@@ -2,3 +2,4 @@
 token.json
 *.zarr/
 .arkitekt/
+crates/rekuest/tests/fixtures/serve/rust/
