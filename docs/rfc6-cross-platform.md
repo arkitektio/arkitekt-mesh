@@ -1,8 +1,7 @@
 # RFC-6: macOS and Windows are built and tested, not assumed
 
-**Status:** In progress. CI matrix added (`.github/workflows/meshd.yml`:
-`test-rust` and `test-python` on Linux, macOS and Windows; `check-arm` for
-Linux and Windows on ARM64). It has not run yet.
+**Status:** Tests pass on Linux, macOS and Windows (September 2026, PR #1).
+Release signing and a real-machine lab run are still open.
 
 ## Problem
 
@@ -44,3 +43,27 @@ Windows binaries and wheels that nobody has run. Known risk areas:
 - The release smoke test is in place.
 - One manual run of the mesh lab tests against a Windows and a macOS
   machine, since the lab is Linux Docker; its address is reachable from both.
+
+## Done
+
+- **CI matrix, green in `meshd.yml`:** the Rust node, `arkitekt-meshd` and
+  fakts' native mesh run against tailscale's test control server, DERP and a
+  tsnet peer on `ubuntu-latest`, `macos-14` and `windows-latest`, and so do
+  the Python bindings. That covers UDP, the relay, IPv6, netcheck, tailnet
+  lock, the packet filter and meshd's stdin shutdown. On Windows, no UDP
+  connection-reset errors showed up in these tests.
+- **Builds:** Linux and Windows ARM64 build (`check-arm`). `ci.yml` builds
+  and unit-tests the native mesh on six runners, including macOS Intel and
+  Windows ARM.
+- **Skipped:** the `lab_*` suites (they need the local ionskale lab) and the
+  port-mapping tests (Linux-only, since they need 127.0.0.2).
+- **`ci.yml`'s workspace job** needed clang 21 (from apt.llvm.org) and
+  GLib/X11 headers for `webrtc-sys` (lovekit's `livekit` feature).
+
+## Still open
+
+- **The release smoke test** of each built binary, and **macOS
+  signing/notarization**. The release jobs have never run: they need a
+  `meshd-v*` tag.
+- **A mesh-lab run from a real macOS or Windows machine.**
+- **Gateway discovery for port mapping** on macOS and Windows.
