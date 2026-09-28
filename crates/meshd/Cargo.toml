@@ -1,0 +1,28 @@
+[package]
+name = "arkitekt-meshd"
+description = "The Arkitekt mesh sidecar: a userspace tailnet node exposing a local HTTP proxy (and a TURN relay) into a deployment's mesh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["tailscale", "mesh", "proxy", "turn", "arkitekt"]
+categories = ["network-programming", "command-line-utilities"]
+readme = "README.md"
+
+[[bin]]
+name = "arkitekt-meshd"
+path = "src/main.rs"
+
+[dependencies]
+mesh = { workspace = true, features = ["session", "relay"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["process"] }
+reqwest.workspace = true
+tempfile = "3"

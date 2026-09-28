@@ -1,0 +1,29 @@
+[project]
+name = "arkitekt-meshd"
+dynamic = ["version"]
+description = "The arkitekt-meshd sidecar binary: a userspace tailnet node (our own Rust client) exposing an HTTP proxy and a TURN relay into an Arkitekt deployment's mesh"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "jhnnsrs", email = "jhnnsrs@gmail.com" }]
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+arkitekt-meshd = "arkitekt_meshd.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/arkitektio/arkirust"
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "arkitekt_meshd/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["arkitekt_meshd"]
+
+# Puts the prebuilt binary ($MESHD_BINARY) into the wheel and tags it for
+# $MESHD_PLATFORM (e.g. manylinux2014_x86_64); see hatch_build.py.
+[tool.hatch.build.targets.wheel.hooks.custom]
