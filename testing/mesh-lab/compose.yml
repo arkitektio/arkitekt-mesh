@@ -1,0 +1,101 @@
+# The local mesh lab: ionskale (built from source) and a tsnet peer.
+# Driven by lab.sh, which writes .lab/ (config, CA, keys) first.
+name: mesh-lab
+
+services:
+  ionskale:
+    build:
+      context: ${IONSKALE_SRC:-.}
+      dockerfile: tests/docker/ionscale/Dockerfile
+    command: ["server", "--config", "/etc/ionscale/config.yaml"]
+    volumes:
+      - ./.lab/config.yaml:/etc/ionscale/config.yaml:ro
+      - ./.lab/tls:/etc/ionscale/tls:ro
+      - ionskale-data:/data
+    ports:
+      - "${MESH_LAB_PORT:-8443}:443"
+      - "${MESH_LAB_STUN_PORT:-3478}:3478/udp"
+
+  # For devices that must set their clock and cannot reach the internet
+  # (DERP's certificate check needs the date): SNTP on the lab address.
+  ntp:
+    build: ./ntp
+    profiles: ["esp32"]
+    ports:
+      - "123:123/udp"
+
+  peer:
+    build:
+      context: ./peer
+      args:
+        TS_VERSION: ${MESH_LAB_TS_VERSION:-v1.102.5}
+    profiles: ["peer"]
+    environment:
+      PEER_CONTROL_URL: ${MESH_LAB_URL:-}
+      PEER_AUTH_KEY: ${MESH_LAB_PEER_KEY:-}
+      PEER_HOSTNAME: lab-peer
+      # Go trusts the lab CA for the DERP relay.
+      SSL_CERT_FILE: /etc/lab/ca.pem
+    volumes:
+      - ./.lab/tls/ca.pem:/etc/lab/ca.pem:ro
+      - peer-state:/var/lib/lab-peer
+
+  # A LiveKit server that is only on the mesh: tailscaled with a real TUN
+  # interface (joined to ionskale as lab-livekit), and livekit-server in its
+  # network namespace, offering candidates on tailscale0 only.
+  ts-livekit:
+    image: tailscale/tailscale:${MESH_LAB_TS_IMAGE_TAG:-stable}
+    profiles: ["livekit"]
+    hostname: lab-livekit
+    environment:
+      TS_AUTHKEY: ${MESH_LAB_LIVEKIT_KEY:-}
+      TS_HOSTNAME: lab-livekit
+      TS_EXTRA_ARGS: --login-server=${MESH_LAB_URL:-}
+      TS_USERSPACE: "false"
+      TS_STATE_DIR: /var/lib/tailscale
+      # Go trusts the lab CA for control and DERP.
+      SSL_CERT_FILE: /etc/lab/ca.pem
+    volumes:
+      - ./.lab/tls/ca.pem:/etc/lab/ca.pem:ro
+      - ts-livekit-state:/var/lib/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+
+  livekit:
+    image: livekit/livekit-server:${MESH_LAB_LIVEKIT_TAG:-latest}
+    profiles: ["livekit"]
+    network_mode: service:ts-livekit
+    # No restart policy: after a reboot, `lab.sh livekit` starts it once
+    # tailscale0 is up (it reads its interfaces only at start).
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    depends_on:
+      - ts-livekit
+
+  # The admin of the `lab-lock` tailnet (tailnet lock): a real tailscaled
+  # holding the trusted key; `lab.sh lock` initializes the lock with it and
+  # `lab.sh lock-sign` signs node keys.
+  lock-admin:
+    image: tailscale/tailscale:${MESH_LAB_TS_IMAGE_TAG:-stable}
+    profiles: ["lock"]
+    hostname: lock-admin
+    environment:
+      TS_AUTHKEY: ${MESH_LAB_LOCK_ADMIN_KEY:-}
+      TS_HOSTNAME: lock-admin
+      TS_EXTRA_ARGS: --login-server=${MESH_LAB_URL:-}
+      TS_USERSPACE: "true"
+      TS_STATE_DIR: /var/lib/tailscale
+      SSL_CERT_FILE: /etc/lab/ca.pem
+    volumes:
+      - ./.lab/tls/ca.pem:/etc/lab/ca.pem:ro
+      - lock-admin-state:/var/lib/tailscale
+
+volumes:
+  lock-admin-state:
+  ionskale-data:
+  peer-state:
+  ts-livekit-state:

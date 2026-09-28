@@ -1,0 +1,18 @@
+# The lab's LiveKit server: only on the mesh. It shares the ts-livekit
+# container's network and offers ICE candidates on the tailnet interface
+# alone, so media reaches it over the mesh or not at all.
+port: 7880
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: false
+  interfaces:
+    includes:
+      - tailscale0
+  ips:
+    includes:
+      - 100.64.0.0/10
+keys:
+  devkey: devsecret_devsecret_devsecret_devsecret
+logging:
+  level: info
