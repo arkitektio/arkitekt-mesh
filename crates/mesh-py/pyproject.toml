@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "arkitekt-mesh"
+description = "Run an Arkitekt mesh node in-process: our own Tailscale-compatible client, with a local HTTP proxy and a TURN relay into a deployment's mesh"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "jhnnsrs", email = "jhnnsrs@gmail.com" }]
+requires-python = ">=3.9"
+dynamic = ["version"]
+classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: 3"]
+
+[project.urls]
+Repository = "https://github.com/arkitektio/arkirust"
+
+[tool.maturin]
+python-source = "python"
+module-name = "arkitekt_mesh._native"
+features = ["pyo3/extension-module"]

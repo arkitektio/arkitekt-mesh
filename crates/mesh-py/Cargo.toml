@@ -1,0 +1,22 @@
+[package]
+name = "arkitekt-mesh-py"
+description = "Python bindings for arkitekt-mesh: run an Arkitekt mesh node in-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lib]
+name = "arkitekt_mesh"
+crate-type = ["cdylib"]
+# The module is tested from Python (tests/), not with cargo.
+test = false
+doctest = false
+
+[dependencies]
+mesh = { workspace = true, features = ["session", "relay"] }
+pyo3 = { version = "0.29", features = ["abi3-py39"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+tokio = { workspace = true, features = ["sync"] }

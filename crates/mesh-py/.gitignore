@@ -1,0 +1,3 @@
+# Built by `maturin develop`.
+python/arkitekt_mesh/*.so
+python/arkitekt_mesh/*.pyd
