@@ -60,10 +60,19 @@ Windows binaries and wheels that nobody has run. Known risk areas:
 - **`ci.yml`'s workspace job** needed clang 21 (from apt.llvm.org) and
   GLib/X11 headers for `webrtc-sys` (lovekit's `livekit` feature).
 
+- **Release builds** (`meshd.yml`, also on a manual run):
+  - The macOS binaries are signed (Developer ID, hardened runtime) and
+    notarized from the organization's secrets, as konstruktor does, before
+    the wheels are built.
+  - Each natively runnable binary is smoke-tested: `--version`, and a start
+    that must report `needs_login`.
+
 ## Still open
 
-- **The release smoke test** of each built binary, and **macOS
-  signing/notarization**. The release jobs have never run: they need a
-  `meshd-v*` tag.
+- **Windows Authenticode signing:** there are no secrets for it.
 - **A mesh-lab run from a real macOS or Windows machine.**
 - **Gateway discovery for port mapping** on macOS and Windows.
+- **The ESP32 firmware** moved to its own repo,
+  [arkitekt-mesh-esp32](https://github.com/arkitektio/arkitekt-mesh-esp32).
+  This repo only checks that the mesh builds without its default features
+  (`ci.yml`, `mesh-embedded`).
