@@ -213,6 +213,7 @@ jobs:
   build-python:
     needs: [test-python, version]
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { runner: ubuntu-latest, target: x86_64, manylinux: auto }
@@ -226,6 +227,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: PyO3/maturin-action@v1
+        env:
+          # ring's assembly needs __ARM_ARCH, which the manylinux2014 aarch64
+          # cross compiler does not define.
+          CFLAGS_aarch64_unknown_linux_gnu: -D__ARM_ARCH=8
         with:
           working-directory: crates/mesh-py
           target: ${{ matrix.target }}
