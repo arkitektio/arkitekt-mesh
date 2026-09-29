@@ -19,7 +19,7 @@
 #   ./lab.sh lock               lock the `lab-lock` tailnet (tailnet lock), with a
 #                               tailscaled admin holding the trusted key
 #   ./lab.sh lock-sign NODEKEY  sign a node key in `lab-lock` (nodekey:<hex>)
-#   ./lab.sh esp32-env FILE     write a mesh.env for firmware/esp32-mesh (fresh key, the
+#   ./lab.sh esp32-env FILE     write a mesh.env for the ESP32 firmware (fresh key, the
 #                               lab CA, the lab NTP; keeps WIFI_*/MESH_LINK/PPP/DIRECT)
 #   ./lab.sh esp32-watch [--udp PORT | --serial DEV] [--timeout S]
 #                               wait for the board's "MESH-TEST ok" line (PPP logs

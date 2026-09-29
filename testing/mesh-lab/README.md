@@ -81,8 +81,9 @@ all reach ionskale there. TLS comes from a lab CA (ECDSA P-256) in
 ## ESP32
 
 ```sh
-./lab.sh esp32-env ../../firmware/esp32-mesh/mesh.env
-(cd ../../firmware/esp32-mesh && . ~/export-esp-1.93.sh && cargo build --release \
+# The firmware lives in arkitektio/arkitekt-mesh-esp32 (here, a sibling checkout).
+./lab.sh esp32-env ../../../../embedded/arkitekt-mesh-esp32/firmware/mesh.env
+(cd ../../../../embedded/arkitekt-mesh-esp32/firmware && . ~/export-esp-1.93.sh && cargo build --release \
   && espflash flash --partition-table partitions.csv target/xtensa-esp32-espidf/release/esp32-mesh)
 ./lab.sh esp32-watch                  # PPP: logs arrive over UDP 5514
 ./lab.sh esp32-watch --serial /dev/ttyUSB0   # Wi-Fi: logs on the serial port

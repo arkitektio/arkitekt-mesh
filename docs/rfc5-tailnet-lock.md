@@ -133,7 +133,7 @@ already builds from `tailscale.com`).
 - **Signing** and **authoring AUMs** (`tailscale lock sign/add/remove`). Use
   tailscale for administration.
 - **ESP32 persistence.** A bare `Node` keeps the chain in memory. The
-  firmware should implement `LockStore` over NVS, and until then it takes the
+  firmware (arkitekt-mesh-esp32) should implement `LockStore` over NVS, and until then it takes the
   genesis from control on each boot.
 - **Ed25519 edge cases.** Go verifies direct signatures with ZIP-215
   (`ed25519consensus`); we use `verify_strict`, which is stricter on

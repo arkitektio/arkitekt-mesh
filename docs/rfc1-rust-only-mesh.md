@@ -13,7 +13,7 @@ The mesh node is our own Tailscale-compatible client (`crates/mesh`,
 | Rust apps, sidecar backend | `arkitekt-meshd` (`crates/meshd`), the same stdin/stdout protocol |
 | Rust apps, native backend | in-process (`fakts` feature `mesh-native`) |
 | Python | in-process (`arkitekt-mesh`, `crates/mesh-py`), or the `arkitekt-meshd` wheel (the Rust binary) |
-| ESP32 | `firmware/esp32-mesh` |
+| ESP32 | [arkitekt-mesh-esp32](https://github.com/arkitektio/arkitekt-mesh-esp32) |
 
 Go stays in two places, both test-only and never shipped:
 - `crates/mesh/tests/harness`: tailscale's own test control server, DERP/STUN and a tsnet peer;
