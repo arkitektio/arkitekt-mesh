@@ -46,8 +46,10 @@ of it blocks the sidecar's role, because DERP always works as a fallback:
 
 ## Done
 
-- `meshd/` (Go) deleted. The `arkitekt-meshd` wheel packaging moved to
-  `crates/meshd/python` and carries the Rust binary.
-- `.github/workflows/meshd.yml` builds only Rust: binaries for six targets,
-  the `arkitekt-meshd` and `arkitekt-mesh` wheels, and `THIRD_PARTY_LICENSES`.
+- `meshd/` (Go) deleted, and with it the `arkitekt-meshd` wheels: Python
+  runs the node in-process (`arkitekt-mesh`), so the binary is only on the
+  GitHub release (and `cargo install arkitekt-meshd`).
+- `.github/workflows/meshd.yml` builds only Rust: binaries for six targets
+  and `THIRD_PARTY_LICENSES`. `.github/workflows/release.yaml` builds and
+  publishes the `arkitekt-mesh` wheels.
 - fakts (Rust and Python) no longer looks for tsnet's `tailscaled.state`.

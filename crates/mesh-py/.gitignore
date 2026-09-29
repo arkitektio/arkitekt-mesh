@@ -1,3 +1,7 @@
 # Built by `maturin develop`.
 python/arkitekt_mesh/*.so
 python/arkitekt_mesh/*.pyd
+
+# Copied in by .github/workflows/release.yaml for release builds.
+/LICENSE
+/LICENSE-THIRD-PARTY

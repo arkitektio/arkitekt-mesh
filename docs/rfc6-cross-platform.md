@@ -62,10 +62,12 @@ Windows binaries and wheels that nobody has run. Known risk areas:
 
 - **Release builds** (`meshd.yml`, also on a manual run):
   - The macOS binaries are signed (Developer ID, hardened runtime) and
-    notarized from the organization's secrets, as konstruktor does, before
-    the wheels are built.
+    notarized from the organization's secrets, as konstruktor does.
   - Each natively runnable binary is smoke-tested: `--version`, and a start
     that must report `needs_login`.
+  - The `arkitekt-mesh` wheels (`release.yaml`) are installed and run on
+    every platform they are built for, the architecture asserted, before
+    they are published.
 
 ## Still open
 

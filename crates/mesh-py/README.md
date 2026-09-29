@@ -1,7 +1,7 @@
 # arkitekt-mesh (Python)
 
 Runs an Arkitekt mesh node inside the Python process. It uses
-[`arkitekt-mesh`](../mesh/), our own Tailscale-compatible client in Rust,
+[`arkitekt-mesh`](https://github.com/arkitektio/arkirust/tree/main/crates/mesh), our own Tailscale-compatible client in Rust,
 the same node the Rust client and `arkitekt-meshd` run. `fakts` uses it
 when it is installed; see `MeshOptions.backend`.
 
