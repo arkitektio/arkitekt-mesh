@@ -1,11 +1,12 @@
 # Releasing `arkitekt-mesh` to PyPI
 
 `.github/workflows/release.yaml` builds and publishes the Python bindings
-(`crates/mesh-py`). Every release of the workspace publishes them:
-`release-plz.yml` starts `release.yaml` on the release's `vX.Y.Z` tag once the
-crates are on crates.io. It publishes with PyPI trusted publishing from this
-workflow, without a GitHub environment. The meshd binaries are separate:
-`meshd.yml` attaches them to a GitHub release on a `meshd-vX.Y.Z` tag.
+(`crates/mesh-py`). Every release of the workspace publishes them: the
+`release` job in `ci.yml` starts `release.yaml` on the release's `vX.Y.Z` tag
+once the crates are on crates.io. It publishes with PyPI trusted publishing
+from this workflow, without a GitHub environment. The meshd binaries go the
+same way: `meshd.yml`, started on the same tag, attaches them to the GitHub
+release.
 
 What goes to PyPI (abi3: one wheel per platform covers every CPython from 3.9 on):
 
@@ -30,18 +31,21 @@ repository `arkirust`, workflow `release.yaml`, no environment.
 
 ## Each release
 
-1. Run `release.yaml` by hand on main (Actions → release → Run workflow). On a
-   branch it builds and smoke-tests everything and publishes nothing. It must
-   be green.
-2. Release the workspace: bump `workspace.package.version` (and the versions
-   in `workspace.dependencies`) on main, or merge the release-plz PR.
-   `release-plz.yml` publishes the crates, tags `vX.Y.Z` and starts
-   `release.yaml` on that tag, which publishes `arkitekt-mesh X.Y.Z`.
+Nothing by hand. A push to main that carries a `feat`, `fix` or `perf` (or a
+breaking change) is a release once CI is green: semantic-release
+(`releaserc.toml`) bumps the workspace version, commits, tags `vX.Y.Z` and
+creates the GitHub release; the same job publishes the crates and starts
+`release.yaml` on the tag, which publishes `arkitekt-mesh X.Y.Z`. The bump
+commit is pushed back to main, so pull before the next push.
 
-release-plz's tag starts no workflow by itself (it is pushed with
-`GITHUB_TOKEN`), which is why `release-plz.yml` dispatches `release.yaml`.
-To publish outside of a release, push a `mesh-vX.Y.Z` tag: `X.Y.Z` must be the
-workspace version, which the `version` job checks.
+The tag starts no workflow by itself (it is pushed with `GITHUB_TOKEN`), which
+is why the job dispatches `release.yaml`.
+
+To try the build without releasing, run `release.yaml` by hand on main
+(Actions → release → Run workflow): on a branch it builds and smoke-tests
+everything and publishes nothing. To publish outside of a release, push a
+`mesh-vX.Y.Z` tag: `X.Y.Z` must be the workspace version, which the `version`
+job checks.
 
 PyPI never takes the same version twice, even after a deletion. If the upload
 stops partway, re-run `publish`: it skips what is already there.

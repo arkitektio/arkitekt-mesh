@@ -7,8 +7,9 @@ name: release
 # docs/releasing-python.md.
 #
 # It publishes when it runs on a tag whose version is the workspace version:
-# - `vX.Y.Z`, the release's own tag. release-plz.yml starts this workflow on
-#   it after every release (a tag release-plz pushes starts nothing by itself).
+# - `vX.Y.Z`, the release's own tag. ci.yml's `release` job starts this
+#   workflow on it after every release (the tag itself starts nothing, as it
+#   is pushed with GITHUB_TOKEN).
 # - `mesh-vX.Y.Z`, pushed by hand, to publish outside of that.
 #
 # Run it by hand on a branch (workflow_dispatch) to build and smoke-test

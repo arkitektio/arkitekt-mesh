@@ -1,14 +1,16 @@
 name: meshd
 
 # The mesh, tested on every platform; and `arkitekt-meshd`, the sidecar binary
-# (crates/meshd), attached to the GitHub release for every platform on a
-# `meshd-vX.Y.Z` tag (X.Y.Z must be the workspace version). The Python
-# bindings (`arkitekt-mesh` on PyPI) are released by release.yaml.
+# (crates/meshd), attached to the GitHub release for every platform when it
+# runs on a tag whose version is the workspace version: `vX.Y.Z`, the
+# release's own tag (ci.yml's `release` job starts this workflow on it after
+# every release), or a `meshd-vX.Y.Z` pushed by hand. The Python bindings
+# (`arkitekt-mesh` on PyPI) are released by release.yaml.
 # Everything is our own Rust client (docs/rfc1-rust-only-mesh.md). Go only
 # appears in the tests, as the reference tailscale they run against.
 #
-# Run it by hand (workflow_dispatch) to build, sign, notarize and smoke-test
-# every binary without releasing anything.
+# Run it by hand on a branch (workflow_dispatch) to build, sign, notarize and
+# smoke-test every binary without releasing anything.
 on:
   workflow_dispatch:
   push:
@@ -99,9 +101,12 @@ jobs:
         run: |
           cargo_version="$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "arkitekt-meshd") | .version')"
-          # A manual run builds the workspace version.
+          # A run on a branch builds the workspace version.
           version="$cargo_version"
-          [[ "$GITHUB_REF" == refs/tags/meshd-v* ]] && version="${GITHUB_REF_NAME#meshd-v}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#meshd-}"
+            version="${version#v}"
+          fi
           if [ "$version" != "$cargo_version" ]; then
             echo "tag $GITHUB_REF_NAME does not match the workspace version $cargo_version" >&2
             exit 1
@@ -207,7 +212,7 @@ jobs:
           path: THIRD_PARTY_LICENSES
 
   release:
-    if: startsWith(github.ref, 'refs/tags/meshd-v')
+    if: github.ref_type == 'tag'
     needs: [build-meshd, licenses]
     runs-on: ubuntu-latest
     permissions:
@@ -228,7 +233,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           (cd dist && sha256sum arkitekt-meshd-* > SHA256SUMS)
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "$GITHUB_REF_NAME" \
-            --notes "arkitekt-meshd ${GITHUB_REF_NAME#meshd-v}: the mesh sidecar for the Rust client."
+          # `vX.Y.Z` already has its release (semantic-release made it).
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --title "$GITHUB_REF_NAME" \
+              --notes "arkitekt-meshd ${GITHUB_REF_NAME#meshd-v}: the mesh sidecar for the Rust client."
+          fi
 
