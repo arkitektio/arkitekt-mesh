@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arkitekt-rath",
@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-examples"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arkitekt",
@@ -149,7 +149,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-lovekit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arkitekt",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-py"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arkitekt-mesh",
  "pyo3",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-meshd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arkitekt-mesh",
  "reqwest 0.12.9",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mikro"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arkitekt",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-rath"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "fakts",
@@ -1327,7 +1327,7 @@ dependencies = [
 
 [[package]]
 name = "fakts"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "arkitekt-mesh",
  "async-trait",
@@ -3793,7 +3793,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rekuest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arkitekt-rath",
@@ -3823,7 +3823,7 @@ dependencies = [
 
 [[package]]
 name = "rekuest-macros"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "heck 0.5.0",
  "proc-macro-crate",
@@ -3834,7 +3834,7 @@ dependencies = [
 
 [[package]]
 name = "rekuest-protocol"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hex",
  "serde",
