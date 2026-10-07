@@ -37,7 +37,12 @@ class Node:
         timeout: float = 90,
         ephemeral: bool = False,
         listen: str = "127.0.0.1:0",
-    ) -> "Node": ...
+        *,
+        tcp_buffer: Optional[int] = None,
+    ) -> "Node":
+        """Start (or join) the node. ``tcp_buffer`` is the bytes of buffer per
+        connection, each way: what a connection can have in flight, so its
+        throughput is at most this per round trip (default: 1 MiB)."""
     @staticmethod
     def has_state(statedir: str) -> bool:
         """Whether a node was already joined in ``statedir``."""

@@ -14,12 +14,15 @@ deployment's mesh (ionscale) and exposes:
 
 ```
 arkitekt-meshd --statedir DIR --hostname NAME [--control-url URL] [--listen 127.0.0.1:0]
-               [--timeout 90s] [--ephemeral] [--turn] [--forward NAME=host:port]... [--no-stdin]
+               [--timeout 90s] [--tcp-buffer BYTES] [--ephemeral] [--turn]
+               [--forward NAME=host:port]... [--no-stdin]
 ```
 
 - **Auth key:** read from `$ARKITEKT_MESH_AUTHKEY`, never from argv. It is
   used only to join; a node already joined in `DIR` ignores it.
 - **Control URL:** saved in `DIR`, so restarts may omit `--control-url`.
+- **TCP buffer:** per connection, each way (default 1 MiB). A connection's
+  throughput is at most this per round trip.
 - **stdout** gets exactly one JSON line:
   - `{"event":"ready","proxy":"http://127.0.0.1:PORT","hostname":…,"ips":[…],"turn":{"urls":[…],"username":…,"credential":…},"forwards":{"NAME":"127.0.0.1:PORT"}}`
     (`turn` and `forwards` appear only when asked for);

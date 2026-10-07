@@ -39,6 +39,9 @@ services:
     volumes:
       - ./.lab/tls/ca.pem:/etc/lab/ca.pem:ro
       - peer-state:/var/lib/lab-peer
+    # For `lab.sh netem`: tc on the peer's own interface.
+    cap_add:
+      - NET_ADMIN
 
   # A LiveKit server that is only on the mesh: tailscaled with a real TUN
   # interface (joined to ionskale as lab-livekit), and livekit-server in its

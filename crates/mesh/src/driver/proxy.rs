@@ -2,23 +2,41 @@
 //! host:port` tunnels (TLS, websockets) and absolute-form `http://` requests,
 //! with every upstream connection dialed through the node. Responses stream
 //! through as they arrive. HTTP only: there is deliberately no SOCKS.
+//!
+//! Upstream connections of `http://` requests are kept and used again, per
+//! host: a connection over the mesh costs a round trip (and, to a peer not
+//! spoken to yet, a handshake) that a request for one chunk of an array
+//! should not pay each time.
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode, Uri};
-use hyper_util::rt::TokioIo;
+use hyper_util::client::legacy::connect::{Connected, Connection};
+use hyper_util::client::legacy::Client;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 
 type Body = BoxBody<Bytes, hyper::Error>;
+
+/// How long an unused upstream connection is kept: well under the two
+/// minutes after which the mesh's TCP gives up on a silent peer.
+const IDLE_UPSTREAM: Duration = Duration::from_secs(60);
+/// Unused upstream connections kept per host.
+const IDLE_PER_HOST: usize = 16;
+/// The buffer, each way, of a tunnel's copy.
+const TUNNEL_BUFFER: usize = 64 * 1024;
 
 /// Opens connections to `host:port` on the mesh.
 pub trait Dial: Send + Sync + 'static {
@@ -37,6 +55,12 @@ pub async fn serve<D: Dial>(dialer: D) -> io::Result<(String, JoinHandle<()>)> {
 pub fn serve_on<D: Dial>(dialer: D, listener: TcpListener) -> io::Result<(String, JoinHandle<()>)> {
     let url = format!("http://{}", listener.local_addr()?);
     let dialer = Arc::new(dialer);
+    let upstream = Client::builder(TokioExecutor::new())
+        .pool_idle_timeout(IDLE_UPSTREAM)
+        .pool_max_idle_per_host(IDLE_PER_HOST)
+        .http1_preserve_header_case(true)
+        .build(Connector(dialer.clone()));
+    let proxy = Arc::new(Proxy { dialer, upstream });
     let task = tokio::spawn(async move {
         // Owned here, so aborting the proxy also aborts its connections.
         let mut connections = JoinSet::new();
@@ -44,7 +68,7 @@ pub fn serve_on<D: Dial>(dialer: D, listener: TcpListener) -> io::Result<(String
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => {
-                        connections.spawn(serve_connection(dialer.clone(), stream));
+                        connections.spawn(serve_connection(proxy.clone(), stream));
                     }
                     Err(e) => {
                         tracing::warn!("the mesh proxy could not accept a connection: {e}");
@@ -58,8 +82,78 @@ pub fn serve_on<D: Dial>(dialer: D, listener: TcpListener) -> io::Result<(String
     Ok((url, task))
 }
 
-async fn serve_connection<D: Dial>(dialer: Arc<D>, stream: TcpStream) {
-    let service = hyper::service::service_fn(move |req| handle(dialer.clone(), req));
+struct Proxy<D: Dial> {
+    dialer: Arc<D>,
+    /// For `http://` requests: it keeps the connections it made, by host.
+    upstream: Client<Connector<D>, Incoming>,
+}
+
+/// Dials the host of a request's url, for [`Client`].
+struct Connector<D>(Arc<D>);
+
+impl<D> Clone for Connector<D> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<D: Dial> tower_service::Service<Uri> for Connector<D> {
+    type Response = Upstream<D::Stream>;
+    type Error = io::Error;
+    type Future = Pin<Box<dyn Future<Output = io::Result<Self::Response>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: Uri) -> Self::Future {
+        let dialer = self.0.clone();
+        Box::pin(async move {
+            let (host, port) = target(&uri, 80).map_err(|(_, why)| io::Error::other(why))?;
+            Ok(Upstream(TokioIo::new(dialer.dial(&host, port).await?)))
+        })
+    }
+}
+
+/// A connection over the mesh, as [`Client`] holds it.
+struct Upstream<S>(TokioIo<S>);
+
+impl<S> Connection for Upstream<S> {
+    fn connected(&self) -> Connected {
+        Connected::new()
+    }
+}
+
+impl<S: AsyncRead + Unpin> hyper::rt::Read for Upstream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> hyper::rt::Write for Upstream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+async fn serve_connection<D: Dial>(proxy: Arc<Proxy<D>>, stream: TcpStream) {
+    let service = hyper::service::service_fn(move |req| handle(proxy.clone(), req));
     if let Err(e) = hyper::server::conn::http1::Builder::new()
         .preserve_header_case(true)
         .serve_connection(TokioIo::new(stream), service)
@@ -71,13 +165,13 @@ async fn serve_connection<D: Dial>(dialer: Arc<D>, stream: TcpStream) {
 }
 
 async fn handle<D: Dial>(
-    dialer: Arc<D>,
+    proxy: Arc<Proxy<D>>,
     req: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
     let response = if req.method() == Method::CONNECT {
-        tunnel(&*dialer, req).await
+        tunnel(&*proxy.dialer, req).await
     } else {
-        forward(&*dialer, req).await
+        forward(&proxy.upstream, req).await
     };
     Ok(response.unwrap_or_else(|(status, message)| error(status, message)))
 }
@@ -92,7 +186,13 @@ async fn tunnel<D: Dial>(dialer: &D, req: Request<Incoming>) -> Result<Response<
         match hyper::upgrade::on(req).await {
             Ok(client) => {
                 let mut client = TokioIo::new(client);
-                if let Err(e) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+                let copied = tokio::io::copy_bidirectional_with_sizes(
+                    &mut client,
+                    &mut upstream,
+                    TUNNEL_BUFFER,
+                    TUNNEL_BUFFER,
+                );
+                if let Err(e) = copied.await {
                     tracing::debug!("mesh tunnel to {host}:{port} ended: {e}");
                 }
             }
@@ -102,11 +202,14 @@ async fn tunnel<D: Dial>(dialer: &D, req: Request<Incoming>) -> Result<Response<
     Ok(Response::new(empty()))
 }
 
-/// An absolute-form `http://` request: dial, send it in origin form and
-/// stream the response back. One upstream connection per request, so a
-/// client re-using its proxy connection for another host still ends up in
-/// the right place.
-async fn forward<D: Dial>(dialer: &D, req: Request<Incoming>) -> Result<Response<Body>, Failure> {
+/// An absolute-form `http://` request: send it over a connection to its
+/// host (one kept from an earlier request, or a new one) and stream the
+/// response back. Connections are kept by host, so a client re-using its
+/// proxy connection for another host still ends up in the right place.
+async fn forward<D: Dial>(
+    upstream: &Client<Connector<D>, Incoming>,
+    req: Request<Incoming>,
+) -> Result<Response<Body>, Failure> {
     if req.uri().scheme_str() != Some("http") {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -114,35 +217,23 @@ async fn forward<D: Dial>(dialer: &D, req: Request<Incoming>) -> Result<Response
         ));
     }
     let (host, port) = target(req.uri(), 80)?;
-    let upstream = dial(dialer, &host, port).await?;
 
+    // The url stays absolute (it names the connection to use); the client
+    // sends it in origin form, with the Host header if there is none.
     let (mut parts, body) = req.into_parts();
-    let authority = parts.uri.authority().cloned();
-    parts.uri = parts
-        .uri
-        .path_and_query()
-        .map(|pq| Uri::from(pq.clone()))
-        .unwrap_or_else(|| Uri::from_static("/"));
     strip_hop_by_hop(&mut parts.headers);
-    if let Some(value) = authority.and_then(|a| HeaderValue::from_str(a.as_str()).ok()) {
-        parts.headers.entry(header::HOST).or_insert(value);
-    }
-
-    let bad_gateway = |e: hyper::Error| (StatusCode::BAD_GATEWAY, format!("{host}:{port}: {e}"));
-    let (mut sender, connection) = hyper::client::conn::http1::Builder::new()
-        .preserve_header_case(true)
-        .handshake(TokioIo::new(upstream))
+    let response = upstream
+        .request(Request::from_parts(parts, body))
         .await
-        .map_err(bad_gateway)?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            tracing::debug!("mesh upstream connection ended: {e}");
-        }
-    });
-    let response = sender
-        .send_request(Request::from_parts(parts, body))
-        .await
-        .map_err(bad_gateway)?;
+        .map_err(|e| {
+            // The cause (e.g. that no peer has this name) is what helps.
+            let mut cause: &dyn std::error::Error = &e;
+            while let Some(source) = cause.source() {
+                cause = source;
+            }
+            tracing::debug!("the mesh could not reach {host}:{port}: {cause}");
+            (StatusCode::BAD_GATEWAY, format!("{host}:{port}: {cause}"))
+        })?;
 
     let (mut parts, body) = response.into_parts();
     strip_hop_by_hop(&mut parts.headers);
@@ -321,6 +412,38 @@ mod tests {
             .await
             .unwrap()
             .contains("no peer named nowhere"));
+    }
+
+    /// Counts the connections made.
+    struct Counting(Table, Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Dial for Counting {
+        type Stream = TcpStream;
+
+        async fn dial(&self, host: &str, port: u16) -> io::Result<TcpStream> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.0.dial(host, port).await
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_connections_are_kept_per_host() {
+        let alpha = server("alpha").await;
+        let beta = server("beta").await;
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let table = Table(HashMap::from([("alpha", alpha), ("beta.tail", beta)]));
+        let proxy = serve(Counting(table, dials.clone())).await.unwrap().0;
+
+        // Each request on a proxy connection of its own, as clients that
+        // keep none make them.
+        for _ in 0..5 {
+            assert_eq!(get(&client(&proxy), "http://alpha/").await, "alpha / alpha");
+            assert_eq!(
+                get(&client(&proxy), "http://beta.tail/").await,
+                "beta / beta.tail"
+            );
+        }
+        assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     async fn connect(proxy: &str, target: &str) -> (TcpStream, String) {

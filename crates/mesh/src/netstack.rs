@@ -14,8 +14,20 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 
 /// Tailscale's MTU for the tunnel.
 pub const MTU: usize = 1280;
-/// Default TCP buffer size, each way, per socket.
+/// TCP buffer size, each way, per socket, unless set otherwise.
 pub const TCP_BUFFER: usize = 64 * 1024;
+
+/// How a TCP sender holds back when packets are lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Congestion {
+    /// Send whatever the receiver's window takes: after a loss the whole
+    /// window is sent again, into the queue that just overflowed.
+    #[default]
+    None,
+    Reno,
+    Cubic,
+}
+
 /// Datagrams queued each way per UDP socket.
 #[cfg(feature = "udp")]
 pub const UDP_PACKETS: usize = 64;
@@ -37,6 +49,7 @@ pub struct Netstack {
     next_port: u16,
     tcp_buffer: usize,
     listen_buffer: usize,
+    congestion: Congestion,
 }
 
 impl Netstack {
@@ -57,6 +70,7 @@ impl Netstack {
             next_port: 49152 + (rand_core::RngCore::next_u32(&mut rand_core::OsRng) % 16000) as u16,
             tcp_buffer: TCP_BUFFER,
             listen_buffer: TCP_BUFFER,
+            congestion: Congestion::None,
         };
         stack.set_addresses(addresses);
         stack
@@ -71,6 +85,11 @@ impl Netstack {
     /// connections they accept, from now on.
     pub fn set_listen_buffer(&mut self, bytes: usize) {
         self.listen_buffer = bytes.max(1024);
+    }
+
+    /// The congestion control of sockets opened from now on.
+    pub fn set_congestion(&mut self, congestion: Congestion) {
+        self.congestion = congestion;
     }
 
     /// Replace this node's addresses (from the netmap).
@@ -99,6 +118,11 @@ impl Netstack {
             tcp::SocketBuffer::new(vec![0; buffer]),
         );
         socket.set_nagle_enabled(false);
+        socket.set_congestion_control(match self.congestion {
+            Congestion::None => tcp::CongestionControl::None,
+            Congestion::Reno => tcp::CongestionControl::Reno,
+            Congestion::Cubic => tcp::CongestionControl::Cubic,
+        });
         socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(30)));
         socket.set_timeout(Some(smoltcp::time::Duration::from_secs(120)));
         socket
@@ -166,8 +190,12 @@ impl Netstack {
     }
 
     /// Process input and timers; returns IP packets to send into the tunnel.
-    pub fn poll(&mut self, now: Instant) -> Vec<Vec<u8>> {
+    /// At most `room` of them are the sockets' own (the rest waits in their
+    /// buffers, as behind a full interface queue); answers to what arrived
+    /// always go out.
+    pub fn poll(&mut self, now: Instant, room: usize) -> Vec<Vec<u8>> {
         let now = self.now(now);
+        self.device.room = room;
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.device.tx.drain(..).collect()
     }
@@ -184,6 +212,8 @@ impl Netstack {
 struct Queues {
     rx: VecDeque<Vec<u8>>,
     tx: VecDeque<Vec<u8>>,
+    /// How many packets `tx` may hold before the sockets must wait.
+    room: usize,
 }
 
 impl Device for Queues {
@@ -196,7 +226,7 @@ impl Device for Queues {
     }
 
     fn transmit(&mut self, _: smoltcp::time::Instant) -> Option<Tx<'_>> {
-        Some(Tx(&mut self.tx))
+        (self.tx.len() < self.room).then_some(Tx(&mut self.tx))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -269,11 +299,11 @@ mod tests {
         let mut got = Vec::new();
         for step in 0..200 {
             let now = t0 + std::time::Duration::from_millis(step);
-            for p in a.poll(now) {
+            for p in a.poll(now, usize::MAX) {
                 assert_eq!(destination(&p), Some(b_ip));
                 b.input(p);
             }
-            for p in b.poll(now) {
+            for p in b.poll(now, usize::MAX) {
                 a.input(p);
             }
             let c = a.socket(client);
@@ -322,11 +352,11 @@ mod tests {
         let mut got = Vec::new();
         for step in 0..20 {
             let now = t0 + std::time::Duration::from_millis(step);
-            for p in a.poll(now) {
+            for p in a.poll(now, usize::MAX) {
                 assert_eq!(destination(&p), Some(b_ip));
                 b.input(p);
             }
-            for p in b.poll(now) {
+            for p in b.poll(now, usize::MAX) {
                 a.input(p);
             }
             let s = b.udp_socket(server);

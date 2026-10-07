@@ -9,6 +9,9 @@ use tokio::task::{JoinHandle, JoinSet};
 
 use crate::driver::Node;
 
+/// The buffer, each way, of a connection's copy.
+const COPY_BUFFER: usize = 64 * 1024;
+
 /// A running forward; stopped (with its connections) when dropped.
 pub struct Forward {
     addr: SocketAddr,
@@ -51,7 +54,13 @@ impl Node {
                         connections.spawn(async move {
                             match node.dial(&target, port).await {
                                 Ok(mut remote) => {
-                                    let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
+                                    let copied = tokio::io::copy_bidirectional_with_sizes(
+                                        &mut local,
+                                        &mut remote,
+                                        COPY_BUFFER,
+                                        COPY_BUFFER,
+                                    );
+                                    let _ = copied.await;
                                 }
                                 Err(e) => tracing::debug!("forward to {target}:{port}: {e}"),
                             }

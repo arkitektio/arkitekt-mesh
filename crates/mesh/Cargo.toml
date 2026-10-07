@@ -38,6 +38,8 @@ smoltcp = { version = "0.13", default-features = false, features = [
     "proto-ipv4",
     "proto-ipv6",
     "socket-tcp",
+    "socket-tcp-reno",
+    "socket-tcp-cubic",
     "async",
 ] }
 
@@ -55,7 +57,8 @@ futures = { workspace = true, optional = true }
 
 # A node's session: state directory, identity, and the local HTTP proxy.
 hyper = { version = "1", features = ["http1", "server", "client"], optional = true }
-hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"], optional = true }
+tower-service = { version = "0.3", optional = true }
 http-body-util = { version = "0.1", optional = true }
 
 # The relay: local TCP forwards and a TURN server over the mesh.
@@ -76,7 +79,7 @@ udp = ["smoltcp/socket-udp"]
 # A node with its state directory (identity, remembered control url, one
 # node per directory) and the local HTTP proxy into the mesh
 # (`driver::Session`): what meshd, fakts and the Python bindings run.
-session = ["tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+session = ["tokio", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tower-service"]
 # Local TCP forwards and a TURN server that relays over the mesh, for apps
 # that cannot use a proxy (WebRTC media, e.g. LiveKit).
 relay = ["tokio", "udp", "dep:turn", "dep:webrtc-util", "dep:async-trait"]
@@ -105,6 +108,10 @@ tempfile = "3"
 hmac = "0.12"
 tokio = { workspace = true, features = ["process"] }
 tracing-subscriber.workspace = true
+
+[[test]]
+name = "bench"
+required-features = ["session"]
 
 [[test]]
 name = "relay"

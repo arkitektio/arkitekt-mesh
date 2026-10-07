@@ -8,7 +8,8 @@ RUN go mod init lab-peer && go get tailscale.com@${TS_VERSION} && go mod tidy \
     && CGO_ENABLED=0 go build -trimpath -o /lab-peer .
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# iproute2: `lab.sh netem` shapes the peer's link (delay, loss) with tc.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates iproute2 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /lab-peer /usr/local/bin/lab-peer
 ENTRYPOINT ["/usr/local/bin/lab-peer"]

@@ -90,7 +90,7 @@ fn stop(session: &Shared) {
 #[pymethods]
 impl Node {
     #[staticmethod]
-    #[pyo3(signature = (statedir, hostname, control_url=None, auth_key=None, timeout=90.0, ephemeral=false, listen="127.0.0.1:0".to_owned()))]
+    #[pyo3(signature = (statedir, hostname, control_url=None, auth_key=None, timeout=90.0, ephemeral=false, listen="127.0.0.1:0".to_owned(), *, tcp_buffer=None))]
     #[allow(clippy::too_many_arguments)]
     fn start<'py>(
         py: Python<'py>,
@@ -101,12 +101,16 @@ impl Node {
         timeout: f64,
         ephemeral: bool,
         listen: String,
+        tcp_buffer: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut options = SessionOptions::new(statedir.clone(), hostname);
         options.control_url = control_url;
         options.auth_key = auth_key;
         options.timeout = Duration::from_secs_f64(timeout.max(0.0));
         options.ephemeral = ephemeral;
+        if let Some(bytes) = tcp_buffer {
+            options.limits.tcp_buffer = bytes;
+        }
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut session = Session::start(options).await.map_err(to_py)?;
             let proxy_url = session.serve_proxy(&listen).await.map_err(io_err)?;

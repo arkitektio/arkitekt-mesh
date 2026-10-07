@@ -53,6 +53,30 @@ import (
 
 const authKey = "tskey-arkitekt-harness"
 
+// peerHandler answers "hello from peer", and for the benchmarks
+// (tests/bench.rs) serves /bytes?n=N (N zero bytes) and drains a POST to
+// /sink, answering how many bytes arrived.
+func peerHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.URL.Path {
+	case "/bytes":
+		n, _ := strconv.ParseInt(r.URL.Query().Get("n"), 10, 64)
+		w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
+		chunk := make([]byte, 64<<10)
+		for n > 0 {
+			m := min(n, int64(len(chunk)))
+			if _, err := w.Write(chunk[:m]); err != nil {
+				return
+			}
+			n -= m
+		}
+	case "/sink":
+		n, _ := io.Copy(io.Discard, r.Body)
+		fmt.Fprint(w, n)
+	default:
+		fmt.Fprint(w, "hello from peer")
+	}
+}
+
 // Ready is the line the Rust tests read.
 type Ready struct {
 	ControlURL string `json:"control_url"`
@@ -166,9 +190,7 @@ func TestHarness(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	go http.Serve(web, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "hello from peer")
-	}))
+	go http.Serve(web, http.HandlerFunc(peerHandler))
 	echo, err := peer.Listen("tcp", ":7")
 	if err != nil {
 		t.Fatal(err)

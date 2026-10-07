@@ -63,6 +63,8 @@ struct Args {
     control_url: Option<String>,
     listen: Option<String>,
     timeout: Option<Duration>,
+    /// Bytes of TCP buffer per connection, each way.
+    tcp_buffer: Option<usize>,
     ephemeral: bool,
     turn: bool,
     forwards: Vec<(String, String, u16)>,
@@ -94,6 +96,13 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, Failure> {
             "control-url" => args.control_url = Some(value()?).filter(|u| !u.is_empty()),
             "listen" => args.listen = Some(value()?),
             "timeout" => args.timeout = Some(parse_duration(&value()?)?),
+            "tcp-buffer" => {
+                let raw = value()?;
+                let bytes = raw
+                    .parse()
+                    .map_err(|_| fail("usage", format!("--tcp-buffer takes bytes, not {raw:?}")))?;
+                args.tcp_buffer = Some(bytes);
+            }
             "forward" => {
                 let spec = value()?;
                 let parsed = spec.split_once('=').and_then(|(name, target)| {
@@ -150,6 +159,9 @@ async fn run(args: Args) -> Result<(), Failure> {
     options.ephemeral = args.ephemeral;
     if let Some(timeout) = args.timeout {
         options.timeout = timeout;
+    }
+    if let Some(bytes) = args.tcp_buffer {
+        options.limits.tcp_buffer = bytes;
     }
     let mut session = Session::start(options).await?;
 
@@ -283,6 +295,7 @@ mod tests {
             "--hostname",
             "h",
             "-timeout=2m",
+            "--tcp-buffer=4194304",
             "--turn",
             "--forward",
             "lk=livekit:7880",
@@ -292,6 +305,7 @@ mod tests {
         assert_eq!(a.statedir, Some("/s".into()));
         assert_eq!(a.hostname.as_deref(), Some("h"));
         assert_eq!(a.timeout, Some(Duration::from_secs(120)));
+        assert_eq!(a.tcp_buffer, Some(4 << 20));
         assert!(a.turn);
         assert_eq!(a.forwards, vec![("lk".into(), "livekit".into(), 7880)]);
     }

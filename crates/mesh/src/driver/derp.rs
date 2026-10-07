@@ -1,6 +1,8 @@
 //! One DERP connection (to one region), kept up with reconnects.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -17,6 +19,22 @@ pub struct Received {
     pub event: Event,
 }
 
+/// How a connection sends.
+#[derive(Debug, Clone)]
+pub struct Sending {
+    /// Frames (of some size) written back to back before a pause of
+    /// [`PACE`] (0: no pauses). The server queues only a few dozen packets per receiver
+    /// and drops the rest of a burst.
+    pub burst: usize,
+    /// Set while the connection is up (frames wait in the queue otherwise).
+    pub up: Arc<AtomicBool>,
+}
+
+/// The pause after a burst of frames.
+const PACE: Duration = Duration::from_millis(1);
+/// The size from which a frame counts towards a burst.
+const PACED_FRAME: usize = 256;
+
 /// Run a connection to `region` until `outgoing` closes. `outgoing` carries
 /// ready-made frames (e.g. [`derp::send_packet`]).
 pub async fn run(
@@ -25,10 +43,13 @@ pub async fn run(
     home: bool,
     events: mpsc::Sender<Received>,
     mut outgoing: mpsc::Receiver<Vec<u8>>,
+    sending: Sending,
 ) {
     let mut backoff = Duration::from_millis(100);
     loop {
-        match session(&region, &node_key, home, &events, &mut outgoing).await {
+        let ended = session(&region, &node_key, home, &events, &mut outgoing, &sending).await;
+        sending.up.store(false, Ordering::Relaxed);
+        match ended {
             Ok(()) => return, // the node dropped us
             Err(e) => {
                 tracing::debug!(
@@ -63,6 +84,7 @@ async fn session(
     home: bool,
     events: &mpsc::Sender<Received>,
     outgoing: &mut mpsc::Receiver<Vec<u8>>,
+    sending: &Sending,
 ) -> Result<(), SessionError> {
     let mut last_err = SessionError::Other("the region has no DERP nodes".into());
     for node in region.nodes.iter().filter(|n| !n.stun_only) {
@@ -112,6 +134,7 @@ async fn session(
             io.write_all(&derp::note_preferred(true)).await?;
         }
         tracing::debug!("connected to DERP region {} via {host}", region.region_id);
+        sending.up.store(true, Ordering::Relaxed);
 
         let (mut rd, mut wr) = tokio::io::split(io);
         let (pong_tx, mut pong_rx) = mpsc::channel::<Vec<u8>>(8);
@@ -148,10 +171,29 @@ async fn session(
             }
         };
         let writer = async {
+            // Frames written since `since`, to pause after a fast burst.
+            let (mut written, mut since) = (0, Instant::now());
             loop {
                 tokio::select! {
                     frame = outgoing.recv() => match frame {
-                        Some(frame) => wr.write_all(&frame).await?,
+                        Some(frame) => {
+                            wr.write_all(&frame).await?;
+                            // Acknowledgements and the like are not what
+                            // fills a relay's queue: they are not held up.
+                            if frame.len() < PACED_FRAME {
+                                continue;
+                            }
+                            written += 1;
+                            if written == sending.burst {
+                                let rest = PACE.saturating_sub(since.elapsed());
+                                if !rest.is_zero() {
+                                    tokio::time::sleep(rest).await;
+                                }
+                            }
+                            if written >= sending.burst || since.elapsed() >= PACE {
+                                (written, since) = (0, Instant::now());
+                            }
+                        }
                         None => return Ok(()),
                     },
                     Some(pong) = pong_rx.recv() => wr.write_all(&pong).await?,

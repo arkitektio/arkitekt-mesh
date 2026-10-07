@@ -63,13 +63,29 @@ pub struct Config {
 /// Buffer and queue sizes: memory against throughput.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
-    /// TCP buffer per socket, each way.
+    /// TCP buffer per socket, each way: also the most a connection has in
+    /// flight, so its throughput is at most this per round trip (64 KiB
+    /// at 20 ms is 3 MiB/s, 1 MiB is 50; measured in
+    /// docs/rfc7-production-and-throughput.md).
     pub tcp_buffer: usize,
     /// TCP buffer, each way, of listening sockets (allocated while they
     /// wait) and the connections they accept.
     pub listen_buffer: usize,
+    /// How TCP senders hold back on loss.
+    pub congestion: netstack::Congestion,
     /// Packets queued per DERP connection (and from all of DERP to the node).
     pub derp_queue: usize,
+    /// Packets sent to a DERP server back to back before a millisecond's
+    /// pause (0: no pauses): a relay drops what it cannot pass on at once.
+    pub derp_burst: usize,
+    /// The UDP port to take, if it is free (0: any). A node that comes
+    /// back on the port it had is where its peers still send: they trust
+    /// a direct path for seconds after its last answer.
+    pub udp_port: u16,
+    /// The UDP sockets' kernel buffers, each way (0: the system's default,
+    /// which a burst at a few hundred Mbit/s overflows). The system may
+    /// allow less (`net.core.rmem_max` on Linux).
+    pub udp_buffer: usize,
     /// Packets held per peer while a handshake is in flight.
     pub handshake_queue: usize,
     /// Peers with WireGuard and path state at once (0: no limit). Past it,
@@ -96,9 +112,13 @@ impl Default for Limits {
     /// For desktops and servers.
     fn default() -> Self {
         Self {
-            tcp_buffer: netstack::TCP_BUFFER,
+            tcp_buffer: 1 << 20,
             listen_buffer: netstack::TCP_BUFFER,
+            congestion: netstack::Congestion::Cubic,
             derp_queue: 1024,
+            derp_burst: 32,
+            udp_port: 0,
+            udp_buffer: 4 << 20,
             handshake_queue: wg::MAX_QUEUED,
             max_active_peers: 0,
             udp_flows: 1024,
@@ -116,7 +136,11 @@ impl Limits {
         Self {
             tcp_buffer: 8 * 1024,
             listen_buffer: 4 * 1024,
+            congestion: netstack::Congestion::None,
             derp_queue: 32,
+            derp_burst: 0,
+            udp_port: 0,
+            udp_buffer: 0,
             handshake_queue: 8,
             max_active_peers: 16,
             udp_flows: 32,
@@ -150,8 +174,8 @@ pub(super) struct State {
     pub(super) netstack: Netstack,
     pub(super) netmap: NetMap,
     home_region: Option<i32>,
-    /// DERP connections, with the region description each was made for.
-    derp: HashMap<i32, (DerpRegion, mpsc::Sender<Vec<u8>>)>,
+    /// DERP connections, by region.
+    derp: HashMap<i32, DerpConn>,
     /// Sockets the app closed, removed once their close completes.
     closing: Vec<SocketHandle>,
     /// STUN probes in flight and each region's measured latency.
@@ -162,6 +186,12 @@ pub(super) struct State {
     /// The public address our gateway maps to our UDP port, if any.
     pub(super) portmap_endpoint: Option<SocketAddr>,
     derp_queue: usize,
+    derp_burst: usize,
+    /// Packets dropped because a DERP connection's queue was full.
+    derp_dropped: u64,
+    /// The DERP connection whose full queue holds the sockets back: the
+    /// loop waits for it to drain before it lets them send again.
+    backlog: Option<mpsc::Sender<Vec<u8>>>,
     max_active_peers: usize,
     /// The peer (by tailnet address) exempt from eviction.
     priority: Option<IpAddr>,
@@ -173,6 +203,21 @@ pub(super) struct State {
     firewall: crate::filter::Firewall,
     /// Tailnet lock: the verified authority, and which peers it hides.
     lock: super::lock::Lock,
+}
+
+/// A DERP connection's handle: its task ends when this is dropped.
+struct DerpConn {
+    /// The region description it was made for.
+    made_for: DerpRegion,
+    tx: mpsc::Sender<Vec<u8>>,
+    /// Whether it is connected right now.
+    up: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DerpConn {
+    fn is_up(&self) -> bool {
+        self.up.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 pub(super) struct Shared {
@@ -304,6 +349,7 @@ impl Node {
         let mut netstack = Netstack::new(&addresses, now);
         netstack.set_tcp_buffer(limits.tcp_buffer);
         netstack.set_listen_buffer(limits.listen_buffer);
+        netstack.set_congestion(limits.congestion);
         let mut state = State {
             tunnel,
             paths,
@@ -317,6 +363,9 @@ impl Node {
             stun_endpoint6: None,
             portmap_endpoint: None,
             derp_queue: limits.derp_queue.max(1),
+            derp_burst: limits.derp_burst,
+            derp_dropped: 0,
+            backlog: None,
             max_active_peers: limits.max_active_peers,
             priority: None,
             udp_port: 0,
@@ -337,9 +386,21 @@ impl Node {
             control_rebind: Notify::new(),
         });
 
-        let udp = Arc::new(UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?);
+        let wanted = config.limits.udp_port;
+        let udp = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, wanted)).await {
+            Ok(socket) => socket,
+            // Taken: any port will do.
+            Err(_) if wanted != 0 => UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?,
+            Err(e) => return Err(e.into()),
+        };
+        let udp = Arc::new(udp);
+        // Known from the start (the loop keeps it current).
+        shared.lock().udp_port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
+        size_buffers(&udp, config.limits.udp_buffer);
         let udp6 = if config.limits.ipv6 {
-            bind_udp6()
+            // The same port, where it is free: one to remember.
+            let port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
+            bind_udp6(port, config.limits.udp_buffer)
         } else {
             None
         };
@@ -422,6 +483,12 @@ impl Node {
     /// Inbound packets the tailnet's packet filter has dropped so far.
     pub fn filtered_packets(&self) -> u64 {
         self.shared.lock().firewall.dropped()
+    }
+
+    /// Outbound packets dropped so far because a DERP connection could not
+    /// take them fast enough ([`Limits::derp_queue`]).
+    pub fn derp_dropped(&self) -> u64 {
+        self.shared.lock().derp_dropped
     }
 
     /// A snapshot of the netmap.
@@ -886,20 +953,22 @@ async fn run_loop(
 
     loop {
         let now = Instant::now();
-        let deadline = {
+        let (deadline, backlog) = {
             let mut state = shared.lock();
             let mut deadline = next_stun;
+            let backlog = state.backlog.clone();
             for d in [
                 state.tunnel.next_deadline(),
                 state.paths.next_deadline(now),
-                state.netstack.poll_at(now),
+                // Held back, the stack always has something to send.
+                state.netstack.poll_at(now).filter(|_| backlog.is_none()),
             ]
             .into_iter()
             .flatten()
             {
                 deadline = deadline.min(d);
             }
-            deadline.max(now)
+            (deadline.max(now), backlog)
         };
 
         let mut transmits = Vec::new();
@@ -931,12 +1000,15 @@ async fn run_loop(
                 } else if disco::looks_like_disco(data) {
                     if direct {
                         let s = &mut *state;
-                        transmits =
-                            s.paths
-                                .on_disco(data, Via::Udp(src), Instant::now(), &s.netmap);
+                        transmits.extend(s.paths.on_disco(
+                            data,
+                            Via::Udp(src),
+                            Instant::now(),
+                            &s.netmap,
+                        ));
                     }
                 } else if wg::is_wireguard(data) {
-                    transmits = state.on_wireguard(data, Instant::now());
+                    transmits.extend(state.on_wireguard(data, Instant::now()));
                 }
             }};
         }
@@ -944,6 +1016,14 @@ async fn run_loop(
             recv = udp.recv_from(&mut buf) => {
                 if let Ok((n, src)) = recv {
                     datagram!(&buf[..n], src);
+                    // And what else has arrived: one pass of the stack for
+                    // all of it, and the kernel's buffer emptied sooner.
+                    for _ in 1..RECV_BATCH {
+                        let Ok((n, src)) = udp.try_recv_from(&mut buf) else {
+                            break;
+                        };
+                        datagram!(&buf[..n], src);
+                    }
                 }
             }
             recv = async {
@@ -954,17 +1034,33 @@ async fn run_loop(
             } => {
                 if let Ok((n, src)) = recv {
                     datagram!(&buf6[..n], src);
+                    if let Some(u) = &udp6 {
+                        for _ in 1..RECV_BATCH {
+                            let Ok((n, src)) = u.try_recv_from(&mut buf6) else {
+                                break;
+                            };
+                            datagram!(&buf6[..n], src);
+                        }
+                    }
                 }
             }
-            Some(Received { region, event }) = derp_rx.recv() => {
+            Some(first) = derp_rx.recv() => {
                 let mut state = shared.lock();
-                if let Event::Packet { from, data } = event {
-                    let now = Instant::now();
-                    if disco::looks_like_disco(&data) {
-                        let s = &mut *state;
-                        transmits = s.paths.on_disco(&data, Via::Derp { region, peer: from }, now, &s.netmap);
-                    } else if wg::is_wireguard(&data) {
-                        transmits = state.on_wireguard(&data, now);
+                let (mut next, mut taken) = (Some(first), 0);
+                while let Some(Received { region, event }) = next.take() {
+                    if let Event::Packet { from, data } = event {
+                        let now = Instant::now();
+                        if disco::looks_like_disco(&data) {
+                            let s = &mut *state;
+                            let via = Via::Derp { region, peer: from };
+                            transmits.extend(s.paths.on_disco(&data, via, now, &s.netmap));
+                        } else if wg::is_wireguard(&data) {
+                            transmits.extend(state.on_wireguard(&data, now));
+                        }
+                    }
+                    taken += 1;
+                    if taken < RECV_BATCH {
+                        next = derp_rx.try_recv().ok();
                     }
                 }
             }
@@ -981,6 +1077,17 @@ async fn run_loop(
                 }
             }
             _ = shared.wake.notified() => {}
+            // The full DERP queue is half empty again: let the sockets send.
+            // Or look again shortly, should its connection have dropped.
+            _ = async {
+                match &backlog {
+                    Some(tx) => {
+                        let room = tx.reserve_many((tx.max_capacity() / 2).max(1));
+                        let _ = tokio::time::timeout(BACKLOG_CHECK, room).await;
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {}
             _ = tokio::time::sleep_until(deadline.into()) => {}
         }
 
@@ -990,6 +1097,7 @@ async fn run_loop(
         {
             match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
                 Ok(socket) => {
+                    size_buffers(&socket, limits.udp_buffer);
                     udp = Arc::new(socket);
                     local_port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
                     let _ = port_tx.send(local_port);
@@ -997,7 +1105,7 @@ async fn run_loop(
                 Err(e) => tracing::warn!("rebind: no new UDP socket: {e}"),
             }
             if udp6.is_some() {
-                udp6 = bind_udp6();
+                udp6 = bind_udp6(0, limits.udp_buffer);
                 local_port6 = udp6
                     .as_ref()
                     .and_then(|u| u.local_addr().ok())
@@ -1085,8 +1193,14 @@ async fn run_loop(
                 match t.via {
                     Via::Udp(addr) => udp_sends.push((addr, t.data)),
                     Via::Derp { region, peer } => {
-                        if let Some((_, tx)) = state.derp.get(&region) {
-                            let _ = tx.try_send(derp::send_packet(&peer, &t.data));
+                        let full = state.derp.get(&region).is_some_and(|conn| {
+                            matches!(
+                                conn.tx.try_send(derp::send_packet(&peer, &t.data)),
+                                Err(mpsc::error::TrySendError::Full(_))
+                            )
+                        });
+                        if full {
+                            state.derp_dropped += 1;
                         }
                     }
                 }
@@ -1123,6 +1237,12 @@ async fn run_loop(
     }
 }
 
+/// How long the sockets wait on a full DERP queue before looking again.
+const BACKLOG_CHECK: Duration = Duration::from_millis(100);
+
+/// Datagrams taken from a socket (or from DERP) before the stack runs.
+const RECV_BATCH: usize = 64;
+
 /// Tasks aborted when dropped.
 #[derive(Default)]
 struct Tasks(Vec<JoinHandle<()>>);
@@ -1150,12 +1270,23 @@ fn ensure_derp(
     if state
         .derp
         .get(&region)
-        .is_some_and(|(made_for, tx)| *made_for == info && !tx.is_closed())
+        .is_some_and(|conn| conn.made_for == info && !conn.tx.is_closed())
     {
         return;
     }
     let (tx, rx) = mpsc::channel(state.derp_queue);
-    state.derp.insert(region, (info.clone(), tx));
+    let sending = derp_conn::Sending {
+        burst: state.derp_burst,
+        up: Arc::default(),
+    };
+    state.derp.insert(
+        region,
+        DerpConn {
+            made_for: info.clone(),
+            tx,
+            up: sending.up.clone(),
+        },
+    );
     let home = state.home_region == Some(region);
     tasks.0.retain(|t| !t.is_finished());
     tasks.0.push(tokio::spawn(derp_conn::run(
@@ -1164,6 +1295,7 @@ fn ensure_derp(
         home,
         events.clone(),
         rx,
+        sending,
     )));
 }
 
@@ -1179,7 +1311,7 @@ fn refresh_derp(
     let stale: Vec<i32> = state
         .derp
         .iter()
-        .filter(|(region, (made_for, _))| state.netmap.derp_regions.get(region) != Some(made_for))
+        .filter(|(region, conn)| state.netmap.derp_regions.get(region) != Some(&conn.made_for))
         .map(|(region, _)| *region)
         .collect();
     for region in stale {
@@ -1197,19 +1329,37 @@ fn canonical(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+/// Ask for `bytes` of kernel buffer each way (0: leave the default). The
+/// system grants what it allows; less is not an error.
+fn size_buffers(socket: &UdpSocket, bytes: usize) {
+    if bytes == 0 {
+        return;
+    }
+    let socket = socket2::SockRef::from(socket);
+    let _ = socket.set_recv_buffer_size(bytes);
+    let _ = socket.set_send_buffer_size(bytes);
+    tracing::debug!(
+        "UDP buffers: {:?} in, {:?} out",
+        socket.recv_buffer_size(),
+        socket.send_buffer_size()
+    );
+}
+
 /// A UDP socket on `[::]`, IPv6 only (so it does not take the IPv4 port
 /// space too). `None` where IPv6 is unavailable.
-fn bind_udp6() -> Option<Arc<UdpSocket>> {
+fn bind_udp6(port: u16, buffer: usize) -> Option<Arc<UdpSocket>> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let bind = || -> io::Result<UdpSocket> {
+    let bind = |port: u16| -> io::Result<UdpSocket> {
         let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
         socket.set_only_v6(true)?;
         socket.set_nonblocking(true)?;
-        socket.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())?;
+        socket.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())?;
         UdpSocket::from_std(socket.into())
     };
-    match bind() {
+    // `port` if it is free, or any.
+    match bind(port).or_else(|_| bind(0)) {
         Ok(socket) => {
+            size_buffers(&socket, buffer);
             tracing::debug!("IPv6 UDP socket on {:?}", socket.local_addr());
             Some(Arc::new(socket))
         }
@@ -1318,8 +1468,26 @@ impl State {
     /// Run the stack and the timers until they are quiet.
     fn pump(&mut self, now: Instant) -> Vec<Transmit> {
         let mut transmits = Vec::new();
+        // What the fullest queue of a connected DERP region still takes
+        // (one still connecting keeps what fits and drops the rest). The
+        // stack does not know which way a packet will go, so this holds
+        // back every socket: but sending on would only drop packets and
+        // have TCP send them again.
+        let fullest = self
+            .derp
+            .values()
+            .filter(|conn| conn.is_up() && !conn.tx.is_closed())
+            .map(|conn| &conn.tx)
+            .min_by_key(|tx| tx.capacity())
+            .cloned();
+        let mut room = fullest.as_ref().map_or(usize::MAX, |tx| tx.capacity());
+        self.backlog = None;
         for _ in 0..64 {
-            let packets = self.netstack.poll(now);
+            let packets = self.netstack.poll(now, room);
+            room = room.saturating_sub(packets.len());
+            if room == 0 {
+                self.backlog.clone_from(&fullest);
+            }
             if packets.is_empty() {
                 break;
             }

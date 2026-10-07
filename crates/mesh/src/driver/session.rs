@@ -30,6 +30,8 @@ const IDENTITY: &str = "identity.json";
 const CONTROL_URL: &str = "control-url";
 const LOCK: &str = "mesh.lock";
 const TKA: &str = "tka.json";
+/// The UDP port of the last run, to come back on (`Limits::udp_port`).
+const UDP_PORT: &str = "udp-port";
 /// How long reaching a peer through the proxy may take; an offline peer
 /// never answers.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -155,6 +157,14 @@ impl Session {
             tracing::info!("joining the mesh as {}", options.hostname);
         }
 
+        let mut limits = options.limits;
+        if limits.udp_port == 0 {
+            limits.udp_port = tokio::fs::read_to_string(statedir.join(UDP_PORT))
+                .await
+                .ok()
+                .and_then(|port| port.trim().parse().ok())
+                .unwrap_or(0);
+        }
         let config = Config {
             control_url: control_url.clone(),
             identity,
@@ -163,7 +173,7 @@ impl Session {
             ephemeral: options.ephemeral,
             tags: Vec::new(),
             direct: true,
-            limits: options.limits,
+            limits,
         };
         let store = Arc::new(super::lock::FileLockStore(statedir.join(TKA)));
         let node_key = config.identity.node_public().text();
@@ -182,6 +192,8 @@ impl Session {
             Ok(Err(e)) => return Err(SessionError::Join(e)),
         };
         tokio::fs::write(&control_path, &control_url).await?;
+        // Best effort: without it the next run takes any port.
+        let _ = tokio::fs::write(statedir.join(UDP_PORT), node.udp_port().to_string()).await;
         match node.lock_status() {
             super::lock::LockStatus::Locked {
                 locked_out: true, ..

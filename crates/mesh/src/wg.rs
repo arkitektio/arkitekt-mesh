@@ -41,6 +41,17 @@ pub const REJECT_AFTER_TIME: Duration = Duration::from_secs(180);
 pub const REKEY_ATTEMPT_TIME: Duration = Duration::from_secs(90);
 pub const REKEY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The first retries of a handshake with a peer we hold no session with.
+/// A node that has just joined (or come back) is often ahead of the peer's
+/// own view of the tailnet: the peer drops an initiation from a node it
+/// does not know yet, and waiting [`REKEY_TIMEOUT`] to try again makes the
+/// first connection take five seconds.
+const FIRST_RETRIES: [Duration; 10] = {
+    let mut waits = [Duration::from_secs(1); 10];
+    waits[0] = Duration::from_millis(250);
+    waits[1] = Duration::from_millis(500);
+    waits
+};
 const COOKIE_LIFETIME: Duration = Duration::from_secs(120);
 /// Packets held for a peer while its handshake is in flight (default).
 pub const MAX_QUEUED: usize = 128;
@@ -258,11 +269,12 @@ impl Tunnel {
                     self.indices.remove(&h.local_index);
                     p.queue.clear();
                     tracing::debug!("handshake with {:?} timed out", key);
-                } else if now.duration_since(h.sent) >= REKEY_TIMEOUT {
-                    let started = h.started;
+                } else if now >= h.retry_at(p.current.is_none()) {
+                    let (started, retries) = (h.started, h.retries + 1);
                     self.initiate(key, now, &mut out);
                     if let Some(h) = self.peers.get_mut(&key).and_then(|p| p.handshake.as_mut()) {
                         h.started = started;
+                        h.retries = retries;
                     }
                 }
                 continue;
@@ -305,7 +317,10 @@ impl Tunnel {
         self.peers
             .values()
             .filter_map(|p| {
-                let handshake = p.handshake.as_ref().map(|h| h.sent + REKEY_TIMEOUT);
+                let handshake = p
+                    .handshake
+                    .as_ref()
+                    .map(|h| h.retry_at(p.current.is_none()));
                 let keepalive = p.keepalive_due;
                 let unanswered = p
                     .first_unanswered
@@ -357,6 +372,7 @@ impl Tunnel {
             chaining_key: state.1,
             started: now,
             sent: now,
+            retries: 0,
         });
         out.send(peer, msg);
     }
@@ -648,6 +664,21 @@ struct Handshake {
     /// When this round of attempts began, and when the last one was sent.
     started: Instant,
     sent: Instant,
+    /// How often it was sent again.
+    retries: usize,
+}
+
+impl Handshake {
+    /// When to send it again, unanswered. `first`: there is no session with
+    /// the peer yet.
+    fn retry_at(&self, first: bool) -> Instant {
+        let wait = FIRST_RETRIES
+            .get(self.retries)
+            .filter(|_| first)
+            .copied()
+            .unwrap_or(REKEY_TIMEOUT);
+        self.sent + wait
+    }
 }
 
 struct Session {
@@ -956,10 +987,16 @@ mod tests {
         let (mut a, _b, _ka, kb) = pair();
         let t0 = Instant::now();
         a.encapsulate(kb, &ipv4(b"x"), t0).unwrap();
-        assert!(a.tick(t0 + Duration::from_secs(1)).send.is_empty());
-        let retry = a.tick(t0 + REKEY_TIMEOUT);
-        assert_eq!(retry.send.len(), 1);
-        assert_eq!(retry.send[0].1[0], TYPE_INITIATION);
+        // No session yet: soon at first, then every REKEY_TIMEOUT.
+        let mut t = t0;
+        for wait in FIRST_RETRIES.into_iter().chain([REKEY_TIMEOUT; 2]) {
+            assert!(a.tick(t + wait - Duration::from_millis(1)).send.is_empty());
+            assert_eq!(a.next_deadline(), Some(t + wait));
+            t += wait;
+            let retry = a.tick(t);
+            assert_eq!(retry.send.len(), 1);
+            assert_eq!(retry.send[0].1[0], TYPE_INITIATION);
+        }
         let _ = a.tick(t0 + REKEY_ATTEMPT_TIME + Duration::from_secs(1));
         assert!(a
             .tick(t0 + REKEY_ATTEMPT_TIME + Duration::from_secs(10))
