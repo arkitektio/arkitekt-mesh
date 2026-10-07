@@ -1,14 +1,18 @@
 name: release
 
 # `arkitekt-mesh` on PyPI: the in-process Python bindings (crates/mesh-py),
-# as abi3 wheels for every platform plus an sdist, published on a
-# `mesh-vX.Y.Z` tag (X.Y.Z must be the workspace version) with PyPI trusted
+# as abi3 wheels for every platform plus an sdist, published with PyPI trusted
 # publishing (this workflow, no environment). Every wheel is installed and run
 # on its platform before anything is published. The runbook:
 # docs/releasing-python.md.
 #
-# Run it by hand (workflow_dispatch) to build and smoke-test everything
-# without publishing.
+# It publishes when it runs on a tag whose version is the workspace version:
+# - `vX.Y.Z`, the release's own tag. release-plz.yml starts this workflow on
+#   it after every release (a tag release-plz pushes starts nothing by itself).
+# - `mesh-vX.Y.Z`, pushed by hand, to publish outside of that.
+#
+# Run it by hand on a branch (workflow_dispatch) to build and smoke-test
+# everything without publishing.
 on:
   workflow_dispatch:
   push:
@@ -28,9 +32,12 @@ jobs:
         run: |
           cargo_version="$(cargo metadata --no-deps --format-version 1 \
             | jq -r '.packages[] | select(.name == "arkitekt-mesh-py") | .version')"
-          # A manual run builds the workspace version.
+          # A run on a branch builds the workspace version.
           version="$cargo_version"
-          [[ "$GITHUB_REF" == refs/tags/mesh-v* ]] && version="${GITHUB_REF_NAME#mesh-v}"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#mesh-}"
+            version="${version#v}"
+          fi
           if [ "$version" != "$cargo_version" ]; then
             echo "tag $GITHUB_REF_NAME does not match the workspace version $cargo_version" >&2
             exit 1
@@ -212,7 +219,7 @@ jobs:
           twine check --strict dist/*
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/mesh-v')
+    if: github.ref_type == 'tag'
     needs: [sdist, smoke]
     runs-on: ubuntu-latest
     permissions:
@@ -224,3 +231,7 @@ jobs:
           merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # A second run for the same version (a re-run, or `mesh-vX.Y.Z` after
+          # `vX.Y.Z`) uploads what is missing instead of failing.
+          skip-existing: true
