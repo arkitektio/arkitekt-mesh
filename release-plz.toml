@@ -1,0 +1,25 @@
+# Lockstep releases: every crate shares one version and one `vX.Y.Z` tag.
+# semantic-release (releaserc.toml) decides the version, writes CHANGELOG.md,
+# tags and creates the GitHub release; release-plz only publishes the crates
+# (`release-plz release`, in ci.yml's `release` job).
+[workspace]
+changelog_update = false
+git_release_enable = false
+git_tag_enable = false
+
+[[package]]
+name = "arkitekt-mesh"
+version_group = "arkitekt-mesh"
+
+# The sidecar binary (`cargo install arkitekt-meshd`); its prebuilt binaries
+# are attached to the GitHub release by .github/workflows/meshd.yml.
+[[package]]
+name = "arkitekt-meshd"
+version_group = "arkitekt-mesh"
+
+# Published to PyPI (as `arkitekt-mesh`) by .github/workflows/release.yaml,
+# not to crates.io.
+[[package]]
+name = "arkitekt-mesh-py"
+version_group = "arkitekt-mesh"
+publish = false

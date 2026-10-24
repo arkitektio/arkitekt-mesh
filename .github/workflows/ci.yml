@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # The end-to-end tests run tailscale's Go test servers and a tsnet peer.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/mesh/tests/harness/go.mod
+          cache-dependency-path: crates/mesh/tests/harness/go.sum
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo test --workspace
+
+  # The node on every platform meshd ships for.
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p arkitekt-mesh --features session,relay
+      - run: cargo test -p arkitekt-mesh --lib
+
+  # What the ESP32 firmware (arkitektio/arkitekt-mesh-esp32) builds: the mesh
+  # without its default features (no ring, no udp, no tka-disable, no portmap).
+  embedded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check -p arkitekt-mesh --no-default-features
+      - run: cargo check -p arkitekt-mesh --no-default-features --features tokio
+
+  # Squash-merged PR titles become the commits semantic-release reads, so enforce Conventional Commits.
+  pr-title:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Every push to main that carries a `feat`, `fix` or `perf` (or a breaking
+  # change) is a release, once the jobs above are green: semantic-release
+  # (releaserc.toml) bumps the version every crate shares, commits, tags
+  # `vX.Y.Z` and creates the GitHub release; then the crates go to crates.io,
+  # the Python bindings to PyPI and the meshd binaries onto the release.
+  release:
+    needs: [test, native, embedded]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'arkitektio'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      id-token: write # crates.io trusted publishing
+      actions: write # starts release.yaml and meshd.yml
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v6
+      # Sets the `released`, `version` and `tag` outputs.
+      - name: semantic-release
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: uvx --from python-semantic-release==9.21.1 semantic-release -c releaserc.toml version
+      # Publishes every crate whose version is not on crates.io yet, in
+      # dependency order (release-plz.toml).
+      - uses: release-plz/action@v0.5
+        if: steps.version.outputs.released == 'true'
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only needed until trusted publishing is configured on crates.io.
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      # `arkitekt-mesh` on PyPI (release.yaml) and the meshd binaries
+      # (meshd.yml), built on the release's tag. The tag was pushed with
+      # GITHUB_TOKEN, which starts no workflow; a dispatch does.
+      - name: Publish arkitekt-mesh to PyPI and the meshd binaries
+        if: steps.version.outputs.released == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh workflow run release.yaml --repo "$GITHUB_REPOSITORY" --ref "$TAG"
+          gh workflow run meshd.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG"

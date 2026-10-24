@@ -27,7 +27,7 @@ it. `publish` runs only after both have passed.
 ## One-time setup
 
 On PyPI, add a trusted publisher for `arkitekt-mesh`: owner `arkitektio`,
-repository `arkirust`, workflow `release.yaml`, no environment.
+repository `arkitekt-mesh`, workflow `release.yaml`, no environment.
 
 ## Each release
 

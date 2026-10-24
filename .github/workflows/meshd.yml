@@ -48,7 +48,6 @@ jobs:
           cache-dependency-path: crates/mesh/tests/harness/go.sum
       - run: cargo test -p arkitekt-mesh --features session,relay
       - run: cargo test -p arkitekt-meshd
-      - run: cargo test -p fakts --features mesh-relay
 
   test-python:
     strategy:

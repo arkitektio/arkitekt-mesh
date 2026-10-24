@@ -1,0 +1,19 @@
+# Releases: python-semantic-release reads the Conventional Commits since the
+# last `vX.Y.Z` tag, bumps the one version every crate shares, commits, tags
+# and creates the GitHub release (the `release` job in .github/workflows/ci.yml,
+# which then publishes the crates, the Python bindings and the meshd binaries).
+[semantic_release]
+tag_format = "v{version}"
+# Pre-1.0: a breaking change bumps the minor, not to 1.0.0.
+allow_zero_version = true
+major_on_zero = false
+version_toml = [
+    "Cargo.toml:workspace.package.version",
+    "Cargo.toml:workspace.dependencies.mesh.version",
+]
+# Cargo.lock carries the workspace's own versions too.
+build_command = "cargo update --workspace"
+assets = ["Cargo.lock"]
+
+[semantic_release.branches.main]
+match = "main"

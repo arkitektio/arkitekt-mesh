@@ -1,4 +1,4 @@
-module github.com/arkitektio/arkirust/crates/mesh/tests/harness
+module github.com/arkitektio/arkitekt-mesh/crates/mesh/tests/harness
 
 go 1.26.6
 
