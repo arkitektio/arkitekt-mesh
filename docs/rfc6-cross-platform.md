@@ -75,6 +75,6 @@ Windows binaries and wheels that nobody has run. Known risk areas:
 - **A mesh-lab run from a real macOS or Windows machine.**
 - **Gateway discovery for port mapping** on macOS and Windows.
 - **The ESP32 firmware** moved to its own repo,
-  [arkitekt-mesh-esp32](https://github.com/arkitektio/arkitekt-mesh-esp32).
+  [esp32-mesh-demo](https://github.com/arkitektio/esp32-mesh-demo).
   This repo only checks that the mesh builds without its default features
   (`ci.yml`, `mesh-embedded`).

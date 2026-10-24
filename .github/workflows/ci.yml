@@ -38,7 +38,7 @@ jobs:
       - run: cargo check -p arkitekt-mesh --features session,relay
       - run: cargo test -p arkitekt-mesh --lib
 
-  # What the ESP32 firmware (arkitektio/arkitekt-mesh-esp32) builds: the mesh
+  # What the ESP32 firmware (arkitektio/esp32-mesh-demo) builds: the mesh
   # without its default features (no ring, no udp, no tka-disable, no portmap).
   embedded:
     runs-on: ubuntu-latest
