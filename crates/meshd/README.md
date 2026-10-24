@@ -35,5 +35,7 @@ arkitekt-meshd --statedir DIR --hostname NAME [--control-url URL] [--listen 127.
 - **Shutdown:** it exits when **stdin closes**, so it never outlives its
   parent. Pass `--no-stdin` to run it interactively.
 
-Wheels carrying the binary (`pip install arkitekt-meshd`) are built from
-`python/` by `.github/workflows/meshd.yml`.
+Prebuilt binaries for every platform are attached to the GitHub releases by
+`.github/workflows/meshd.yml`; `cargo install arkitekt-meshd` builds it from
+crates.io. (Python apps that want the node without a binary use the
+`arkitekt-mesh` package on PyPI, which runs it in-process.)
