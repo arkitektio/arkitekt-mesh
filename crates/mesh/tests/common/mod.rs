@@ -30,7 +30,7 @@ pub struct Harness {
 fn binary() -> Option<PathBuf> {
     static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
     BIN.get_or_init(|| {
-        // Also used from other crates' tests (fakts), next to this one.
+        // Also used from meshd's tests, next to this one.
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let Some(dir) = [
             manifest.join("tests/harness"),
