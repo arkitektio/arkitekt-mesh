@@ -390,8 +390,9 @@ cmd_test() {
   (cd "$root" \
     && cargo test -p arkitekt-mesh --features session,relay --test lab --test lab_restart --test lab_firmware_tls --test lab_acl --test lab_lock \
     && cargo test -p arkitekt-meshd --test lab \
-    && if [ -n "${ARKITEKT_TEST_LIVEKIT_HOST:-}" ]; then
-         cargo test -p arkitekt-lovekit --features livekit --test lab_livekit
+    && if [ -n "${ARKITEKT_TEST_LIVEKIT_HOST:-}" ] && [ -d "$root/../arkirust" ]; then
+         # lovekit's test lives in arkirust (checked out next to this repository).
+         (cd "$root/../arkirust" && cargo test -p arkitekt-lovekit --features livekit --test lab_livekit)
        fi)
   if [ "${1:-}" = "--python" ]; then
     (cd "$root/crates/mesh-py" && uv run --with maturin --with pytest sh -c \
