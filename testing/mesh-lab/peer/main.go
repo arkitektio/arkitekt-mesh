@@ -16,6 +16,7 @@ import (
 	"strconv"
 
 	"tailscale.com/tsnet"
+	"tailscale.com/util/clientmetric"
 )
 
 func main() {
@@ -77,7 +78,8 @@ func main() {
 
 // peerHandler answers "hello from peer", and for the benchmarks
 // (tests/bench.rs) serves /bytes?n=N (N zero bytes) and drains a POST to
-// /sink, answering how many bytes arrived.
+// /sink, answering how many bytes arrived. /debug/metrics is tailscale's own
+// counters (e.g. its DERP sends dropped), in Prometheus' format.
 func peerHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/bytes":
@@ -91,6 +93,8 @@ func peerHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			n -= m
 		}
+	case "/debug/metrics":
+		clientmetric.WritePrometheusExpositionFormat(w)
 	case "/sink":
 		n, _ := io.Copy(io.Discard, r.Body)
 		fmt.Fprint(w, n)

@@ -8,6 +8,10 @@ services:
       context: ${IONSKALE_SRC:-.}
       dockerfile: tests/docker/ionscale/Dockerfile
     command: ["server", "--config", "/etc/ionscale/config.yaml"]
+    environment:
+      # The packets its DERP relay queues per receiver (tailscale's 32 when
+      # empty), e.g. `MESH_LAB_DERP_QUEUE=512 lab.sh up`.
+      TS_DEBUG_DERP_PER_CLIENT_SEND_QUEUE_DEPTH: ${MESH_LAB_DERP_QUEUE:-}
     volumes:
       - ./.lab/config.yaml:/etc/ionscale/config.yaml:ro
       - ./.lab/tls:/etc/ionscale/tls:ro
