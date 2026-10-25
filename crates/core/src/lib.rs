@@ -27,6 +27,7 @@ pub mod crypto;
 pub mod derp;
 pub mod disco;
 pub mod filter;
+pub mod http2;
 pub mod keys;
 pub mod lock;
 pub mod nacl;

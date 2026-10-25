@@ -61,3 +61,8 @@ testing = []
 
 [dev-dependencies]
 hmac = "0.12"
+# tests/http2.rs: our HTTP/2 client against the h2 crate's server.
+tokio = { version = "1", features = ["rt", "macros", "io-util", "time"] }
+h2 = "0.4"
+http = "1"
+bytes = "1"
