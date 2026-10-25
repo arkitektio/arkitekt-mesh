@@ -247,9 +247,9 @@ impl Mesh {
             .map_err(|e| e.to_string())?;
         let conn = ControlConn::new(
             &url.authority,
-            &self.config.machine_key,
+            &self.config().machine_key,
             &server_key,
-            self.config.http2,
+            self.config().http2,
         )
         .map_err(|e| e.to_string())?;
         Ok(Live {
@@ -273,9 +273,9 @@ impl Mesh {
         let server_key = api::parse_server_key(status, &body).map_err(|e| e.to_string())?;
         let (conn, path) = ControlConn::upgraded(
             &url.authority,
-            &self.config.machine_key,
+            &self.config().machine_key,
             &server_key,
-            self.config.http2,
+            self.config().http2,
         )
         .map_err(|e| e.to_string())?;
         let ws = if url.https { "wss" } else { "ws" };
@@ -387,7 +387,7 @@ impl Mesh {
         let (Some(info), Some(lock)) = (info, lock) else {
             return self.apply(resp);
         };
-        let node_key = NodePublic(self.config.node_key.public());
+        let node_key = NodePublic(self.config().node_key.public());
         let (sync, step) = LockSync::start(node_key, info, lock);
         let mut held = VecDeque::new();
         held.push_back(resp);
@@ -466,12 +466,12 @@ impl Mesh {
         }
         let start = inner.start.take().expect("starting");
         let mut core = NodeCore::new(
-            self.config.node_key.clone(),
+            self.config().node_key.clone(),
             start.paths.expect("paths"),
             start.netmap,
             start.filter_sets,
             start.lock,
-            self.config.settings,
+            self.config().settings,
             now(),
         );
         core.set_udp_ports(0, None);

@@ -116,14 +116,14 @@ impl Mesh {
                     .await;
             (
                 opened,
-                DerpConn::upgraded(self.config.node_key.clone(), home, now()),
+                DerpConn::upgraded(self.config().node_key.clone(), home, now()),
             )
         } else {
             let opened =
                 embassy_time::with_deadline(handshake_by, dial.dial(&host, port, tls)).await;
             (
                 opened,
-                DerpConn::new(&authority, self.config.node_key.clone(), home, now()),
+                DerpConn::new(&authority, self.config().node_key.clone(), home, now()),
             )
         };
         let mut stream = opened

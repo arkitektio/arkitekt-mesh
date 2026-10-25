@@ -215,3 +215,38 @@ async fn a_session_rejoins_without_key_or_url() {
     })
     .await;
 }
+
+/// A node ionskale knows comes back without its key, and with its key
+/// expired: a board's later boots (the login's mesh key long expired) are
+/// the same node again.
+#[tokio::test]
+async fn a_known_node_rejoins_without_its_key_and_with_it_expired() {
+    let Some(lab) = lab() else { return };
+    let key = lab.admin(&["key", "--expiry", "15s"]).trim().to_owned();
+    let hostname = lab.hostname("rejoin");
+    let mut first = lab.config(&hostname, false);
+    first.auth_key = Some(key.clone());
+    first.ephemeral = false;
+    let node = Node::start(first.clone()).await.unwrap();
+    let addresses = node.addresses().to_vec();
+    drop(node);
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    for auth_key in [None, Some(key)] {
+        let again = mesh::driver::Config {
+            auth_key: auth_key.clone(),
+            ..first.clone()
+        };
+        let node = Node::start(again)
+            .await
+            .unwrap_or_else(|e| panic!("rejoining with {auth_key:?}: {e}"));
+        assert_eq!(node.addresses(), addresses, "the same node");
+        let response = eventually(30, "the peer over the mesh", || get(&node, &lab.peer)).await;
+        assert!(
+            response.ends_with("hello from peer") || response.starts_with("HTTP/1.1 200"),
+            "{response}"
+        );
+        drop(node);
+    }
+    lab.admin(&["delete", &hostname]);
+}

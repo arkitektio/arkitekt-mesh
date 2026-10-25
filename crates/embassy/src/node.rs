@@ -77,7 +77,7 @@ impl Mesh {
 
     /// What the fullest connected DERP queue still takes.
     fn derp_room(&self, inner: &Inner) -> usize {
-        let cap = self.config.derp_queue.max(1);
+        let cap = self.config().derp_queue.max(1);
         inner
             .slots
             .iter()
@@ -90,7 +90,7 @@ impl Mesh {
     /// Each transmit to UDP or to its region's DERP slot (dropped when the
     /// slot's queue is full, as the core counts).
     pub(crate) fn dispatch(&self, inner: &mut Inner, transmits: Vec<Transmit>) {
-        let cap = self.config.derp_queue.max(1);
+        let cap = self.config().derp_queue.max(1);
         for t in transmits {
             match t.via {
                 Via::Udp(to) => inner

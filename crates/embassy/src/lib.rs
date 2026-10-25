@@ -217,7 +217,7 @@ struct Inner {
 
 /// The node: shared by its tasks and the app's sockets (one executor).
 pub struct Mesh {
-    config: Config,
+    config: RefCell<Config>,
     inner: RefCell<Inner>,
     node_wake: Signal<NoopRawMutex, ()>,
     control_wake: Signal<NoopRawMutex, ()>,
@@ -236,6 +236,27 @@ pub(crate) fn at(instant: Instant) -> embassy_time::Instant {
 impl Mesh {
     /// A node, not yet running ([`run`](Self::run)).
     pub fn new(config: Config) -> Self {
+        Self {
+            inner: RefCell::new(Self::fresh(&config)),
+            config: RefCell::new(config),
+            node_wake: Signal::new(),
+            control_wake: Signal::new(),
+            slot_wake: core::array::from_fn(|_| Signal::new()),
+        }
+    }
+
+    /// Start over with `config`, in place, once [`run`](Self::run) ended
+    /// (control refused the node, or could not be reached, before it
+    /// joined): then run it again. A board makes one node and keeps it,
+    /// instead of a new one for every attempt. Sockets of the old node are
+    /// gone; it must not be running.
+    pub fn restart(&self, config: Config) {
+        *self.inner.borrow_mut() = Self::fresh(&config);
+        *self.config.borrow_mut() = config;
+    }
+
+    /// The state of a node that has not started.
+    fn fresh(config: &Config) -> Inner {
         let node_public = NodePublic(config.node_key.public());
         let mut paths = Paths::new(PrivateKey::generate(), node_public);
         paths.set_udp(config.settings.direct);
@@ -260,31 +281,30 @@ impl Mesh {
             String::new(),
             now(),
         );
-        Self {
-            inner: RefCell::new(Inner {
-                core: None,
-                start: Some(Start {
-                    paths: Some(paths),
-                    netmap: Default::default(),
-                    filter_sets: Default::default(),
-                    lock: mesh_core::lock::Lock::new(config.lock_store.clone()),
-                }),
-                session,
-                udp_out: VecDeque::new(),
-                slots: Default::default(),
-                joined: Vec::new(),
+        Inner {
+            core: None,
+            start: Some(Start {
+                paths: Some(paths),
+                netmap: Default::default(),
+                filter_sets: Default::default(),
+                lock: mesh_core::lock::Lock::new(config.lock_store.clone()),
             }),
-            config,
-            node_wake: Signal::new(),
-            control_wake: Signal::new(),
-            slot_wake: core::array::from_fn(|_| Signal::new()),
+            session,
+            udp_out: VecDeque::new(),
+            slots: Default::default(),
+            joined: Vec::new(),
         }
+    }
+
+    /// The node's config (borrowed briefly: never across an await).
+    pub(crate) fn config(&self) -> core::cell::Ref<'_, Config> {
+        self.config.borrow()
     }
 
     /// Run the node: control, DERP and UDP, until control will not have it
     /// (before it first joined: refused, or unreachable).
     pub async fn run<U: Udp, D: Dial>(&self, udp: &U, dial: &D) -> Result<(), MeshError> {
-        let url = control::Url::parse(&self.config.control_url)?;
+        let url = control::Url::parse(&self.config().control_url)?;
         let derp = embassy_futures::join::join(self.slot_task(0, dial), self.slot_task(1, dial));
         match embassy_futures::select::select3(
             self.control_task(&url, dial),

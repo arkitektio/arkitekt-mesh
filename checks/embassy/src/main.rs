@@ -4,7 +4,8 @@
 //! cargo run -- harness   # the Go harness (needs go), as CI runs it
 //! cargo run -- lab       # the mesh lab's ionskale: eval "$(testing/mesh-lab/lab.sh env)"
 //! cargo run -- harness --derp-only   # no direct paths: everything through DERP
-//! cargo run -- lab --board-tls       # control and DERP through the board's TLS (embedded-tls)
+//! cargo run -- lab --board-tls       # control and DERP through the board's TLS (arkitekt-embassy)
+//! cargo run -- harness --restart     # refused first (a wrong key), then restarted in place
 //! ```
 //!
 //! The node joins, then reaches the peer over the tunnel: HTTP on :80 (or
@@ -252,8 +253,25 @@ async fn main(spawner: Spawner) {
             "direct paths allowed"
         }
     );
+    let restart = std::env::args().any(|a| a == "--restart");
+    let good = config.clone();
+    if restart {
+        config.auth_key = Some("tskey-not-a-key".into());
+    }
     let mesh = Mesh::new(config);
     let udp = host::HostUdp::bind();
+    if restart {
+        // Refused before it joined: run ends, and the same node starts over.
+        let refused = embassy_time::with_timeout(
+            embassy_time::Duration::from_secs(30),
+            mesh.run(&udp, &host::HostDial::new()),
+        )
+        .await
+        .expect("a refusal in time");
+        println!("refused: {refused:?}");
+        assert!(refused.is_err(), "a wrong key is refused");
+        mesh.restart(good);
+    }
     let finished = if std::env::args().any(|a| a == "--board-tls") {
         println!("the board's TLS (embedded-tls)");
         board::install_runtime(spawner);

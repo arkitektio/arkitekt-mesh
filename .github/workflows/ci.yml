@@ -114,6 +114,9 @@ jobs:
         working-directory: checks/embassy
       - run: cargo run -- harness --derp-only
         working-directory: checks/embassy
+      # Refused first (a wrong key), then the same node restarted in place.
+      - run: cargo run -- harness --restart
+        working-directory: checks/embassy
       # Two DERP regions: the node's second slot, and rehoming.
       - run: cargo run -- harness --derp-only
         working-directory: checks/embassy
