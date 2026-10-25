@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arkitekt-mesh-core",
  "async-trait",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-core"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "argon2",
  "base64",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-embassy"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arkitekt-mesh-core",
  "embassy-futures",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-py"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arkitekt-mesh",
  "pyo3",
@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-web"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arkitekt-mesh-core",
  "arkitekt-mesh-embassy",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-meshd"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "arkitekt-mesh",
  "reqwest",
