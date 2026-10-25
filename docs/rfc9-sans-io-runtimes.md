@@ -273,6 +273,15 @@ Each phase ends green and could be released. Gates every time:
 7. **arkirust and the board.** The joiner contract and the routing
    `TcpConnect` in fakts / arkitekt-embassy (an arkirust release), then the
    `mesh` feature in `esp32-embassy-demo` (S3 + PSRAM).
+   7a done: the board's TLS under the driver. `checks/embassy -- harness
+   --board-tls` dials through arkitekt-embassy's `conn::open`. With
+   embedded-tls 0.19 (arkirust 0.16) a 256 KiB echo over DERP stalled
+   every time: its read keeps each record header on its stack, so a
+   cancelled read loses it (the driver's `select`s cancel reads all the
+   time). arkitekt-embassy now speaks TLS through rustls's unbuffered client
+   with RustCrypto (cancel-safe by construction; 1 MiB over DERP in 4.4 s);
+   unreleased (arkirust 0.17). The check's `--board-tls` step joins CI once
+   that is on crates.io (`MESH_CHECK_ECHO_KIB=1024`).
 
 ## Decided
 

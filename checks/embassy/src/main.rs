@@ -4,11 +4,13 @@
 //! cargo run -- harness   # the Go harness (needs go), as CI runs it
 //! cargo run -- lab       # the mesh lab's ionskale: eval "$(testing/mesh-lab/lab.sh env)"
 //! cargo run -- harness --derp-only   # no direct paths: everything through DERP
+//! cargo run -- lab --board-tls       # control and DERP through the board's TLS (embedded-tls)
 //! ```
 //!
 //! The node joins, then reaches the peer over the tunnel: HTTP on :80 (or
 //! the lab peer's), and 64 KiB through the harness peer's TCP echo on :7.
 
+mod board;
 mod host;
 
 use std::io::{BufRead, BufReader};
@@ -181,8 +183,13 @@ async fn scenario(mesh: &Mesh, target: &Target, derp_only: bool) {
         response.lines().next().unwrap_or("")
     );
     if target.echo {
-        echo(mesh, &target.peer_ip, 64 << 10).await;
-        println!("64 KiB through the peer's echo");
+        // MESH_CHECK_ECHO_KIB: more, to stress a connection's reads.
+        let kib: usize = std::env::var("MESH_CHECK_ECHO_KIB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        echo(mesh, &target.peer_ip, kib << 10).await;
+        println!("{kib} KiB through the peer's echo");
     }
     if derp_only {
         assert_eq!(
@@ -195,8 +202,27 @@ async fn scenario(mesh: &Mesh, target: &Target, derp_only: bool) {
     }
 }
 
+/// The node beside the scenario, for a minute at most: whether it ended.
+async fn drive<D: mesh_embassy::Dial>(
+    mesh: &Mesh,
+    udp: &host::HostUdp,
+    dial: &D,
+    target: &Target,
+    derp_only: bool,
+) -> bool {
+    let run = async {
+        match select(mesh.run(udp, dial), scenario(mesh, target, derp_only)).await {
+            Either::First(result) => panic!("the node ended: {result:?}"),
+            Either::Second(()) => {}
+        }
+    };
+    embassy_time::with_timeout(embassy_time::Duration::from_secs(60), run)
+        .await
+        .is_ok()
+}
+
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -228,18 +254,14 @@ async fn main(_spawner: Spawner) {
     );
     let mesh = Mesh::new(config);
     let udp = host::HostUdp::bind();
-    let dial = host::HostDial::new();
-
-    let run = async {
-        match select(mesh.run(&udp, &dial), scenario(&mesh, &target, derp_only)).await {
-            Either::First(result) => panic!("the node ended: {result:?}"),
-            Either::Second(()) => {}
-        }
+    let finished = if std::env::args().any(|a| a == "--board-tls") {
+        println!("the board's TLS (embedded-tls)");
+        board::install_runtime(spawner);
+        drive(&mesh, &udp, &board::BoardDial::new(), &target, derp_only).await
+    } else {
+        drive(&mesh, &udp, &host::HostDial::new(), &target, derp_only).await
     };
-    if embassy_time::with_timeout(embassy_time::Duration::from_secs(60), run)
-        .await
-        .is_err()
-    {
+    if !finished {
         eprintln!("FAILED: timed out");
         std::process::exit(1);
     }

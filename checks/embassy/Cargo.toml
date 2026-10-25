@@ -5,6 +5,7 @@
 # run -- lab` the mesh lab's ionskale (its environment loaded), and talks
 # to the peer over the tunnel. The only run before hardware. Not a
 # workspace member: its std executor must not meet a board's features.
+# `-- lab --board-tls` dials through the firmware's TLS (embedded-tls).
 [package]
 name = "mesh-embassy-check"
 version = "0.0.0"
@@ -30,3 +31,9 @@ critical-section = { version = "1", features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# --board-tls: the firmware's TLS (embedded-tls, through arkitekt-embassy).
+arkitekt-embassy = "0.16"
+# Without std, as arkitekt-embassy has rekuest: arkirust 0.16 does not build
+# rekuest without std beside a spec with it.
+arkitekt-spec = { version = "0.16", default-features = false, features = ["declare"] }
+embedded-nal-async = "0.9"
