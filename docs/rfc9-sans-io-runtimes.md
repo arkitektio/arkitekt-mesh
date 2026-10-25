@@ -282,6 +282,21 @@ Each phase ends green and could be released. Gates every time:
    with RustCrypto (cancel-safe by construction; 1 MiB over DERP in 4.4 s);
    unreleased (arkirust 0.17). The check's `--board-tls` step joins CI once
    that is on crates.io (`MESH_CHECK_ECHO_KIB=1024`).
+   7b done (arkirust, unreleased: 0.17): `fakts::MeshJoiner::join` returns
+   a `MeshRoute`, `Proxy(url)` or `Direct` (the platform's TCP reaches the
+   mesh; mesh aliases go through the ordinary host). arkitekt-embassy's
+   `route::Routed` sends tailnet addresses and names over the mesh and the
+   rest over the network, `route::MeshHandoff` hands the login's key to the
+   task running the node, and `conn::open_owned` gives a node's
+   connections their own record buffers. arkirust's `checks/embassy
+   mesh_route` runs it all against the lab. The node resolves only the
+   tailnet's names (a router in front of an app's DNS must not take other
+   domains' names).
+   7c done (built, not run on a board): esp32-embassy-demo's `mesh` feature
+   on an ESP32-S3 with PSRAM, its keys kept in flash (later boots reuse a
+   login whose key is used up). rustls needs 16 codegen units on Xtensa (one
+   crashes LLVM's constant-pool selection), so the release is thin-LTO; with
+   the mesh, embassy-net and sntpc-net-embassy need their IPv6 features.
 
 ## Decided
 
