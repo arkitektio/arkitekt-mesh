@@ -146,9 +146,20 @@ impl ControlClient {
         Ok(api::parse_rpc(path, status, &body)?)
     }
 
+    /// A call answered whole: its status and body (capped).
+    pub async fn call_whole(&self, call: &Call) -> Result<(u16, Vec<u8>), ControlError> {
+        let (status, mut stream) = self.send(call).await?;
+        Ok((status, read_all(&mut stream).await?))
+    }
+
     /// A map request; the responses arrive through [`MapStream::next`].
     pub async fn map(&self, req: &MapRequest) -> Result<MapStream, ControlError> {
-        let (status, mut stream) = self.send(&Call::map(req)).await?;
+        self.map_call(&Call::map(req)).await
+    }
+
+    /// A map call, as [`map`](Self::map).
+    pub async fn map_call(&self, call: &Call) -> Result<MapStream, ControlError> {
+        let (status, mut stream) = self.send(call).await?;
         if status != 200 {
             let body = read_all(&mut stream).await.unwrap_or_default();
             return Err(api::failure("map request", status, &body).into());

@@ -1,6 +1,7 @@
 //! The tokio driver: runs a node over real sockets.
 
 pub mod control;
+mod control_link;
 pub mod derp;
 pub mod lock;
 pub mod net;

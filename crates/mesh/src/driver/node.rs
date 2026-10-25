@@ -22,13 +22,11 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
-use super::control::{ControlClient, ControlError};
+use super::control::ControlError;
+use super::control_link::{ControlLink, Out};
 use super::derp::{self as derp_conn, Received};
 use crate::control::netmap::NetMap;
-use crate::control::types::{
-    EndpointType, Hostinfo, MapRequest, MapResponse, NetInfo, RegisterAuth, RegisterRequest,
-    CAPABILITY_VERSION,
-};
+use crate::control::types::{EndpointType, MapResponse};
 use crate::derp;
 use crate::keys::{NodeIdentity, PrivateKey};
 use crate::netstack;
@@ -36,9 +34,6 @@ use crate::paths::{Paths, Via};
 use crate::wg;
 use mesh_core::node::{canonical, Event, HomeReport, NodeCore, Settings};
 
-/// Control and DERP servers send keepalives every minute; after this long
-/// without anything, the connection is presumed dead.
-pub(crate) const QUIET_LIMIT: Duration = Duration::from_secs(120);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the node may take to register and get its first netmap.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
@@ -240,49 +235,40 @@ impl Node {
         config: Config,
         store: Option<Arc<dyn super::lock::LockStore>>,
     ) -> Result<Self, MeshError> {
-        let machine = config.identity.machine.0.clone();
         let node_key = config.identity.node.0.clone();
         let node_public = config.identity.node_public();
         let disco_key = PrivateKey::generate();
-
-        let client = ControlClient::connect(&config.control_url, &machine).await?;
-        register(&client, &config).await?;
 
         let mut paths = Paths::new(disco_key, node_public);
         paths.set_udp(config.direct);
         let disco_public = paths.disco_public();
 
-        // The netmap stream, then its first response.
+        // Register, then the netmap stream up to its first full response
+        // (tailnet lock synced on each before it applies).
         let mut lock = super::lock::Lock::new(store);
-        let mut stream = client
-            .map(&map_request(
-                &config,
-                disco_public,
-                true,
-                &(None, BTreeMap::new()),
-                &[],
-                &lock.head_text(),
-            ))
-            .await?;
+        let mut link = ControlLink::new(&config, disco_public, lock.head_text());
         let mut netmap = NetMap::default();
         let mut filter_sets = BTreeMap::new();
         loop {
-            match stream.next().await? {
-                Some(mut resp) => {
+            match link.next().await {
+                Out::Map(mut resp) => {
                     if let Some(info) = resp.tka_info.take() {
-                        super::lock::sync(&client, &node_public, &info, &mut lock).await;
+                        if let Some(client) = link.client().cloned() {
+                            super::lock::sync(&client, &node_public, &info, &mut lock).await;
+                        }
+                        link.session.set_tka_head(lock.head_text());
                     }
                     crate::filter::apply_update(
                         &mut filter_sets,
                         resp.packet_filter.take(),
                         resp.packet_filters.take(),
                     );
-                    netmap.apply(resp);
+                    netmap.apply(*resp);
                     if netmap.self_node.is_some() {
                         break;
                     }
                 }
-                None => return Err(ControlError::Protocol("the map stream ended".into()).into()),
+                Out::Ended(e) => return Err(e),
             }
         }
         let addresses = netmap.self_addresses().to_vec();
@@ -354,28 +340,16 @@ impl Node {
             watch::channel::<Vec<(SocketAddr, EndpointType)>>(Vec::new());
         let (port_tx, port_rx) = watch::channel::<u16>(udp.local_addr()?.port());
         let (home_tx, home_rx) = watch::channel::<HomeReport>((home_region, BTreeMap::new()));
-        let (head_tx, head_rx) = watch::channel::<String>(shared.lock().lock().head_text());
-        let (client_tx, client_rx) = watch::channel(client);
 
         let tasks = vec![
-            // The map stream: netmap updates into the loop.
-            tokio::spawn(map_loop(
+            // Control: the map stream into the loop, our endpoints and home out.
+            tokio::spawn(control_loop(
                 shared.clone(),
-                client_tx,
-                config.clone(),
-                disco_public,
-                stream,
+                link,
+                node_public,
                 map_tx,
-                head_tx,
-            )),
-            // Endpoint and home updates to control.
-            tokio::spawn(update_loop(
-                client_rx,
-                config.clone(),
-                disco_public,
                 home_rx,
                 endpoints_rx,
-                head_rx,
             )),
             tokio::spawn(run_loop(
                 shared.clone(),
@@ -587,206 +561,63 @@ impl Node {
     }
 }
 
-async fn register(client: &ControlClient, config: &Config) -> Result<(), MeshError> {
-    let resp = client
-        .register(&RegisterRequest {
-            version: CAPABILITY_VERSION,
-            node_key: config.identity.node_public(),
-            auth: config
-                .auth_key
-                .clone()
-                .map(|auth_key| RegisterAuth { auth_key }),
-            hostinfo: hostinfo(config, &(None, BTreeMap::new())),
-            ephemeral: config.ephemeral,
-            ..Default::default()
-        })
-        .await?;
-    if !resp.error.is_empty() {
-        return Err(MeshError::Refused(resp.error));
-    }
-    if resp.node_key_expired {
-        return Err(MeshError::KeyExpired);
-    }
-    if !resp.auth_url.is_empty() {
-        return Err(MeshError::NeedsLogin(Some(resp.auth_url)));
-    }
-    if !resp.machine_authorized {
-        return Err(MeshError::NeedsLogin(None));
-    }
-    Ok(())
-}
-
-/// What we tell control about our home region: it, and every region's latency.
-fn hostinfo(config: &Config, home: &HomeReport) -> Hostinfo {
-    Hostinfo {
-        ipn_version: concat!("arkitekt-mesh/", env!("CARGO_PKG_VERSION")).into(),
-        os: std::env::consts::OS.into(),
-        arch: std::env::consts::ARCH.into(),
-        hostname: config.hostname.clone(),
-        app: "arkitekt".into(),
-        request_tags: config.tags.clone(),
-        net_info: home.0.map(|preferred_derp| NetInfo {
-            preferred_derp,
-            derp_latency: home.1.clone(),
-        }),
-    }
-}
-
-fn map_request(
-    config: &Config,
-    disco: crate::keys::DiscoPublic,
-    stream: bool,
-    home: &HomeReport,
-    endpoints: &[(SocketAddr, EndpointType)],
-    tka_head: &str,
-) -> MapRequest {
-    MapRequest {
-        version: CAPABILITY_VERSION,
-        node_key: config.identity.node_public(),
-        disco_key: disco,
-        stream,
-        keep_alive: stream,
-        omit_peers: !stream,
-        hostinfo: hostinfo(config, home),
-        endpoints: endpoints.iter().map(|(e, _)| *e).collect(),
-        endpoint_types: endpoints.iter().map(|(_, t)| *t as u8).collect(),
-        tka_head: tka_head.to_owned(),
-    }
-}
-
-/// Keep the map stream going; reconnect when it drops, and publish the
-/// new connection for the update loop.
-async fn map_loop(
+/// Control, after the start: map responses into the node (tailnet lock
+/// synced first, on a copy the node keeps filtering without meanwhile),
+/// our endpoints, home and lock head out, rebinds in. The policy is the
+/// session's ([`ControlLink`]).
+async fn control_loop(
     shared: Arc<Shared>,
-    client: watch::Sender<ControlClient>,
-    config: Config,
-    disco: crate::keys::DiscoPublic,
-    mut stream: super::control::MapStream,
+    mut link: ControlLink,
+    node_public: crate::keys::NodePublic,
     map_tx: mpsc::Sender<MapResponse>,
-    head_tx: watch::Sender<String>,
+    mut home: watch::Receiver<HomeReport>,
+    mut endpoints: watch::Receiver<Vec<(SocketAddr, EndpointType)>>,
 ) {
-    let mut backoff = Duration::from_secs(1);
+    link.session.set_home(home.borrow_and_update().clone());
+    link.session
+        .set_endpoints(endpoints.borrow_and_update().clone());
     loop {
-        loop {
-            // Control sends a keepalive every minute: silence means a dead link.
-            let next = tokio::select! {
-                next = tokio::time::timeout(QUIET_LIMIT, stream.next()) => match next {
-                    Ok(next) => next,
-                    Err(_) => {
-                        tracing::debug!("the map stream went quiet; reconnecting");
-                        break;
-                    }
-                },
-                _ = shared.control_rebind.notified() => {
-                    tracing::debug!("rebind: reconnecting to control");
-                    backoff = Duration::from_millis(100);
-                    break;
-                }
-            };
-            match next {
-                Ok(Some(mut resp)) => {
+        tokio::select! {
+            out = link.next() => match out {
+                Out::Map(mut resp) => {
                     // Tailnet lock first, so the change is judged by the
-                    // chain it came with. Synced on a copy: the loop keeps
-                    // filtering with the last verified lock meanwhile.
+                    // chain it came with.
                     let info = resp.tka_info.take();
                     let stale = info
                         .as_ref()
                         .is_some_and(|i| shared.lock().lock().needs_sync(i));
-                    if let Some(info) = info.filter(|_| stale) {
+                    if let (Some(info), Some(client)) = (info.filter(|_| stale), link.client().cloned()) {
                         let mut lock = shared.lock().lock().clone();
-                        let current = client.borrow().clone();
-                        super::lock::sync(
-                            &current,
-                            &config.identity.node_public(),
-                            &info,
-                            &mut lock,
-                        )
-                        .await;
+                        super::lock::sync(&client, &node_public, &info, &mut lock).await;
                         let head = lock.head_text();
                         shared.lock().set_lock(lock);
                         shared.wake.notify_one();
-                        head_tx.send_if_modified(|h| {
-                            let changed = *h != head;
-                            *h = head;
-                            changed
-                        });
+                        link.session.set_tka_head(head);
                     }
                     // The loop owns the netmap; hand it the change.
-                    if !resp.keep_alive && map_tx.send(resp).await.is_err() {
+                    if map_tx.send(*resp).await.is_err() {
                         return;
                     }
-                    backoff = Duration::from_secs(1);
                 }
-                Ok(None) => break,
-                Err(e) => {
-                    tracing::debug!("map stream: {e}");
-                    break;
+                // Only before the first registration, which the start did.
+                Out::Ended(e) => {
+                    tracing::warn!("control: {e}");
+                    return;
                 }
-            }
-        }
-        // Reconnect: a fresh connection, registration and stream.
-        loop {
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(30));
-            let attempt = async {
-                let c =
-                    ControlClient::connect(&config.control_url, &config.identity.machine.0).await?;
-                register(&c, &config).await?;
-                let head = shared.lock().lock().head_text();
-                let s = c
-                    .map(&map_request(
-                        &config,
-                        disco,
-                        true,
-                        &(None, BTreeMap::new()),
-                        &[],
-                        &head,
-                    ))
-                    .await?;
-                Ok::<_, MeshError>((c, s))
-            };
-            match attempt.await {
-                Ok((c, s)) => {
-                    let _ = client.send(c);
-                    stream = s;
-                    break;
+            },
+            changed = endpoints.changed() => {
+                if changed.is_err() {
+                    return;
                 }
-                Err(e) => tracing::warn!("reconnecting to control: {e}"),
+                link.session.set_endpoints(endpoints.borrow_and_update().clone());
             }
-        }
-    }
-}
-
-/// Tell control our endpoints and home region whenever they (or the
-/// control connection) change.
-async fn update_loop(
-    mut client: watch::Receiver<ControlClient>,
-    config: Config,
-    disco: crate::keys::DiscoPublic,
-    mut home: watch::Receiver<HomeReport>,
-    mut endpoints: watch::Receiver<Vec<(SocketAddr, EndpointType)>>,
-    mut tka_head: watch::Receiver<String>,
-) {
-    let mut first = true;
-    loop {
-        if !first {
-            tokio::select! {
-                changed = endpoints.changed() => if changed.is_err() { return },
-                changed = home.changed() => if changed.is_err() { return },
-                changed = tka_head.changed() => if changed.is_err() { return },
-                changed = client.changed() => if changed.is_err() { return },
+            changed = home.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                link.session.set_home(home.borrow_and_update().clone());
             }
-        }
-        first = false;
-        let eps = endpoints.borrow_and_update().clone();
-        let report = home.borrow_and_update().clone();
-        let head = tka_head.borrow_and_update().clone();
-        let req = map_request(&config, disco, false, &report, &eps, &head);
-        let current = client.borrow_and_update().clone();
-        match current.map(&req).await {
-            // The answer is not needed (the stream brings changes): drain it.
-            Ok(mut s) => while let Ok(true) = s.skip().await {},
-            Err(e) => tracing::debug!("endpoint update: {e}"),
+            _ = shared.control_rebind.notified() => link.session.rebind(clock::now()),
         }
     }
 }

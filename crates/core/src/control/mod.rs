@@ -8,5 +8,6 @@ pub mod conn;
 pub mod http1;
 pub mod netmap;
 pub mod noise;
+pub mod session;
 pub mod stream;
 pub mod types;
