@@ -206,7 +206,9 @@ Each phase ends green and could be released. Gates every time:
    in CI. `arkitekt-mesh` re-exports it at the old paths. No behaviour
    change. (A new crate: a crates.io placeholder and trusted publisher
    before the release.)
-2. **NodeCore.** `State` and the loops' policy out of `driver/node.rs`; the
+2. **NodeCore** (done: `mesh_core::node`, and tailnet lock's state in
+   `mesh_core::lock`; the DERP queues stay with the driver, which tells the
+   core the fullest one's room; every test unchanged). `State` and the loops' policy out of `driver/node.rs`; the
    tokio driver is the thin loop around it. The node, lab, lock and memory
    tests pass unchanged: if one needs more than an import path, the
    extraction changed behaviour.

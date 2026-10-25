@@ -147,8 +147,8 @@ impl Drop for Held {
 
 fn publish(shared: &Shared, external: Option<SocketAddr>) {
     let mut state = shared.lock();
-    if state.portmap_endpoint != external {
-        state.portmap_endpoint = external;
+    if state.portmap_endpoint() != external {
+        state.set_portmap_endpoint(external);
         drop(state);
         shared.wake.notify_one();
     }

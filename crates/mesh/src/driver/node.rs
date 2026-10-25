@@ -4,7 +4,7 @@
 //! App sockets ([`TcpStream`]) share the state behind a mutex; they wake
 //! the loop after every read and write, and smoltcp wakes them back.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -13,9 +13,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use mesh_core::time::{self as clock, Instant};
+use mesh_core::time as clock;
 
-use rand_core::{OsRng, RngCore};
 use smoltcp::iface::SocketHandle;
 use smoltcp::socket::tcp::State as TcpState;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -26,19 +25,17 @@ use tokio::task::JoinHandle;
 use super::control::{ControlClient, ControlError};
 use super::derp::{self as derp_conn, Received};
 use crate::control::netmap::NetMap;
-use crate::control::types::DerpRegion;
 use crate::control::types::{
     EndpointType, Hostinfo, MapRequest, MapResponse, NetInfo, RegisterAuth, RegisterRequest,
     CAPABILITY_VERSION,
 };
-use crate::derp::{self, Event};
-use crate::keys::{NodeIdentity, NodePublic, PrivateKey};
-use crate::netstack::{self, Netstack};
-use crate::paths::{Paths, Transmit, Via};
-use crate::wg::{self, Tunnel};
-use crate::{disco, stun};
+use crate::derp;
+use crate::keys::{NodeIdentity, PrivateKey};
+use crate::netstack;
+use crate::paths::{Paths, Via};
+use crate::wg;
+use mesh_core::node::{canonical, Event, HomeReport, NodeCore, Settings};
 
-const STUN_INTERVAL: Duration = Duration::from_secs(20);
 /// Control and DERP servers send keepalives every minute; after this long
 /// without anything, the connection is presumed dead.
 pub(crate) const QUIET_LIMIT: Duration = Duration::from_secs(120);
@@ -170,47 +167,8 @@ pub enum MeshError {
     Io(#[from] io::Error),
 }
 
-pub(super) struct State {
-    tunnel: Tunnel,
-    paths: Paths,
-    pub(super) netstack: Netstack,
-    pub(super) netmap: NetMap,
-    home_region: Option<i32>,
-    /// DERP connections, by region.
-    derp: HashMap<i32, DerpConn>,
-    /// Sockets the app closed, removed once their close completes.
-    closing: Vec<SocketHandle>,
-    /// STUN probes in flight and each region's measured latency.
-    netcheck: crate::netcheck::Netcheck,
-    stun_endpoint: Option<SocketAddr>,
-    /// Our IPv6 address as a STUN server saw it.
-    stun_endpoint6: Option<SocketAddr>,
-    /// The public address our gateway maps to our UDP port, if any.
-    pub(super) portmap_endpoint: Option<SocketAddr>,
-    derp_queue: usize,
-    derp_burst: usize,
-    /// Packets dropped because a DERP connection's queue was full.
-    derp_dropped: u64,
-    /// The DERP connection whose full queue holds the sockets back: the
-    /// loop waits for it to drain before it lets them send again.
-    backlog: Option<mpsc::Sender<Vec<u8>>>,
-    max_active_peers: usize,
-    /// The peer (by tailnet address) exempt from eviction.
-    priority: Option<IpAddr>,
-    /// Our UDP socket's port (it changes on rebind).
-    udp_port: u16,
-    /// The tailnet's ACLs on inbound packets, by named set as control sends
-    /// them, and the firewall compiled from them.
-    filter_sets: BTreeMap<String, Vec<crate::filter::FilterRule>>,
-    firewall: crate::filter::Firewall,
-    /// Tailnet lock: the verified authority, and which peers it hides.
-    lock: super::lock::Lock,
-}
-
 /// A DERP connection's handle: its task ends when this is dropped.
 struct DerpConn {
-    /// The region description it was made for.
-    made_for: DerpRegion,
     tx: mpsc::Sender<Vec<u8>>,
     /// Whether it is connected right now.
     up: Arc<std::sync::atomic::AtomicBool>,
@@ -223,7 +181,7 @@ impl DerpConn {
 }
 
 pub(super) struct Shared {
-    state: Mutex<State>,
+    state: Mutex<NodeCore>,
     pub(super) wake: Notify,
     /// Set by [`Node::rebind`]; the loop picks it up on its next pass.
     rebind: std::sync::atomic::AtomicBool,
@@ -232,7 +190,7 @@ pub(super) struct Shared {
 }
 
 impl Shared {
-    pub(super) fn lock(&self) -> MutexGuard<'_, State> {
+    pub(super) fn lock(&self) -> MutexGuard<'_, NodeCore> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
@@ -328,7 +286,7 @@ impl Node {
             }
         }
         let addresses = netmap.self_addresses().to_vec();
-        let home_region = pick_home(&netmap);
+        let home_region = mesh_core::node::pick_home(&netmap);
         tracing::info!(
             "on the mesh as {} ({}), home DERP region {:?}",
             netmap
@@ -344,43 +302,26 @@ impl Node {
             home_region
         );
 
-        let now = clock::now();
         let limits = config.limits;
-        let mut tunnel = Tunnel::new(node_key.clone());
-        tunnel.set_max_queued(limits.handshake_queue);
-        let mut netstack = Netstack::new(&addresses, now);
-        netstack.set_tcp_buffer(limits.tcp_buffer);
-        netstack.set_listen_buffer(limits.listen_buffer);
-        netstack.set_congestion(limits.congestion);
-        let mut state = State {
-            tunnel,
+        let state = NodeCore::new(
+            node_key.clone(),
             paths,
-            netstack,
             netmap,
-            home_region,
-            derp: HashMap::new(),
-            closing: Vec::new(),
-            netcheck: crate::netcheck::Netcheck::new(),
-            stun_endpoint: None,
-            stun_endpoint6: None,
-            portmap_endpoint: None,
-            derp_queue: limits.derp_queue.max(1),
-            derp_burst: limits.derp_burst,
-            derp_dropped: 0,
-            backlog: None,
-            max_active_peers: limits.max_active_peers,
-            priority: None,
-            udp_port: 0,
-            firewall: {
-                let mut firewall = crate::filter::Firewall::new(limits.udp_flows);
-                firewall.set_filter(crate::filter::compile(&filter_sets));
-                firewall
-            },
             filter_sets,
             lock,
-        };
-        state.apply_lock();
-        state.sync_peers();
+            Settings {
+                direct: config.direct,
+                ipv4: limits.ipv4,
+                tcp_buffer: limits.tcp_buffer,
+                listen_buffer: limits.listen_buffer,
+                congestion: limits.congestion,
+                handshake_queue: limits.handshake_queue,
+                max_active_peers: limits.max_active_peers,
+                udp_flows: limits.udp_flows,
+                netcheck_interval: limits.netcheck_interval,
+            },
+            clock::now(),
+        );
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
             wake: Notify::new(),
@@ -397,7 +338,8 @@ impl Node {
         };
         let udp = Arc::new(udp);
         // Known from the start (the loop keeps it current).
-        shared.lock().udp_port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
+        let port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
+        shared.lock().set_udp_ports(port, None);
         size_buffers(&udp, config.limits.udp_buffer);
         let udp6 = if config.limits.ipv6 {
             // The same port, where it is free: one to remember.
@@ -412,7 +354,7 @@ impl Node {
             watch::channel::<Vec<(SocketAddr, EndpointType)>>(Vec::new());
         let (port_tx, port_rx) = watch::channel::<u16>(udp.local_addr()?.port());
         let (home_tx, home_rx) = watch::channel::<HomeReport>((home_region, BTreeMap::new()));
-        let (head_tx, head_rx) = watch::channel::<String>(shared.lock().lock.head_text());
+        let (head_tx, head_rx) = watch::channel::<String>(shared.lock().lock().head_text());
         let (client_tx, client_rx) = watch::channel(client);
 
         let tasks = vec![
@@ -474,28 +416,28 @@ impl Node {
 
     /// Tailnet lock as this node sees it (docs/rfc5-tailnet-lock.md).
     pub fn lock_status(&self) -> super::lock::LockStatus {
-        self.shared.lock().lock.status()
+        self.shared.lock().lock().status()
     }
 
     /// The DERP region this node is homed to (where peers reach it).
     pub fn home_region(&self) -> Option<i32> {
-        self.shared.lock().home_region
+        self.shared.lock().home_region()
     }
 
     /// Inbound packets the tailnet's packet filter has dropped so far.
     pub fn filtered_packets(&self) -> u64 {
-        self.shared.lock().firewall.dropped()
+        self.shared.lock().filtered_packets()
     }
 
     /// Outbound packets dropped so far because a DERP connection could not
     /// take them fast enough ([`Limits::derp_queue`]).
     pub fn derp_dropped(&self) -> u64 {
-        self.shared.lock().derp_dropped
+        self.shared.lock().derp_dropped()
     }
 
     /// A snapshot of the netmap.
     pub fn netmap(&self) -> NetMap {
-        self.shared.lock().netmap.clone()
+        self.shared.lock().netmap().clone()
     }
 
     /// The network changed (a new Wi-Fi, an address change, a link that came
@@ -514,7 +456,7 @@ impl Node {
     /// (e.g. the server a device reports to).
     pub fn set_priority_peer(&self, host: &str) -> io::Result<()> {
         let ip = self.resolve(host)?;
-        self.shared.lock().priority = Some(ip);
+        self.shared.lock().set_priority(Some(ip));
         Ok(())
     }
 
@@ -524,7 +466,7 @@ impl Node {
         let handle = self
             .shared
             .lock()
-            .netstack
+            .netstack_mut()
             .listen(port)
             .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, e.to_string()))?;
         self.shared.wake.notify_one();
@@ -537,7 +479,7 @@ impl Node {
 
     /// The local port of the node's UDP socket (WireGuard, disco, STUN).
     pub fn udp_port(&self) -> u16 {
-        self.shared.lock().udp_port
+        self.shared.lock().udp_port()
     }
 
     /// Whether the peer `host` currently has WireGuard state.
@@ -547,21 +489,21 @@ impl Node {
         };
         let state = self.shared.lock();
         state
-            .netmap
+            .netmap()
             .peer_by_ip(ip)
-            .is_some_and(|p| state.tunnel.has_peer(&p.key))
+            .is_some_and(|p| state.tunnel().has_peer(&p.key))
     }
 
     /// How many peers currently have WireGuard state.
     pub fn active_peers(&self) -> usize {
-        self.shared.lock().tunnel.len()
+        self.shared.lock().tunnel().len()
     }
 
     /// The trusted direct path to the peer at `ip`, if one is up.
     pub fn direct_path(&self, ip: IpAddr) -> Option<SocketAddr> {
         let state = self.shared.lock();
-        let key = state.netmap.peer_by_ip(ip)?.key;
-        state.paths.direct(&key, clock::now())
+        let key = state.netmap().peer_by_ip(ip)?.key;
+        state.paths().direct(&key, clock::now())
     }
 
     /// A peer's tailnet address: an IP literal, or a name in the netmap
@@ -572,7 +514,7 @@ impl Node {
             return Ok(ip);
         }
         let state = self.shared.lock();
-        let peer = state.netmap.peer_by_name(host).ok_or_else(|| {
+        let peer = state.netmap().peer_by_name(host).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no peer named {host} on the mesh"),
@@ -612,14 +554,14 @@ impl Node {
         let remote = SocketAddr::new(ip, port);
         let handle = {
             let mut state = self.shared.lock();
-            if state.netmap.peer_by_ip(ip).is_none() {
+            if state.netmap().peer_by_ip(ip).is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("{ip} is not a peer on the mesh"),
                 ));
             }
             state
-                .netstack
+                .netstack_mut()
                 .connect(remote)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
         };
@@ -675,8 +617,6 @@ async fn register(client: &ControlClient, config: &Config) -> Result<(), MeshErr
 }
 
 /// What we tell control about our home region: it, and every region's latency.
-type HomeReport = (Option<i32>, BTreeMap<String, f64>);
-
 fn hostinfo(config: &Config, home: &HomeReport) -> Hostinfo {
     Hostinfo {
         ipn_version: concat!("arkitekt-mesh/", env!("CARGO_PKG_VERSION")).into(),
@@ -711,64 +651,6 @@ fn map_request(
         endpoints: endpoints.iter().map(|(e, _)| *e).collect(),
         endpoint_types: endpoints.iter().map(|(_, t)| *t as u8).collect(),
         tka_head: tka_head.to_owned(),
-    }
-}
-
-fn is_private(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
-        IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
-    }
-}
-
-/// The regions a node may home to: not avoided, measurable, with a DERP node.
-fn home_candidates(netmap: &NetMap) -> Vec<i32> {
-    netmap
-        .derp_regions
-        .values()
-        .filter(|r| !r.avoid && !r.no_measure_no_home && r.nodes.iter().any(|n| !n.stun_only))
-        .map(|r| r.region_id)
-        .collect()
-}
-
-/// The home to start with, before anything is measured: the lowest region.
-fn pick_home(netmap: &NetMap) -> Option<i32> {
-    home_candidates(netmap).into_iter().min()
-}
-
-/// Re-pick the home region from the measured latencies; on a switch,
-/// connect the new home (it announces itself as preferred), drop the old
-/// one (it reconnects as a plain region when next used), and tell control.
-fn rehome(
-    state: &mut State,
-    now: Instant,
-    node_key: &PrivateKey,
-    events: &mpsc::Sender<Received>,
-    tasks: &mut Tasks,
-    report: &watch::Sender<HomeReport>,
-) {
-    let candidates = home_candidates(&state.netmap);
-    let latencies: BTreeMap<String, f64> = state
-        .netcheck
-        .latencies(now)
-        .into_iter()
-        .map(|(region, d)| (format!("{region}-v4"), d.as_secs_f64()))
-        .collect();
-    if let Some(new) = state.netcheck.choose(state.home_region, &candidates, now) {
-        let old = state.home_region.replace(new);
-        tracing::info!(
-            "home DERP region {old:?} -> {new} ({:?})",
-            state.netcheck.latency(new, now)
-        );
-        if let Some(old) = old {
-            state.derp.remove(&old);
-        }
-        ensure_derp(state, new, node_key, events, tasks);
-        let _ = report.send((Some(new), latencies));
-    } else if report.borrow().1.is_empty() && !latencies.is_empty() {
-        // The first measurement: report it once even without a switch.
-        let home = state.home_region;
-        let _ = report.send((home, latencies));
     }
 }
 
@@ -809,9 +691,9 @@ async fn map_loop(
                     let info = resp.tka_info.take();
                     let stale = info
                         .as_ref()
-                        .is_some_and(|i| shared.lock().lock.needs_sync(i));
+                        .is_some_and(|i| shared.lock().lock().needs_sync(i));
                     if let Some(info) = info.filter(|_| stale) {
-                        let mut lock = shared.lock().lock.clone();
+                        let mut lock = shared.lock().lock().clone();
                         let current = client.borrow().clone();
                         super::lock::sync(
                             &current,
@@ -821,11 +703,7 @@ async fn map_loop(
                         )
                         .await;
                         let head = lock.head_text();
-                        {
-                            let mut state = shared.lock();
-                            state.lock = lock;
-                            state.apply_lock();
-                        }
+                        shared.lock().set_lock(lock);
                         shared.wake.notify_one();
                         head_tx.send_if_modified(|h| {
                             let changed = *h != head;
@@ -854,7 +732,7 @@ async fn map_loop(
                 let c =
                     ControlClient::connect(&config.control_url, &config.identity.machine.0).await?;
                 register(&c, &config).await?;
-                let head = shared.lock().lock.head_text();
+                let head = shared.lock().lock().head_text();
                 let s = c
                     .map(&map_request(
                         &config,
@@ -913,6 +791,9 @@ async fn update_loop(
     }
 }
 
+/// The node's I/O: the UDP sockets, DERP and the map stream into the core,
+/// what it sends out, the DERP connections it asks for. The policy (when
+/// to probe, re-home, report, hold back) is [`NodeCore`]'s.
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     shared: Arc<Shared>,
@@ -929,7 +810,6 @@ async fn run_loop(
     home_tx: watch::Sender<HomeReport>,
 ) {
     let mut local_port = udp.local_addr().map(|a| a.port()).unwrap_or(0);
-    shared.lock().udp_port = local_port;
     // Datagrams are at most a WireGuard packet at the tunnel MTU (plus
     // headers) or a small disco/STUN message.
     let mut buf = vec![0u8; 2048];
@@ -938,93 +818,73 @@ async fn run_loop(
         .as_ref()
         .and_then(|u| u.local_addr().ok())
         .map(|a| a.port());
-    let mut next_stun = clock::now();
-    // Measure every region right away, then every `netcheck_interval`.
-    let mut next_netcheck = Some(clock::now());
-    let mut reported: BTreeSet<SocketAddr> = BTreeSet::new();
-    // Aborted with this loop.
+    shared.lock().set_udp_ports(local_port, local_port6);
+    // DERP connections, by region; aborted with this loop.
+    let mut derp: HashMap<i32, DerpConn> = HashMap::new();
     let mut derp_tasks = Tasks::default();
-
-    // Connect the home region right away, so peers can reach us.
-    {
-        let mut state = shared.lock();
-        if let Some(home) = state.home_region {
-            ensure_derp(&mut state, home, &node_key, &derp_tx, &mut derp_tasks);
+    // The DERP connection whose full queue holds the sockets back: the loop
+    // waits for it to drain before it lets them send again.
+    let mut backlog: Option<mpsc::Sender<Vec<u8>>> = None;
+    let mut act = |shared: &Shared, derp: &mut HashMap<i32, DerpConn>| loop {
+        let Some(event) = shared.lock().poll_event() else {
+            break;
+        };
+        match event {
+            Event::ConnectDerp { region, info, home } => {
+                // Replacing a connection drops its sender, which ends its task.
+                let (tx, rx) = mpsc::channel(limits.derp_queue.max(1));
+                let sending = derp_conn::Sending {
+                    burst: limits.derp_burst,
+                    up: Arc::default(),
+                };
+                derp.insert(
+                    region,
+                    DerpConn {
+                        tx,
+                        up: sending.up.clone(),
+                    },
+                );
+                derp_tasks.0.retain(|t| !t.is_finished());
+                derp_tasks.0.push(tokio::spawn(derp_conn::run(
+                    info,
+                    node_key.clone(),
+                    home,
+                    derp_tx.clone(),
+                    rx,
+                    sending,
+                )));
+            }
+            Event::DropDerp { region } => {
+                derp.remove(&region);
+            }
+            Event::Endpoints(endpoints) => {
+                let _ = endpoints_tx.send(endpoints);
+            }
+            Event::Home(report) => {
+                let _ = home_tx.send(report);
+            }
         }
-    }
+    };
 
     loop {
+        // The connections asked for (the home region's, at the start).
+        act(&shared, &mut derp);
         let now = clock::now();
-        let (deadline, backlog) = {
-            let mut state = shared.lock();
-            let mut deadline = next_stun;
-            let backlog = state.backlog.clone();
-            for d in [
-                state.tunnel.next_deadline(),
-                state.paths.next_deadline(now),
-                // Held back, the stack always has something to send.
-                state.netstack.poll_at(now).filter(|_| backlog.is_none()),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                deadline = deadline.min(d);
-            }
-            (deadline.max(now), backlog)
-        };
+        let deadline = shared.lock().poll_timeout(now, backlog.is_some());
 
         let mut transmits = Vec::new();
-        // A datagram from either UDP socket.
-        macro_rules! datagram {
-            ($data:expr, $src:expr) => {{
-                let mut state = shared.lock();
-                let (data, src): (&[u8], SocketAddr) = ($data, canonical($src));
-                if stun::is_stun(data) {
-                    if let Some((tx, addr)) = stun::parse_response(data) {
-                        let now = clock::now();
-                        if state.netcheck.answered(&tx, now).is_some() {
-                            let addr = canonical(addr);
-                            if addr.is_ipv4() {
-                                state.stun_endpoint = Some(addr);
-                            } else {
-                                state.stun_endpoint6 = Some(addr);
-                            }
-                            rehome(
-                                &mut state,
-                                now,
-                                &node_key,
-                                &derp_tx,
-                                &mut derp_tasks,
-                                &home_tx,
-                            );
-                        }
-                    }
-                } else if disco::looks_like_disco(data) {
-                    if direct {
-                        let s = &mut *state;
-                        transmits.extend(s.paths.on_disco(
-                            data,
-                            Via::Udp(src),
-                            clock::now(),
-                            &s.netmap,
-                        ));
-                    }
-                } else if wg::is_wireguard(data) {
-                    transmits.extend(state.on_wireguard(data, clock::now()));
-                }
-            }};
-        }
         tokio::select! {
             recv = udp.recv_from(&mut buf) => {
                 if let Ok((n, src)) = recv {
-                    datagram!(&buf[..n], src);
+                    let mut state = shared.lock();
+                    transmits.extend(state.handle_datagram(clock::now(), src, &buf[..n]));
                     // And what else has arrived: one pass of the stack for
                     // all of it, and the kernel's buffer emptied sooner.
                     for _ in 1..RECV_BATCH {
                         let Ok((n, src)) = udp.try_recv_from(&mut buf) else {
                             break;
                         };
-                        datagram!(&buf[..n], src);
+                        transmits.extend(state.handle_datagram(clock::now(), src, &buf[..n]));
                     }
                 }
             }
@@ -1035,13 +895,14 @@ async fn run_loop(
                 }
             } => {
                 if let Ok((n, src)) = recv {
-                    datagram!(&buf6[..n], src);
+                    let mut state = shared.lock();
+                    transmits.extend(state.handle_datagram(clock::now(), src, &buf6[..n]));
                     if let Some(u) = &udp6 {
                         for _ in 1..RECV_BATCH {
                             let Ok((n, src)) = u.try_recv_from(&mut buf6) else {
                                 break;
                             };
-                            datagram!(&buf6[..n], src);
+                            transmits.extend(state.handle_datagram(clock::now(), src, &buf6[..n]));
                         }
                     }
                 }
@@ -1050,15 +911,8 @@ async fn run_loop(
                 let mut state = shared.lock();
                 let (mut next, mut taken) = (Some(first), 0);
                 while let Some(Received { region, event }) = next.take() {
-                    if let Event::Packet { from, data } = event {
-                        let now = clock::now();
-                        if disco::looks_like_disco(&data) {
-                            let s = &mut *state;
-                            let via = Via::Derp { region, peer: from };
-                            transmits.extend(s.paths.on_disco(&data, via, now, &s.netmap));
-                        } else if wg::is_wireguard(&data) {
-                            transmits.extend(state.on_wireguard(&data, now));
-                        }
+                    if let derp::Event::Packet { from, data } = event {
+                        transmits.extend(state.handle_derp(clock::now(), region, from, &data));
                     }
                     taken += 1;
                     if taken < RECV_BATCH {
@@ -1066,17 +920,8 @@ async fn run_loop(
                     }
                 }
             }
-            Some(mut resp) = map_rx.recv() => {
-                let mut state = shared.lock();
-                let (whole, named) = (resp.packet_filter.take(), resp.packet_filters.take());
-                if crate::filter::apply_update(&mut state.filter_sets, whole, named) {
-                    let filter = crate::filter::compile(&state.filter_sets);
-                    state.firewall.set_filter(filter);
-                }
-                if state.netmap.apply(resp) {
-                    state.apply_lock();
-                    refresh_derp(&mut state, &node_key, &derp_tx, &mut derp_tasks);
-                }
+            Some(resp) = map_rx.recv() => {
+                shared.lock().apply_map(resp);
             }
             _ = shared.wake.notified() => {}
             // The full DERP queue is half empty again: let the sockets send.
@@ -1113,21 +958,7 @@ async fn run_loop(
                     .and_then(|u| u.local_addr().ok())
                     .map(|a| a.port());
             }
-            let mut state = shared.lock();
-            state.udp_port = local_port;
-            state.paths.reset_direct();
-            state.derp.clear(); // their tasks end
-                                // A new network: old latencies say nothing about it.
-            state.netcheck = crate::netcheck::Netcheck::new();
-            state.stun_endpoint = None;
-            state.stun_endpoint6 = None;
-            if let Some(home) = state.home_region {
-                ensure_derp(&mut state, home, &node_key, &derp_tx, &mut derp_tasks);
-            }
-            drop(state);
-            next_stun = clock::now();
-            next_netcheck = Some(clock::now());
-            reported.clear();
+            shared.lock().rebind(clock::now(), local_port, local_port6);
             tracing::info!("rebound: UDP port {local_port}");
         }
 
@@ -1136,73 +967,51 @@ async fn run_loop(
         let mut udp_sends = Vec::new();
         {
             let mut state = shared.lock();
-            transmits.extend(state.pump(now));
-            if now >= next_stun {
-                next_stun =
-                    now + STUN_INTERVAL + Duration::from_millis(OsRng.next_u32() as u64 % 6000);
-                // Every region when a netcheck is due (DERP-only nodes too:
-                // the home region matters to them most), else the home's
-                // STUN for our endpoint.
-                let all = next_netcheck.is_some_and(|at| now >= at);
-                if all {
-                    next_netcheck = limits.netcheck_interval.map(|every| now + every);
+            // A connection whose task ended is made again when next needed.
+            derp.retain(|region, conn| {
+                let open = !conn.tx.is_closed();
+                if !open {
+                    state.derp_closed(*region);
                 }
-                if direct || all {
-                    let families = (limits.ipv4, udp6.is_some());
-                    udp_sends = state.stun_requests(now, all, families);
-                }
-                let mut eps: BTreeSet<SocketAddr> = BTreeSet::new();
-                if direct && limits.ipv4 {
-                    eps.extend(state.stun_endpoint);
-                    eps.extend(local_endpoint(local_port));
-                }
-                if direct {
-                    if let Some(port6) = local_port6 {
-                        eps.extend(state.stun_endpoint6);
-                        eps.extend(local_endpoint6(port6));
-                    }
-                }
-                let portmapped = state.portmap_endpoint.filter(|_| direct);
-                eps.extend(portmapped);
-                if eps != reported {
-                    tracing::debug!("our endpoints: {eps:?}");
-                    reported = eps.clone();
-                    let typed: Vec<(SocketAddr, EndpointType)> = eps
-                        .into_iter()
-                        .map(|e| {
-                            let kind = if Some(e) == portmapped {
-                                EndpointType::Portmapped
-                            } else if e.ip().is_loopback() || is_private(e.ip()) {
-                                EndpointType::Local
-                            } else {
-                                EndpointType::Stun
-                            };
-                            (e, kind)
-                        })
-                        .collect();
-                    state
-                        .paths
-                        .set_endpoints(typed.iter().map(|(e, _)| *e).collect());
-                    let _ = endpoints_tx.send(typed);
-                }
+                open
+            });
+            // What the fullest queue of a connected DERP region still takes
+            // (one still connecting keeps what fits and drops the rest).
+            let fullest = derp
+                .values()
+                .filter(|conn| conn.is_up())
+                .map(|conn| &conn.tx)
+                .min_by_key(|tx| tx.capacity())
+                .cloned();
+            let room = fullest.as_ref().map_or(usize::MAX, |tx| tx.capacity());
+            let pumped = state.pump(now, room);
+            backlog = if pumped.held_back { fullest } else { None };
+            transmits.extend(pumped.transmits);
+            if state.stun_due(now) {
+                let local = (direct && limits.ipv4)
+                    .then(|| local_endpoint(local_port))
+                    .flatten();
+                let local6 = local_port6.filter(|_| direct).and_then(local_endpoint6);
+                udp_sends = state.stun(now, local, local6);
             }
-            for t in &transmits {
-                if let Via::Derp { region, .. } = t.via {
-                    ensure_derp(&mut state, region, &node_key, &derp_tx, &mut derp_tasks);
-                }
-            }
-            for t in std::mem::take(&mut transmits) {
+            state.link_derp_for(&transmits);
+        }
+        // Connect the regions the transmits go to before sending to them.
+        act(&shared, &mut derp);
+        {
+            let mut state = shared.lock();
+            for t in transmits {
                 match t.via {
                     Via::Udp(addr) => udp_sends.push((addr, t.data)),
                     Via::Derp { region, peer } => {
-                        let full = state.derp.get(&region).is_some_and(|conn| {
+                        let full = derp.get(&region).is_some_and(|conn| {
                             matches!(
                                 conn.tx.try_send(derp::send_packet(&peer, &t.data)),
                                 Err(mpsc::error::TrySendError::Full(_))
                             )
                         });
                         if full {
-                            state.derp_dropped += 1;
+                            state.count_derp_dropped();
                         }
                     }
                 }
@@ -1222,20 +1031,7 @@ async fn run_loop(
             }
         }
         // A STUN answer may have arrived: report it on the next pass.
-        let unreported = {
-            let state = shared.lock();
-            [
-                state.stun_endpoint,
-                state.stun_endpoint6,
-                state.portmap_endpoint,
-            ]
-            .into_iter()
-            .flatten()
-            .any(|e| !reported.contains(&e))
-        };
-        if unreported {
-            next_stun = next_stun.min(clock::now() + Duration::from_millis(50));
-        }
+        shared.lock().after_pass(clock::now());
     }
 }
 
@@ -1255,80 +1051,6 @@ impl Drop for Tasks {
             task.abort();
         }
     }
-}
-
-fn ensure_derp(
-    state: &mut State,
-    region: i32,
-    node_key: &PrivateKey,
-    events: &mpsc::Sender<Received>,
-    tasks: &mut Tasks,
-) {
-    let Some(info) = state.netmap.derp_regions.get(&region).cloned() else {
-        return;
-    };
-    // Keep a live connection made for this same description of the region;
-    // replacing it drops the old sender, which ends the old task.
-    if state
-        .derp
-        .get(&region)
-        .is_some_and(|conn| conn.made_for == info && !conn.tx.is_closed())
-    {
-        return;
-    }
-    let (tx, rx) = mpsc::channel(state.derp_queue);
-    let sending = derp_conn::Sending {
-        burst: state.derp_burst,
-        up: Arc::default(),
-    };
-    state.derp.insert(
-        region,
-        DerpConn {
-            made_for: info.clone(),
-            tx,
-            up: sending.up.clone(),
-        },
-    );
-    let home = state.home_region == Some(region);
-    tasks.0.retain(|t| !t.is_finished());
-    tasks.0.push(tokio::spawn(derp_conn::run(
-        info,
-        node_key.clone(),
-        home,
-        events.clone(),
-        rx,
-        sending,
-    )));
-}
-
-/// After a netmap change: drop DERP connections whose region moved (e.g.
-/// the server restarted on a new port) or went away, and reconnect the home
-/// region right away. Others reconnect when next used.
-fn refresh_derp(
-    state: &mut State,
-    node_key: &PrivateKey,
-    events: &mpsc::Sender<Received>,
-    tasks: &mut Tasks,
-) {
-    let stale: Vec<i32> = state
-        .derp
-        .iter()
-        .filter(|(region, conn)| state.netmap.derp_regions.get(region) != Some(&conn.made_for))
-        .map(|(region, _)| *region)
-        .collect();
-    for region in stale {
-        tracing::debug!("DERP region {region} changed; reconnecting");
-        state.derp.remove(&region);
-    }
-    if let Some(home) = state.home_region {
-        ensure_derp(state, home, node_key, events, tasks);
-    }
-}
-
-/// An IPv4-mapped IPv6 address as the IPv4 address it is (disco writes
-/// IPv4 addresses mapped).
-fn canonical(addr: SocketAddr) -> SocketAddr {
-    SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
 /// Ask for `bytes` of kernel buffer each way (0: leave the default). The
@@ -1398,185 +1120,6 @@ fn local_endpoint(port: u16) -> Option<SocketAddr> {
     (!ip.is_unspecified()).then(|| SocketAddr::new(ip, port))
 }
 
-impl State {
-    /// Hide the peers tailnet lock does not trust, judge our own key, then
-    /// bring the stack and tunnel in line (hidden peers lose their sessions).
-    fn apply_lock(&mut self) {
-        let lock = &mut self.lock;
-        lock.hidden = self.netmap.retain_trusted(|p| lock.trusts(p));
-        lock.judge_self(self.netmap.self_node.as_ref());
-        let ids: Vec<i64> = self
-            .netmap
-            .peers()
-            .iter()
-            .chain(self.netmap.untrusted())
-            .map(|p| p.id)
-            .collect();
-        lock.forget_except(ids.into_iter());
-        self.sync_peers();
-    }
-
-    /// Bring the stack and the tunnel in line with the netmap. WireGuard and
-    /// path state are made when a peer is first used, so only departed
-    /// peers are removed here (path state prunes itself on tick).
-    fn sync_peers(&mut self) {
-        self.netstack.set_addresses(self.netmap.self_addresses());
-        let keys: BTreeSet<NodePublic> = self.netmap.peers().iter().map(|p| p.key).collect();
-        let stale: Vec<NodePublic> = self
-            .tunnel
-            .peers()
-            .filter(|k| !keys.contains(k))
-            .copied()
-            .collect();
-        for key in stale {
-            self.tunnel.remove_peer(&key);
-        }
-    }
-
-    fn on_wireguard(&mut self, data: &[u8], now: Instant) -> Vec<Transmit> {
-        let netmap = &self.netmap;
-        let allowed = |key: &NodePublic| netmap.peer_by_key(key).is_some();
-        let out = match self.tunnel.decapsulate_allowing(data, now, allowed) {
-            Ok(out) => out,
-            Err(e) => {
-                tracing::trace!("dropped a WireGuard message: {e}");
-                return Vec::new();
-            }
-        };
-        self.deliver(out, now)
-    }
-
-    /// Route the tunnel's datagrams and feed arrived packets to the stack.
-    fn deliver(&mut self, out: wg::Output, now: Instant) -> Vec<Transmit> {
-        let mut transmits = Vec::new();
-        for (peer, datagram) in out.send {
-            transmits.extend(self.paths.route(&peer, datagram, now, &self.netmap));
-        }
-        for (peer, packet) in out.packets {
-            if !accept_inbound(&self.netmap, &peer, &packet) {
-                tracing::trace!("dropped a packet from {peer:?} that is not its to send");
-            } else if !self.firewall.inbound(&packet, now) {
-                tracing::trace!(
-                    "the packet filter dropped a packet from {:?}",
-                    netstack::source(&packet)
-                );
-            } else {
-                self.netstack.input(packet);
-            }
-        }
-        transmits
-    }
-
-    /// Run the stack and the timers until they are quiet.
-    fn pump(&mut self, now: Instant) -> Vec<Transmit> {
-        let mut transmits = Vec::new();
-        // What the fullest queue of a connected DERP region still takes
-        // (one still connecting keeps what fits and drops the rest). The
-        // stack does not know which way a packet will go, so this holds
-        // back every socket: but sending on would only drop packets and
-        // have TCP send them again.
-        let fullest = self
-            .derp
-            .values()
-            .filter(|conn| conn.is_up() && !conn.tx.is_closed())
-            .map(|conn| &conn.tx)
-            .min_by_key(|tx| tx.capacity())
-            .cloned();
-        let mut room = fullest.as_ref().map_or(usize::MAX, |tx| tx.capacity());
-        self.backlog = None;
-        for _ in 0..64 {
-            let packets = self.netstack.poll(now, room);
-            room = room.saturating_sub(packets.len());
-            if room == 0 {
-                self.backlog.clone_from(&fullest);
-            }
-            if packets.is_empty() {
-                break;
-            }
-            for packet in packets {
-                let Some(dst) = netstack::destination(&packet) else {
-                    continue;
-                };
-                // Replies to what we send need no rule.
-                self.firewall.outbound(&packet, now);
-                let Some(peer) = self.netmap.peer_by_ip(dst).map(|p| p.key) else {
-                    continue;
-                };
-                self.tunnel.add_peer(peer);
-                if let Ok(out) = self.tunnel.encapsulate(peer, &packet, now) {
-                    transmits.extend(self.deliver(out, now));
-                }
-            }
-        }
-        let out = self.tunnel.tick(now);
-        transmits.extend(self.deliver(out, now));
-        transmits.extend(self.paths.tick(now, &self.netmap));
-        self.enforce_peer_cap();
-
-        // Sockets the app dropped go once their close completes.
-        let netstack = &mut self.netstack;
-        self.closing.retain(|&h| {
-            let done = matches!(
-                netstack.socket(h).state(),
-                TcpState::Closed | TcpState::TimeWait
-            );
-            if done {
-                netstack.remove(h);
-            }
-            !done
-        });
-        transmits
-    }
-
-    /// Keep at most `max_active_peers` peers' WireGuard and path state,
-    /// dropping the least recently used (never the priority peer).
-    fn enforce_peer_cap(&mut self) {
-        let cap = self.max_active_peers;
-        if cap == 0 || self.tunnel.len() <= cap {
-            return;
-        }
-        let protected = self
-            .priority
-            .and_then(|ip| self.netmap.peer_by_ip(ip))
-            .map(|p| p.key);
-        let excess = self.tunnel.len() - cap;
-        let evict: Vec<NodePublic> = self
-            .tunnel
-            .least_recently_used()
-            .into_iter()
-            .filter(|k| Some(*k) != protected)
-            .take(excess)
-            .collect();
-        for key in evict {
-            tracing::debug!("over {cap} active peers: dropping {key:?}'s tunnel state");
-            self.tunnel.remove_peer(&key);
-            self.paths.forget(&key);
-        }
-    }
-
-    /// STUN requests: to every region (`all`, a netcheck), or to the home
-    /// region only (for our endpoint).
-    fn stun_requests(
-        &mut self,
-        now: Instant,
-        all: bool,
-        (ipv4, ipv6): (bool, bool),
-    ) -> Vec<(SocketAddr, Vec<u8>)> {
-        let home = self.home_region;
-        crate::netcheck::targets(&self.netmap.derp_regions)
-            .into_iter()
-            .filter(|&(region, _)| all || Some(region) == home)
-            .filter(|(_, addr)| if addr.is_ipv4() { ipv4 } else { ipv6 })
-            .map(|(region, addr)| {
-                let mut tx = [0u8; 12];
-                OsRng.fill_bytes(&mut tx);
-                self.netcheck.sent(tx, region, now);
-                (addr, stun::request(&tx))
-            })
-            .collect()
-    }
-}
-
 /// A TCP connection over the mesh.
 pub struct TcpStream {
     shared: Arc<Shared>,
@@ -1608,7 +1151,7 @@ impl TcpListener {
 
     fn poll_accept(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<(TcpStream, SocketAddr)>> {
         let mut state = self.shared.lock();
-        let socket = state.netstack.socket(self.handle);
+        let socket = state.netstack_mut().socket(self.handle);
         match socket.state() {
             TcpState::Established | TcpState::CloseWait => {
                 let remote = socket
@@ -1616,7 +1159,7 @@ impl TcpListener {
                     .map(|ep| SocketAddr::new(IpAddr::from(ep.addr), ep.port))
                     .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
                 let fresh = state
-                    .netstack
+                    .netstack_mut()
                     .listen(self.port)
                     .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, e.to_string()))?;
                 let accepted = std::mem::replace(&mut self.handle, fresh);
@@ -1639,11 +1182,11 @@ impl TcpListener {
                 // A half-open attempt that failed: listen again.
                 socket.abort();
                 let fresh = state
-                    .netstack
+                    .netstack_mut()
                     .listen(self.port)
                     .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, e.to_string()))?;
                 let stale = std::mem::replace(&mut self.handle, fresh);
-                state.closing.push(stale);
+                state.close_socket(stale);
                 drop(state);
                 self.shared.wake.notify_one();
                 cx.waker().wake_by_ref();
@@ -1656,8 +1199,8 @@ impl TcpListener {
 impl Drop for TcpListener {
     fn drop(&mut self) {
         let mut state = self.shared.lock();
-        state.netstack.socket(self.handle).abort();
-        state.closing.push(self.handle);
+        state.netstack_mut().socket(self.handle).abort();
+        state.close_socket(self.handle);
         drop(state);
         self.shared.wake.notify_one();
     }
@@ -1666,7 +1209,7 @@ impl Drop for TcpListener {
 impl TcpStream {
     fn poll_connected(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let mut state = self.shared.lock();
-        let socket = state.netstack.socket(self.handle);
+        let socket = state.netstack_mut().socket(self.handle);
         match socket.state() {
             TcpState::Established => Poll::Ready(Ok(())),
             TcpState::Closed | TcpState::TimeWait | TcpState::CloseWait | TcpState::LastAck => {
@@ -1690,7 +1233,7 @@ impl AsyncRead for TcpStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let mut state = self.shared.lock();
-        let socket = state.netstack.socket(self.handle);
+        let socket = state.netstack_mut().socket(self.handle);
         if socket.can_recv() {
             let n = socket
                 .recv_slice(buf.initialize_unfilled())
@@ -1716,7 +1259,7 @@ impl AsyncWrite for TcpStream {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         let mut state = self.shared.lock();
-        let socket = state.netstack.socket(self.handle);
+        let socket = state.netstack_mut().socket(self.handle);
         if !socket.may_send() {
             return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
         }
@@ -1737,7 +1280,11 @@ impl AsyncWrite for TcpStream {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.shared.lock().netstack.socket(self.handle).close();
+        self.shared
+            .lock()
+            .netstack_mut()
+            .socket(self.handle)
+            .close();
         self.shared.wake.notify_one();
         Poll::Ready(Ok(()))
     }
@@ -1746,69 +1293,14 @@ impl AsyncWrite for TcpStream {
 impl Drop for TcpStream {
     fn drop(&mut self) {
         let mut state = self.shared.lock();
-        let socket = state.netstack.socket(self.handle);
+        let socket = state.netstack_mut().socket(self.handle);
         if self.established {
             socket.close();
         } else {
             socket.abort();
         }
-        state.closing.push(self.handle);
+        state.close_socket(self.handle);
         drop(state);
         self.shared.wake.notify_one();
-    }
-}
-
-/// Cryptokey routing: a packet from `peer` is accepted only if its source
-/// is one of `peer`'s addresses (or allowed IPs) and its destination is ours.
-fn accept_inbound(netmap: &NetMap, peer: &NodePublic, packet: &[u8]) -> bool {
-    let (Some(src), Some(dst)) = (netstack::source(packet), netstack::destination(packet)) else {
-        return false;
-    };
-    netmap.self_addresses().contains(&dst) && netmap.peer_by_ip(src).is_some_and(|p| p.key == *peer)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::control::types::{MapResponse, Node as NetNode};
-    use crate::keys::PublicKey;
-
-    fn packet(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
-        let mut p = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 6, 0, 0];
-        p.extend_from_slice(&src);
-        p.extend_from_slice(&dst);
-        p
-    }
-
-    #[test]
-    fn peers_may_only_send_from_their_own_addresses() {
-        let a = NodePublic(PublicKey([1; 32]));
-        let b = NodePublic(PublicKey([2; 32]));
-        let node = |id, key, ip: &str| {
-            crate::control::netmap::Peer::from(NetNode {
-                id,
-                key,
-                addresses: vec![format!("{ip}/32")],
-                ..Default::default()
-            })
-        };
-        let mut netmap = NetMap::default();
-        netmap.apply(MapResponse {
-            node: Some(node(1, NodePublic::default(), "100.64.0.9")),
-            peers: vec![node(2, a, "100.64.0.1"), node(3, b, "100.64.0.2")],
-            ..Default::default()
-        });
-        let me = [100, 64, 0, 9];
-        assert!(accept_inbound(&netmap, &a, &packet([100, 64, 0, 1], me)));
-        // b claiming to be a is dropped.
-        assert!(!accept_inbound(&netmap, &b, &packet([100, 64, 0, 1], me)));
-        // Not for us, or not from the tailnet at all.
-        assert!(!accept_inbound(
-            &netmap,
-            &a,
-            &packet([100, 64, 0, 1], [100, 64, 0, 2])
-        ));
-        assert!(!accept_inbound(&netmap, &a, &packet([8, 8, 8, 8], me)));
-        assert!(!accept_inbound(&netmap, &a, &[0x45, 0]));
     }
 }

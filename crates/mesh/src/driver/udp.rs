@@ -32,7 +32,7 @@ impl UdpBinder {
         let (handle, port) = self
             .shared
             .lock()
-            .netstack
+            .netstack_mut()
             .bind_udp(port)
             .map_err(|e| io::Error::new(io::ErrorKind::AddrInUse, format!("{e:?}")))?;
         Ok(UdpSocket::new(
@@ -75,7 +75,13 @@ impl UdpSocket {
                 ),
             ));
         }
-        if self.shared.lock().netmap.peer_by_ip(target.ip()).is_none() {
+        if self
+            .shared
+            .lock()
+            .netmap()
+            .peer_by_ip(target.ip())
+            .is_none()
+        {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("{} is not a peer on the mesh", target.ip()),
@@ -83,7 +89,7 @@ impl UdpSocket {
         }
         let sent = poll_fn(|cx| {
             let mut state = self.shared.lock();
-            let socket = state.netstack.udp_socket(self.handle);
+            let socket = state.netstack_mut().udp_socket(self.handle);
             match socket.send_slice(data, IpEndpoint::from(target)) {
                 Ok(()) => Poll::Ready(Ok(data.len())),
                 Err(SendError::BufferFull) => {
@@ -106,7 +112,7 @@ impl UdpSocket {
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         poll_fn(|cx| {
             let mut state = self.shared.lock();
-            let socket = state.netstack.udp_socket(self.handle);
+            let socket = state.netstack_mut().udp_socket(self.handle);
             match socket.recv_slice(buf) {
                 Ok((n, meta)) => Poll::Ready(Ok((
                     n,
@@ -129,7 +135,7 @@ impl UdpSocket {
 impl Drop for UdpSocket {
     fn drop(&mut self) {
         let mut state = self.shared.lock();
-        state.netstack.udp_socket(self.handle).close();
-        state.netstack.remove(self.handle);
+        state.netstack_mut().udp_socket(self.handle).close();
+        state.netstack_mut().remove(self.handle);
     }
 }
