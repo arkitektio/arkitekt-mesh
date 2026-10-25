@@ -18,6 +18,8 @@ use crate::control::types::TkaInfo;
 use crate::keys::NodePublic;
 use crate::tka::{hash_text, AumHash, Authority};
 
+pub mod sync;
+
 /// Where a node keeps its tailnet-lock chain between runs.
 pub trait LockStore: Send + Sync + 'static {
     /// The chain as last saved (oldest first), if any.
