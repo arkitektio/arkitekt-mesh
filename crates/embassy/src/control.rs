@@ -202,6 +202,9 @@ impl Mesh {
         url: &Url,
         dial: &'d D,
     ) -> Result<Live<D::Conn<'d>>, String> {
+        if D::WEBSOCKET {
+            return self.connect_websocket(url, dial).await;
+        }
         let server_key = {
             let mut stream = dial
                 .dial(&url.host, url.port, url.tls())
@@ -249,6 +252,40 @@ impl Mesh {
             self.config.http2,
         )
         .map_err(|e| e.to_string())?;
+        Ok(Live {
+            conn,
+            stream,
+            calls: BTreeMap::new(),
+        })
+    }
+
+    /// The WebSocket form: `/key` by GET, then the upgrade the Dial makes.
+    async fn connect_websocket<'d, D: Dial>(
+        &self,
+        url: &Url,
+        dial: &'d D,
+    ) -> Result<Live<D::Conn<'d>>, String> {
+        let scheme = if url.https { "https" } else { "http" };
+        let (status, body) = dial
+            .get(&format!("{scheme}://{}{}", url.authority, api::key_path()))
+            .await
+            .map_err(|e| format!("GET /key: {e}"))?;
+        let server_key = api::parse_server_key(status, &body).map_err(|e| e.to_string())?;
+        let (conn, path) = ControlConn::upgraded(
+            &url.authority,
+            &self.config.machine_key,
+            &server_key,
+            self.config.http2,
+        )
+        .map_err(|e| e.to_string())?;
+        let ws = if url.https { "wss" } else { "ws" };
+        let stream = dial
+            .websocket(
+                &format!("{ws}://{}{path}", url.authority),
+                api::WEBSOCKET_PROTOCOL,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(Live {
             conn,
             stream,

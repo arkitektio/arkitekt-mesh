@@ -1,0 +1,25 @@
+# The web driver (arkitekt-mesh-web) under node: control and DERP over
+# WebSockets, DERP only. `./run.sh harness` joins the Go harness (needs go
+# and wasm-pack), `./run.sh lab` the mesh lab's ionskale (its environment
+# loaded), and reaches the peer over the tunnel. Not a workspace member.
+[package]
+name = "mesh-web-check"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mesh-web = { path = "../../crates/web", package = "arkitekt-mesh-web" }
+mesh-core = { path = "../../crates/core", package = "arkitekt-mesh-core", default-features = false }
+embassy-time = "0.5"
+embedded-io-async = "0.7"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

@@ -262,6 +262,14 @@ Each phase ends green and could be released. Gates every time:
    driver's cancelled reads, untested (the host check's TLS is poll-based).
 6. **The web driver.** DERP-only, control and DERP over WebSocket; run
    under node against ionskale, like arkirust's wasm e2e.
+   Done: `arkitekt-mesh-web` is the embassy driver on the JS event loop: a
+   `Dial` whose streams are WebSockets (`Dial::WEBSOCKET`: control by
+   `GET /ts2021`, DERP by `GET /derp`, `/key` by fetch), no UDP, and a time
+   driver of its own (performance.now, setTimeout: embassy-time's needs a
+   window, which node and workers lack). `checks/web` (CI job `web`, in
+   the release's `needs`) joins `testcontrol` under node and reaches its
+   peer over DERP; against the lab's ionskale with its CA by hand
+   (`./run.sh lab`). ionskale now lets any origin read `/key`.
 7. **arkirust and the board.** The joiner contract and the routing
    `TcpConnect` in fakts / arkitekt-embassy (an arkirust release), then the
    `mesh` feature in `esp32-embassy-demo` (S3 + PSRAM).

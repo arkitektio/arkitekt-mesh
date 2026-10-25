@@ -1,0 +1,30 @@
+[package]
+name = "arkitekt-mesh-web"
+description = "arkitekt-mesh in the browser: a node of the deployment's tailnet over WebSockets (DERP only), on wasm32"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["tailscale", "wireguard", "mesh", "wasm", "browser"]
+categories = ["network-programming", "wasm", "web-programming"]
+readme = "README.md"
+
+[lib]
+name = "mesh_web"
+
+# Only on wasm32: elsewhere the crate is empty.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+mesh-core.workspace = true
+mesh-embassy.workspace = true
+embassy-time = "0.5"
+# Our own time driver (performance.now, setTimeout): embassy-time's wasm
+# driver needs a window, which node and web workers lack.
+embassy-time-driver = "0.2"
+embedded-io-async = "0.7"
+getrandom = { version = "0.2", features = ["js"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["WebSocket", "BinaryType", "MessageEvent", "CloseEvent", "Event", "Response"] }
+tracing = { version = "0.1", default-features = false }

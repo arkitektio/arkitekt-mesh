@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/embassy",
     "crates/mesh",
+    "crates/web",
     "crates/meshd",
     "crates/mesh-py",
 ]
@@ -19,6 +20,7 @@ homepage = "https://github.com/arkitektio/arkitekt-mesh"
 mesh = { path = "crates/mesh", version = "0.7.0", package = "arkitekt-mesh" }
 # Without std by default: the std crates ask for it.
 mesh-core = { path = "crates/core", version = "0.7.0", package = "arkitekt-mesh-core", default-features = false }
+mesh-embassy = { path = "crates/embassy", version = "0.7.0", package = "arkitekt-mesh-embassy" }
 
 async-trait = "0.1"
 base64 = "0.22"

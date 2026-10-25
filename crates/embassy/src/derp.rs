@@ -10,7 +10,7 @@ use embassy_futures::select::{select, select3, Either3};
 use embedded_io_async::{Read, Write};
 
 use mesh_core::control::types::{DerpNode, DerpRegion};
-use mesh_core::derp::conn::{Backoff, DerpConn};
+use mesh_core::derp::conn::{Backoff, DerpConn, WEBSOCKET_PROTOCOL};
 use mesh_core::derp::Event;
 
 use crate::{at, now, Dial, Mesh, Tls};
@@ -103,16 +103,32 @@ impl Mesh {
         // Dialing and the handshake take at most this long (then the
         // region's next node), as in the tokio driver.
         let handshake_by = embassy_time::Instant::now() + embassy_time::Duration::from_secs(10);
-        let mut stream = embassy_time::with_deadline(handshake_by, dial.dial(&host, port, tls))
-            .await
-            .map_err(|_| format!("connecting to {host} timed out"))?
-            .map_err(|e| format!("{host}: {e}"))?;
         let authority = if port == 443 {
             node.host_name.clone()
         } else {
             format!("{}:{port}", node.host_name)
         };
-        let mut conn = DerpConn::new(&authority, self.config.node_key.clone(), home, now());
+        let (opened, mut conn) = if D::WEBSOCKET {
+            // By name: the WebSocket's TLS checks the certificate for it.
+            let url = format!("wss://{authority}/derp");
+            let opened =
+                embassy_time::with_deadline(handshake_by, dial.websocket(&url, WEBSOCKET_PROTOCOL))
+                    .await;
+            (
+                opened,
+                DerpConn::upgraded(self.config.node_key.clone(), home, now()),
+            )
+        } else {
+            let opened =
+                embassy_time::with_deadline(handshake_by, dial.dial(&host, port, tls)).await;
+            (
+                opened,
+                DerpConn::new(&authority, self.config.node_key.clone(), home, now()),
+            )
+        };
+        let mut stream = opened
+            .map_err(|_| format!("connecting to {host} timed out"))?
+            .map_err(|e| format!("{host}: {e}"))?;
         let mut buf = vec![0u8; 4096];
         loop {
             if self.inner.borrow().slots[i].generation != generation {

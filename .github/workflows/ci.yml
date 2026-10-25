@@ -61,6 +61,35 @@ jobs:
       - run: cargo clippy -p arkitekt-mesh-core --no-default-features --features tka-disable,udp --target thumbv7em-none-eabihf -- -D warnings
       - run: cargo clippy -p arkitekt-mesh-core --no-default-features --features tka-disable,udp --target wasm32-unknown-unknown -- -D warnings
       - run: cargo clippy -p arkitekt-mesh-embassy --target thumbv7em-none-eabihf -- -D warnings
+      - run: cargo clippy -p arkitekt-mesh-web --target wasm32-unknown-unknown -- -D warnings
+
+  # The web driver under node (checks/web, not a workspace member): it joins
+  # tailscale's test control by WebSocket and reaches the peer over DERP by
+  # WebSocket.
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: checks/web
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/mesh/tests/harness/go.mod
+          cache-dependency-path: crates/mesh/tests/harness/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall -y --locked wasm-pack
+      - run: cargo clippy --target wasm32-unknown-unknown --all-targets -- -D warnings
+        working-directory: checks/web
+      - run: ./run.sh harness
+        working-directory: checks/web
 
   # The embassy driver on the host (checks/embassy, not a workspace member):
   # an embassy executor on std joins tailscale's test control server and
@@ -108,7 +137,7 @@ jobs:
   # `vX.Y.Z` and creates the GitHub release; then the crates go to crates.io,
   # the Python bindings to PyPI and the meshd binaries onto the release.
   release:
-    needs: [test, native, embedded, no-std, embassy]
+    needs: [test, native, embedded, no-std, embassy, web]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'arkitektio'
     runs-on: ubuntu-latest
     concurrency:

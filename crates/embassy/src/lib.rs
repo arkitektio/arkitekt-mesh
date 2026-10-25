@@ -96,6 +96,28 @@ pub trait Dial {
         port: u16,
         tls: Tls<'_>,
     ) -> Result<Self::Conn<'a>, DialError>;
+
+    /// Whether control and DERP go by WebSocket ([`websocket`](Self::websocket),
+    /// [`get`](Self::get)) instead of HTTP upgrades on [`dial`](Self::dial)'s
+    /// streams: a browser has no raw TCP.
+    const WEBSOCKET: bool = false;
+
+    /// A WebSocket to `url` (`ws://` or `wss://`) speaking `protocol`: each
+    /// write goes as one binary message, reads give the messages' bytes.
+    async fn websocket<'a>(
+        &'a self,
+        url: &str,
+        protocol: &str,
+    ) -> Result<Self::Conn<'a>, DialError> {
+        let _ = (url, protocol);
+        Err(DialError(String::from("this Dial has no WebSocket")))
+    }
+
+    /// `GET url`: its status and body (control's `/key`, by WebSocket).
+    async fn get(&self, url: &str) -> Result<(u16, Vec<u8>), DialError> {
+        let _ = url;
+        Err(DialError(String::from("this Dial has no GET")))
+    }
 }
 
 /// Who the node is and how it runs.

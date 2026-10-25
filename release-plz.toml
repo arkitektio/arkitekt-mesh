@@ -19,6 +19,10 @@ version_group = "arkitekt-mesh"
 name = "arkitekt-mesh-embassy"
 version_group = "arkitekt-mesh"
 
+[[package]]
+name = "arkitekt-mesh-web"
+version_group = "arkitekt-mesh"
+
 # The sidecar binary (`cargo install arkitekt-meshd`); its prebuilt binaries
 # are attached to the GitHub release by .github/workflows/meshd.yml.
 [[package]]
