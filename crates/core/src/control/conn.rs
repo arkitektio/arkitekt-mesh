@@ -57,11 +57,12 @@ pub enum Event {
 }
 
 enum Phase {
-    /// The upgrade request is out; the 101 and the handshake response are
-    /// read into `buf`.
+    /// The upgrade request is out; the 101 (unless the driver upgraded:
+    /// `head` false) and the handshake response are read into `buf`.
     Upgrading {
         handshake: Option<ClientHandshake>,
         buf: Vec<u8>,
+        head: bool,
     },
     Open {
         noise: NoiseStream,
@@ -107,11 +108,42 @@ impl ControlConn {
             phase: Phase::Upgrading {
                 handshake: Some(handshake),
                 buf: Vec::new(),
+                head: true,
             },
             out: super::api::upgrade_request(authority, &init),
             calls: BTreeMap::new(),
             events: VecDeque::new(),
         })
+    }
+
+    /// A connection whose upgrade the driver makes: the WebSocket form, a
+    /// `GET` of the returned path with the
+    /// [`WEBSOCKET_PROTOCOL`](super::api::WEBSOCKET_PROTOCOL) subprotocol
+    /// (a browser's WebSocket does it). Nothing is queued; the messages'
+    /// bytes, from the handshake response on, go to
+    /// [`handle_input`](Self::handle_input), and what
+    /// [`poll_transmit`](Self::poll_transmit) gives goes out as binary
+    /// messages.
+    pub fn upgraded(
+        authority: &str,
+        machine: &PrivateKey,
+        server_key: &MachinePublic,
+        config: http2::Config,
+    ) -> Result<(Self, String), ConnError> {
+        let (handshake, init) = ClientHandshake::start(machine, server_key, CAPABILITY_VERSION)?;
+        let conn = Self {
+            authority: authority.to_owned(),
+            config,
+            phase: Phase::Upgrading {
+                handshake: Some(handshake),
+                buf: Vec::new(),
+                head: false,
+            },
+            out: Vec::new(),
+            calls: BTreeMap::new(),
+            events: VecDeque::new(),
+        };
+        Ok((conn, super::api::websocket_path(&init)))
     }
 
     /// Whether calls may go out.
@@ -197,13 +229,21 @@ impl ControlConn {
     fn input(&mut self, data: &[u8]) -> Result<(), ConnError> {
         match &mut self.phase {
             Phase::Failed => Err(ConnError::H2(H2Error::GoingAway)),
-            Phase::Upgrading { handshake, buf } => {
+            Phase::Upgrading {
+                handshake,
+                buf,
+                head,
+            } => {
                 buf.extend_from_slice(data);
-                let Some((head, used)) = http1::parse_head(buf)? else {
-                    return Ok(());
-                };
-                if head.status != 101 {
-                    return Err(ConnError::Upgrade(head.status));
+                let mut used = 0;
+                if *head {
+                    let Some((response, n)) = http1::parse_head(buf)? else {
+                        return Ok(());
+                    };
+                    if response.status != 101 {
+                        return Err(ConnError::Upgrade(response.status));
+                    }
+                    used = n;
                 }
                 // The server corks its answer: the response may ride with the head.
                 let rest = &buf[used..];

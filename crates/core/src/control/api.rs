@@ -59,6 +59,27 @@ pub fn upgrade_request(authority: &str, initiation: &[u8]) -> Vec<u8> {
     )
 }
 
+/// The path of the WebSocket form of the upgrade (`GET`, the
+/// `tailscale-control-protocol` subprotocol): the initiation goes in the
+/// query, where a browser can put it.
+pub fn websocket_path(initiation: &[u8]) -> String {
+    use base64::Engine;
+    let handshake = base64::engine::general_purpose::STANDARD.encode(initiation);
+    let mut path = String::from("/ts2021?X-Tailscale-Handshake=");
+    for c in handshake.chars() {
+        match c {
+            '+' => path.push_str("%2B"),
+            '/' => path.push_str("%2F"),
+            '=' => path.push_str("%3D"),
+            c => path.push(c),
+        }
+    }
+    path
+}
+
+/// The subprotocol the WebSocket form asks for.
+pub const WEBSOCKET_PROTOCOL: &str = "tailscale-control-protocol";
+
 /// One request to control, over the Noise connection's HTTP/2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Call {
@@ -241,6 +262,16 @@ mod tests {
         let mut frames = MapFrames::new();
         frames.feed(&frame(r#"{"KeepAlive":true}"#)[..6]).unwrap();
         assert!(frames.finish().is_err());
+    }
+
+    #[test]
+    fn the_websocket_path_escapes_base64() {
+        // 0xfb 0xff 0xfe encodes to "+//+": every character escaped.
+        assert_eq!(
+            websocket_path(&[0xfb, 0xff, 0xfe]),
+            "/ts2021?X-Tailscale-Handshake=%2B%2F%2F%2B"
+        );
+        assert!(websocket_path(&[1]).ends_with("AQ%3D%3D"));
     }
 
     #[test]

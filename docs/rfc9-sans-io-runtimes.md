@@ -217,6 +217,21 @@ Each phase ends green and could be released. Gates every time:
    `testcontrol` and ionskale (the mesh harness can start the
    `mounts/ionskale` build), on the host. ionskale gets its WebSocket-on-Noise
    test.
+   Done: `mesh_core::http2` (and HPACK), `control::{http1, api, conn}` and
+   `noise::NoiseStream`; the tokio driver goes through `http1`, `api` and
+   `NoiseStream` (over `h2`), `ControlConn` runs against `testcontrol`
+   (`tests/control_conn.rs`) and the lab's ionskale over TLS, both by the
+   HTTP upgrade and by WebSocket (`tests/lab_control_conn.rs`). ionskale
+   routed only `POST /ts2021`, so the WebSocket form (a `GET`) never reached
+   tailscale's `controlhttpserver`; it now routes `GET /ts2021` too, and
+   serves a WebSocket connection with `http2.Server.ServeConn` directly
+   (under net/http and h2c, the past deadline that stops the server's
+   background read closed one WebSocket connection in about seven).
+   The control loop's policy (register, the map stream and its quiet limit,
+   reconnect with backoff, endpoint updates, tailnet-lock sync) still lives
+   in the tokio driver's `map_loop`/`update_loop`; it moves into the core,
+   written against `api::Call` and its answers (not against either HTTP/2),
+   with the embassy driver (phase 5), its first second user.
 4. **DerpConn.** The DERP connection machine (and over WebSocket); tokio's
    DERP task only moves bytes.
 5. **The embassy driver.** A conformance run on the host against
