@@ -825,52 +825,55 @@ async fn run_loop(
     // The DERP connection whose full queue holds the sockets back: the loop
     // waits for it to drain before it lets them send again.
     let mut backlog: Option<mpsc::Sender<Vec<u8>>> = None;
-    let mut act = |shared: &Shared, derp: &mut HashMap<i32, DerpConn>| loop {
-        let Some(event) = shared.lock().poll_event() else {
-            break;
-        };
-        match event {
-            Event::ConnectDerp { region, info, home } => {
-                // Replacing a connection drops its sender, which ends its task.
-                let (tx, rx) = mpsc::channel(limits.derp_queue.max(1));
-                let sending = derp_conn::Sending {
-                    burst: limits.derp_burst,
-                    up: Arc::default(),
-                };
-                derp.insert(
-                    region,
-                    DerpConn {
-                        tx,
-                        up: sending.up.clone(),
-                    },
-                );
-                derp_tasks.0.retain(|t| !t.is_finished());
-                derp_tasks.0.push(tokio::spawn(derp_conn::run(
-                    info,
-                    node_key.clone(),
-                    home,
-                    derp_tx.clone(),
-                    rx,
-                    sending,
-                )));
-            }
-            Event::DropDerp { region } => {
-                derp.remove(&region);
-            }
-            Event::Endpoints(endpoints) => {
-                let _ = endpoints_tx.send(endpoints);
-            }
-            Event::Home(report) => {
-                let _ = home_tx.send(report);
+    // What the core asks for, under the lock already held.
+    let mut act = |state: &mut NodeCore, derp: &mut HashMap<i32, DerpConn>| {
+        while let Some(event) = state.poll_event() {
+            match event {
+                Event::ConnectDerp { region, info, home } => {
+                    // Replacing a connection drops its sender, which ends its task.
+                    let (tx, rx) = mpsc::channel(limits.derp_queue.max(1));
+                    let sending = derp_conn::Sending {
+                        burst: limits.derp_burst,
+                        up: Arc::default(),
+                    };
+                    derp.insert(
+                        region,
+                        DerpConn {
+                            tx,
+                            up: sending.up.clone(),
+                        },
+                    );
+                    derp_tasks.0.retain(|t| !t.is_finished());
+                    derp_tasks.0.push(tokio::spawn(derp_conn::run(
+                        info,
+                        node_key.clone(),
+                        home,
+                        derp_tx.clone(),
+                        rx,
+                        sending,
+                    )));
+                }
+                Event::DropDerp { region } => {
+                    derp.remove(&region);
+                }
+                Event::Endpoints(endpoints) => {
+                    let _ = endpoints_tx.send(endpoints);
+                }
+                Event::Home(report) => {
+                    let _ = home_tx.send(report);
+                }
             }
         }
     };
 
     loop {
-        // The connections asked for (the home region's, at the start).
-        act(&shared, &mut derp);
         let now = clock::now();
-        let deadline = shared.lock().poll_timeout(now, backlog.is_some());
+        let deadline = {
+            let mut state = shared.lock();
+            // The connections asked for (the home region's, at the start).
+            act(&mut state, &mut derp);
+            state.poll_timeout(now, backlog.is_some())
+        };
 
         let mut transmits = Vec::new();
         tokio::select! {
@@ -994,12 +997,9 @@ async fn run_loop(
                 let local6 = local_port6.filter(|_| direct).and_then(local_endpoint6);
                 udp_sends = state.stun(now, local, local6);
             }
+            // Connect the regions the transmits go to before sending to them.
             state.link_derp_for(&transmits);
-        }
-        // Connect the regions the transmits go to before sending to them.
-        act(&shared, &mut derp);
-        {
-            let mut state = shared.lock();
+            act(&mut state, &mut derp);
             for t in transmits {
                 match t.via {
                     Via::Udp(addr) => udp_sends.push((addr, t.data)),
