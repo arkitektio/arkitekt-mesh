@@ -17,7 +17,7 @@ name = "mesh"
 
 [dependencies]
 # The sans-IO core: keys, codecs and protocol state machines.
-mesh-core.workspace = true
+mesh-core = { workspace = true, features = ["std"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 blake2 = "0.10"
@@ -100,7 +100,7 @@ tokio = [
 ]
 
 [dev-dependencies]
-mesh-core = { workspace = true, features = ["testing"] }
+mesh-core = { workspace = true, features = ["std", "testing"] }
 # The ESP32 firmware's TLS provider, for tests/lab_firmware_tls.rs.
 rustls-rustcrypto = "0.0.2-alpha"
 axum.workspace = true

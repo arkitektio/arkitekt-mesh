@@ -247,6 +247,16 @@ Each phase ends green and could be released. Gates every time:
    `checks/embassy` runs the real stack), TLS from a connector. The only
    check before hardware, so it is required. Builds for
    `xtensa-esp32s3-none-elf`.
+   Done: the control loop's policy is `control::session::ControlSession`
+   (5a) and tailnet-lock sync `lock::sync::LockSync` (5b), both adopted by
+   the tokio driver; `arkitekt-mesh-embassy` (5c) runs control, two DERP
+   slots and the node loop as one future over the app's `Udp` and `Dial`,
+   with TCP over the tunnel for the app. `checks/embassy` (CI job
+   `embassy`, in the release's `needs`) joins `testcontrol` and reaches its
+   peer (HTTP, a 64 KiB echo), directly and DERP-only; against the lab's
+   ionskale by hand (`cargo run -- lab`). Builds for
+   `xtensa-esp32s3-none-elf`. Not yet: a `LockStore` (the chain is
+   re-bootstrapped each start), DERP send pacing, IPv6, incoming TCP.
 6. **The web driver.** DERP-only, control and DERP over WebSocket; run
    under node against ionskale, like arkirust's wasm e2e.
 7. **arkirust and the board.** The joiner contract and the routing

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/embassy",
     "crates/mesh",
     "crates/meshd",
     "crates/mesh-py",
@@ -16,7 +17,8 @@ homepage = "https://github.com/arkitektio/arkitekt-mesh"
 
 [workspace.dependencies]
 mesh = { path = "crates/mesh", version = "0.7.0", package = "arkitekt-mesh" }
-mesh-core = { path = "crates/core", version = "0.7.0", package = "arkitekt-mesh-core" }
+# Without std by default: the std crates ask for it.
+mesh-core = { path = "crates/core", version = "0.7.0", package = "arkitekt-mesh-core", default-features = false }
 
 async-trait = "0.1"
 base64 = "0.22"

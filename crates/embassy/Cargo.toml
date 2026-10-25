@@ -1,0 +1,30 @@
+[package]
+name = "arkitekt-mesh-embassy"
+description = "arkitekt-mesh on embassy: a node of the deployment's tailnet without std, over the app's UDP and TLS streams"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["tailscale", "wireguard", "mesh", "embassy", "no-std"]
+categories = ["network-programming", "no-std", "embedded"]
+readme = "README.md"
+
+[lib]
+name = "mesh_embassy"
+
+# no_std + alloc; no executor and no time driver of its own (the app's).
+[dependencies]
+mesh-core.workspace = true
+embassy-time = "0.5"
+embassy-sync = "0.8"
+embassy-futures = "0.1"
+embedded-io-async = "0.7"
+embedded-nal-async = "0.9"
+smoltcp = { version = "0.13", default-features = false }
+thiserror = { version = "2", default-features = false }
+tracing = { version = "0.1", default-features = false }
+
+[features]
+# Verify tailnet-lock disablements (Argon2i, 16 MiB): too much for a board.
+tka-disable = ["mesh-core/tka-disable"]

@@ -60,6 +60,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p arkitekt-mesh-core --no-default-features --features tka-disable,udp --target thumbv7em-none-eabihf -- -D warnings
       - run: cargo clippy -p arkitekt-mesh-core --no-default-features --features tka-disable,udp --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy -p arkitekt-mesh-embassy --target thumbv7em-none-eabihf -- -D warnings
+
+  # The embassy driver on the host (checks/embassy, not a workspace member):
+  # an embassy executor on std joins tailscale's test control server and
+  # reaches its peer over the tunnel, directly and through DERP only.
+  embassy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: checks/embassy
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/mesh/tests/harness/go.mod
+          cache-dependency-path: crates/mesh/tests/harness/go.sum
+      - run: cargo clippy -- -D warnings
+        working-directory: checks/embassy
+      - run: cargo run -- harness
+        working-directory: checks/embassy
+      - run: cargo run -- harness --derp-only
+        working-directory: checks/embassy
 
   # Squash-merged PR titles become the commits semantic-release reads, so enforce Conventional Commits.
   pr-title:
@@ -78,7 +103,7 @@ jobs:
   # `vX.Y.Z` and creates the GitHub release; then the crates go to crates.io,
   # the Python bindings to PyPI and the meshd binaries onto the release.
   release:
-    needs: [test, native, embedded, no-std]
+    needs: [test, native, embedded, no-std, embassy]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'arkitektio'
     runs-on: ubuntu-latest
     concurrency:
