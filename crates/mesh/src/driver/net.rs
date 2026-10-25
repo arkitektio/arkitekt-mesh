@@ -6,6 +6,7 @@ use std::io;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::control::http1;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -273,15 +274,15 @@ impl Head {
 pub async fn read_head(io: &mut (impl AsyncRead + Unpin)) -> io::Result<Head> {
     let mut buf = Vec::with_capacity(1024);
     let mut chunk = [0u8; 1024];
-    let end = loop {
-        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            break i;
-        }
-        if buf.len() > 64 * 1024 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "response head too large",
-            ));
+    loop {
+        let parsed =
+            http1::parse_head(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if let Some((head, used)) = parsed {
+            return Ok(Head {
+                status: head.status,
+                headers: head.headers,
+                rest: buf[used..].to_vec(),
+            });
         }
         let n = io.read(&mut chunk).await?;
         if n == 0 {
@@ -291,37 +292,22 @@ pub async fn read_head(io: &mut (impl AsyncRead + Unpin)) -> io::Result<Head> {
             ));
         }
         buf.extend_from_slice(&chunk[..n]);
-    };
-    let text = std::str::from_utf8(&buf[..end])
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "response head is not text"))?;
-    let mut lines = text.split("\r\n");
-    let status = lines
-        .next()
-        .and_then(|l| l.split(' ').nth(1))
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed status line"))?;
-    let headers = lines
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-        .collect();
-    Ok(Head {
-        status,
-        headers,
-        rest: buf[end + 4..].to_vec(),
-    })
+    }
 }
 
 /// `GET` a small resource; returns the status and body.
 pub async fn get(base: &BaseUrl, path: &str) -> io::Result<(u16, Vec<u8>)> {
     let tls = if base.https { Tls::Verify } else { Tls::None };
     let mut io = connect(&base.host, base.port, tls).await?;
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {}\r\nUser-Agent: arkitekt-mesh\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
-        base.authority()
+    let request = http1::request(
+        "GET",
+        path,
+        &base.authority(),
+        &["Accept: application/json", "Connection: close"],
     );
-    io.write_all(request.as_bytes()).await?;
+    io.write_all(&request).await?;
     let head = read_head(&mut io).await?;
-    let mut body = head.rest.clone();
+    let mut body = head.rest;
     io.read_to_end(&mut body).await.or_else(|e| {
         // Some TLS servers close without close_notify; the body is complete.
         if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -330,35 +316,13 @@ pub async fn get(base: &BaseUrl, path: &str) -> io::Result<(u16, Vec<u8>)> {
             Err(e)
         }
     })?;
-    if head
-        .header("transfer-encoding")
-        .is_some_and(|v| v.eq_ignore_ascii_case("chunked"))
-    {
-        body = dechunk(&body)?;
-    } else if let Some(len) = head
-        .header("content-length")
-        .and_then(|l| l.parse::<usize>().ok())
-    {
-        body.truncate(len);
-    }
-    Ok((head.status, body))
-}
-
-fn dechunk(mut body: &[u8]) -> io::Result<Vec<u8>> {
-    let bad = || io::Error::new(io::ErrorKind::InvalidData, "malformed chunked body");
-    let mut out = Vec::new();
-    loop {
-        let line_end = body.windows(2).position(|w| w == b"\r\n").ok_or_else(bad)?;
-        let size_text = std::str::from_utf8(&body[..line_end]).map_err(|_| bad())?;
-        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| bad())?;
-        body = &body[line_end + 2..];
-        if size == 0 {
-            return Ok(out);
-        }
-        out.extend_from_slice(body.get(..size).ok_or_else(bad)?);
-        body = body.get(size + 2..).ok_or_else(bad)?;
-    }
+    let framing = http1::Head {
+        status: head.status,
+        headers: head.headers,
+    };
+    let body =
+        http1::body(&framing, body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok((framing.status, body))
 }
 
 #[cfg(test)]
@@ -382,14 +346,6 @@ mod tests {
             ("::1", "[::1]:8080".to_owned())
         );
         assert!(BaseUrl::parse("ftp://x").is_err());
-    }
-
-    #[test]
-    fn chunked_bodies() {
-        assert_eq!(
-            dechunk(b"5\r\nhello\r\n1;x\r\n!\r\n0\r\n\r\n").unwrap(),
-            b"hello!"
-        );
     }
 
     #[tokio::test]

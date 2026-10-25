@@ -187,6 +187,104 @@ impl Transport {
 /// The server's optional first message: `FF FF FF 'T' 'S' ‖ u32 BE len ‖ JSON`.
 pub const EARLY_PAYLOAD_MAGIC: &[u8; 5] = b"\xff\xff\xffTS";
 
+/// The largest early payload accepted.
+const MAX_EARLY_PAYLOAD: usize = 10 << 20;
+
+/// The record layer as a byte stream, without I/O: ciphertext in (in any
+/// slicing), plaintext out, plaintext sealed into records.
+///
+/// Before handing any plaintext up it sniffs the server's optional early
+/// payload (`FF FF FF 'T' 'S' ‖ u32 BE len ‖ JSON`) and drops it.
+pub struct NoiseStream {
+    transport: Transport,
+    /// Ciphertext not yet a whole record.
+    raw: Vec<u8>,
+    /// Plaintext ready for the reader.
+    plain: Vec<u8>,
+    sniffed: bool,
+}
+
+impl NoiseStream {
+    /// After the handshake; `leftover` is what arrived with its response.
+    pub fn new(transport: Transport, leftover: Vec<u8>) -> Self {
+        Self {
+            transport,
+            raw: leftover,
+            plain: Vec::new(),
+            sniffed: false,
+        }
+    }
+
+    /// Ciphertext from the server.
+    pub fn handle_input(&mut self, data: &[u8]) -> Result<(), NoiseError> {
+        self.raw.extend_from_slice(data);
+        self.decrypt()
+    }
+
+    /// Decrypt the complete records buffered (also those that came with
+    /// the handshake: call once after [`new`](Self::new)).
+    pub fn decrypt(&mut self) -> Result<(), NoiseError> {
+        while let Some(record) = self.transport.open(&mut self.raw)? {
+            self.plain.extend_from_slice(&record);
+        }
+        self.sniff()
+    }
+
+    /// Move up to `out.len()` plaintext bytes into `out`.
+    pub fn read(&mut self, out: &mut [u8]) -> usize {
+        if !self.sniffed {
+            return 0;
+        }
+        let n = out.len().min(self.plain.len());
+        out[..n].copy_from_slice(&self.plain[..n]);
+        self.plain.drain(..n);
+        n
+    }
+
+    /// All the plaintext ready.
+    pub fn take(&mut self) -> Vec<u8> {
+        if !self.sniffed {
+            return Vec::new();
+        }
+        core::mem::take(&mut self.plain)
+    }
+
+    /// Whether plaintext is ready.
+    pub fn readable(&self) -> bool {
+        self.sniffed && !self.plain.is_empty()
+    }
+
+    /// Seal `plaintext` into records, appended to `out`.
+    pub fn seal(&mut self, plaintext: &[u8], out: &mut Vec<u8>) {
+        self.transport.seal(plaintext, out);
+    }
+
+    /// Drop the early payload once enough plaintext is here to tell.
+    fn sniff(&mut self) -> Result<(), NoiseError> {
+        if self.sniffed || self.plain.len() < 9 {
+            return Ok(());
+        }
+        if &self.plain[..5] != EARLY_PAYLOAD_MAGIC {
+            self.sniffed = true;
+            return Ok(());
+        }
+        let len = u32::from_be_bytes(self.plain[5..9].try_into().expect("4")) as usize;
+        if len > MAX_EARLY_PAYLOAD {
+            return Err(NoiseError::Malformed);
+        }
+        if self.plain.len() < 9 + len {
+            return Ok(());
+        }
+        tracing::trace!(
+            "control early payload: {}",
+            String::from_utf8_lossy(&self.plain[9..9 + len])
+        );
+        self.plain.drain(..9 + len);
+        self.sniffed = true;
+        Ok(())
+    }
+}
+
 /// The server half of the handshake, for tests here and in the drivers.
 #[cfg(any(test, feature = "testing"))]
 pub mod tests {

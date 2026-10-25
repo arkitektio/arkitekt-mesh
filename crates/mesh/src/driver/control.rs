@@ -6,15 +6,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{ready, Context, Poll};
 
-use base64::Engine;
 use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use super::net::{self, BaseUrl, BoxIo, Tls};
-use crate::control::noise::{ClientHandshake, Transport, EARLY_PAYLOAD_MAGIC, RESPONSE_LEN};
-use crate::control::stream::{MapReader, StreamError};
+use crate::control::api::{self, ApiError, Call, MapFrames, MAX_MAP_FRAME};
+use crate::control::noise::{ClientHandshake, NoiseStream, Transport, RESPONSE_LEN};
 use crate::control::types::{
-    MapRequest, MapResponse, RegisterRequest, RegisterResponse, ServerKeys, CAPABILITY_VERSION,
+    MapRequest, MapResponse, RegisterRequest, RegisterResponse, CAPABILITY_VERSION,
 };
 use crate::keys::{MachinePublic, NodePublic, PrivateKey};
 
@@ -34,8 +33,11 @@ fn protocol(msg: impl Into<String>) -> ControlError {
     ControlError::Protocol(msg.into())
 }
 
-/// Largest map response frame accepted.
-const MAX_MAP_FRAME: usize = 16 << 20;
+impl From<ApiError> for ControlError {
+    fn from(e: ApiError) -> Self {
+        ControlError::Protocol(e.0)
+    }
+}
 
 /// An authenticated HTTP/2 connection to the control server.
 #[derive(Clone)]
@@ -64,13 +66,8 @@ impl ControlClient {
         let tls = if base.https { Tls::NoVerify } else { Tls::None };
         let mut io = net::connect(&base.host, base.port, tls).await?;
         let (handshake, init) = ClientHandshake::start(machine, &server_key, CAPABILITY_VERSION)?;
-        let request = format!(
-            "POST /ts2021 HTTP/1.1\r\nHost: {}\r\nUser-Agent: arkitekt-mesh\r\nUpgrade: tailscale-control-protocol\r\n\
-             Connection: upgrade\r\nX-Tailscale-Handshake: {}\r\nContent-Length: 0\r\n\r\n",
-            base.authority(),
-            base64::engine::general_purpose::STANDARD.encode(&init)
-        );
-        io.write_all(request.as_bytes()).await?;
+        io.write_all(&api::upgrade_request(&base.authority(), &init))
+            .await?;
         let head = net::read_head(&mut io).await?;
         if head.status != 101 {
             return Err(protocol(format!(
@@ -96,7 +93,7 @@ impl ControlClient {
         }
         buf.drain(..want);
 
-        let noise = NoiseIo::new(io, transport, buf);
+        let noise = NoiseIo::new(io, transport, buf)?;
         let (send, connection) = h2::client::Builder::new()
             // Small windows bound what control can buffer in us ahead of
             // our reading (memory matters on small devices).
@@ -116,48 +113,24 @@ impl ControlClient {
         })
     }
 
-    async fn post(
-        &self,
-        path: &str,
-        node_key: &NodePublic,
-        body: Vec<u8>,
-    ) -> Result<(u16, h2::RecvStream), ControlError> {
-        self.send(http::Method::POST, path, node_key, body).await
-    }
-
-    async fn send(
-        &self,
-        method: http::Method,
-        path: &str,
-        node_key: &NodePublic,
-        body: Vec<u8>,
-    ) -> Result<(u16, h2::RecvStream), ControlError> {
-        let uri = format!("https://{}{path}", self.base.authority());
-        let request = http::Request::builder()
-            .method(method)
-            .uri(uri)
-            .header("content-type", "application/json")
-            .header("ts-lb", node_key.text())
-            .body(())
-            .map_err(|e| protocol(e.to_string()))?;
+    async fn send(&self, call: &Call) -> Result<(u16, h2::RecvStream), ControlError> {
+        let uri = format!("https://{}{}", self.base.authority(), call.path);
+        let mut request = http::Request::builder().method(call.method).uri(uri);
+        for (name, value) in call.headers() {
+            request = request.header(name, value);
+        }
+        let request = request.body(()).map_err(|e| protocol(e.to_string()))?;
         let mut send = self.send.clone().ready().await?;
         let (response, mut stream) = send.send_request(request, false)?;
-        stream.send_data(Bytes::from(body), true)?;
+        stream.send_data(Bytes::from(call.body.clone()), true)?;
         let response = response.await?;
         Ok((response.status().as_u16(), response.into_body()))
     }
 
     pub async fn register(&self, req: &RegisterRequest) -> Result<RegisterResponse, ControlError> {
-        let body = serde_json::to_vec(req).map_err(|e| protocol(e.to_string()))?;
-        let (status, mut stream) = self.post("/machine/register", &req.node_key, body).await?;
+        let (status, mut stream) = self.send(&Call::register(req)).await?;
         let body = read_all(&mut stream).await?;
-        if status != 200 {
-            return Err(protocol(format!(
-                "register failed with HTTP {status}: {}",
-                String::from_utf8_lossy(&body).trim()
-            )));
-        }
-        serde_json::from_slice(&body).map_err(|e| protocol(format!("bad register response: {e}")))
+        Ok(api::parse_register(status, &body)?)
     }
 
     /// A JSON RPC in Go's style: a GET with a JSON body (the tailnet-lock
@@ -168,45 +141,30 @@ impl ControlClient {
         node_key: &NodePublic,
         req: &Req,
     ) -> Result<Resp, ControlError> {
-        let body = serde_json::to_vec(req).map_err(|e| protocol(e.to_string()))?;
-        let (status, mut stream) = self.send(http::Method::GET, path, node_key, body).await?;
+        let (status, mut stream) = self.send(&Call::rpc(path, node_key, req)).await?;
         let body = read_all(&mut stream).await?;
-        if status != 200 {
-            return Err(protocol(format!(
-                "{path} failed with HTTP {status}: {}",
-                String::from_utf8_lossy(&body).trim()
-            )));
-        }
-        if body.len() > 10 << 20 {
-            return Err(protocol(format!("{path}: response too large")));
-        }
-        serde_json::from_slice(&body).map_err(|e| protocol(format!("bad {path} response: {e}")))
+        Ok(api::parse_rpc(path, status, &body)?)
     }
 
     /// A map request; the responses arrive through [`MapStream::next`].
     pub async fn map(&self, req: &MapRequest) -> Result<MapStream, ControlError> {
-        let body = serde_json::to_vec(req).map_err(|e| protocol(e.to_string()))?;
-        let (status, mut stream) = self.post("/machine/map", &req.node_key, body).await?;
+        let (status, mut stream) = self.send(&Call::map(req)).await?;
         if status != 200 {
             let body = read_all(&mut stream).await.unwrap_or_default();
-            return Err(protocol(format!(
-                "map request failed with HTTP {status}: {}",
-                String::from_utf8_lossy(&body).trim()
-            )));
+            return Err(api::failure("map request", status, &body).into());
         }
         Ok(MapStream {
             stream,
-            pending: Vec::new(),
+            frames: MapFrames::new(),
         })
     }
 }
 
-/// The frames of a map response: `u32 LE length ‖ JSON`, each read
-/// through a [`MapReader`] as it arrives, never held whole.
+/// The frames of a map response, each read through [`MapFrames`] as it
+/// arrives, never held whole.
 pub struct MapStream {
     stream: h2::RecvStream,
-    /// Bytes received past the current point (at most one chunk).
-    pending: Vec<u8>,
+    frames: MapFrames,
 }
 
 impl MapStream {
@@ -226,46 +184,29 @@ impl MapStream {
     /// Read and drop a response without parsing it. Returns whether there
     /// may be more.
     pub async fn skip(&mut self) -> Result<bool, ControlError> {
-        self.pending.clear();
+        self.frames = MapFrames::new();
         Ok(self.chunk().await?.is_some())
     }
 
     /// The next map response, or `None` when the server ends the stream.
     pub async fn next(&mut self) -> Result<Option<MapResponse>, ControlError> {
-        while self.pending.len() < 4 {
+        loop {
+            if let Some(response) = self.frames.pop() {
+                return Ok(Some(response));
+            }
             match self.chunk().await? {
-                Some(chunk) => self.pending.extend_from_slice(&chunk),
-                None if self.pending.is_empty() => return Ok(None),
-                None => return Err(protocol("the map stream ended mid-frame")),
+                Some(chunk) => self.frames.feed(&chunk)?,
+                None => {
+                    self.frames.finish()?;
+                    return Ok(None);
+                }
             }
         }
-        let len = u32::from_le_bytes(self.pending[..4].try_into().expect("4")) as usize;
-        if len == 0 || len > MAX_MAP_FRAME {
-            return Err(protocol(format!("bad map frame length {len}")));
-        }
-        self.pending.drain(..4);
-
-        let bad = |e: StreamError| protocol(e.to_string());
-        let mut reader = MapReader::new();
-        let take = len.min(self.pending.len());
-        reader.feed(&self.pending[..take]).map_err(bad)?;
-        self.pending.drain(..take);
-        let mut left = len - take;
-        while left > 0 {
-            let chunk = self
-                .chunk()
-                .await?
-                .ok_or_else(|| protocol("the map stream ended mid-frame"))?;
-            let take = left.min(chunk.len());
-            reader.feed(&chunk[..take]).map_err(bad)?;
-            self.pending.extend_from_slice(&chunk[take..]);
-            left -= take;
-        }
-        if self.pending.is_empty() {
-            self.pending = Vec::new();
-        }
-        reader.finish().map(Some).map_err(bad)
     }
+}
+
+fn invalid(e: crate::control::noise::NoiseError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e)
 }
 
 async fn read_all(stream: &mut h2::RecvStream) -> Result<Vec<u8>, ControlError> {
@@ -282,13 +223,8 @@ async fn read_all(stream: &mut h2::RecvStream) -> Result<Vec<u8>, ControlError> 
 }
 
 async fn server_key(base: &BaseUrl) -> Result<MachinePublic, ControlError> {
-    let (status, body) = net::get(base, &format!("/key?v={CAPABILITY_VERSION}")).await?;
-    if status != 200 {
-        return Err(protocol(format!("GET /key failed with HTTP {status}")));
-    }
-    let keys: ServerKeys =
-        serde_json::from_slice(&body).map_err(|e| protocol(format!("bad /key response: {e}")))?;
-    Ok(keys.public_key)
+    let (status, body) = net::get(base, &api::key_path()).await?;
+    Ok(api::parse_server_key(status, &body)?)
 }
 
 async fn read_more(io: &mut BoxIo, buf: &mut Vec<u8>) -> io::Result<()> {
@@ -299,18 +235,11 @@ async fn read_more(io: &mut BoxIo, buf: &mut Vec<u8>) -> io::Result<()> {
     Ok(())
 }
 
-/// The Noise record layer as a byte stream, for HTTP/2.
-///
-/// Before handing any bytes up it sniffs the server's optional early
-/// payload (`FF FF FF 'T' 'S' ‖ u32 BE len ‖ JSON`) and drops it.
+/// The Noise record layer ([`NoiseStream`]) as an async byte stream, for
+/// the h2 crate.
 struct NoiseIo {
     inner: BoxIo,
-    transport: Transport,
-    /// Ciphertext read but not yet decrypted.
-    raw: Vec<u8>,
-    /// Plaintext ready for the reader.
-    plain: Vec<u8>,
-    sniffed: bool,
+    noise: NoiseStream,
     /// Sealed bytes not yet written.
     pending: Vec<u8>,
     /// Where reads land (on the heap: small devices have small stacks).
@@ -318,60 +247,15 @@ struct NoiseIo {
 }
 
 impl NoiseIo {
-    fn new(inner: BoxIo, transport: Transport, leftover: Vec<u8>) -> Self {
-        Self {
+    fn new(inner: BoxIo, transport: Transport, leftover: Vec<u8>) -> io::Result<Self> {
+        let mut noise = NoiseStream::new(transport, leftover);
+        noise.decrypt().map_err(invalid)?;
+        Ok(Self {
             inner,
-            transport,
-            raw: leftover,
-            plain: Vec::new(),
-            sniffed: false,
+            noise,
             pending: Vec::new(),
             scratch: vec![0; 4096].into_boxed_slice(),
-        }
-    }
-
-    /// Decrypt whatever complete records are buffered.
-    fn decrypt(&mut self) -> io::Result<()> {
-        while let Some(record) = self
-            .transport
-            .open(&mut self.raw)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
-        {
-            self.plain.extend_from_slice(&record);
-        }
-        Ok(())
-    }
-
-    /// Drop the early payload once enough plaintext is here to tell.
-    /// Returns whether reading may proceed.
-    fn sniff(&mut self) -> io::Result<bool> {
-        if self.sniffed {
-            return Ok(true);
-        }
-        if self.plain.len() < 9 {
-            return Ok(false);
-        }
-        if &self.plain[..5] != EARLY_PAYLOAD_MAGIC {
-            self.sniffed = true;
-            return Ok(true);
-        }
-        let len = u32::from_be_bytes(self.plain[5..9].try_into().expect("4")) as usize;
-        if len > 10 << 20 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "oversized early payload",
-            ));
-        }
-        if self.plain.len() < 9 + len {
-            return Ok(false);
-        }
-        tracing::trace!(
-            "control early payload: {}",
-            String::from_utf8_lossy(&self.plain[9..9 + len])
-        );
-        self.plain.drain(..9 + len);
-        self.sniffed = true;
-        Ok(true)
+        })
     }
 
     fn poll_flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -394,11 +278,9 @@ impl AsyncRead for NoiseIo {
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
         loop {
-            this.decrypt()?;
-            if this.sniff()? && !this.plain.is_empty() {
-                let n = out.remaining().min(this.plain.len());
-                out.put_slice(&this.plain[..n]);
-                this.plain.drain(..n);
+            if this.noise.readable() {
+                let n = this.noise.read(out.initialize_unfilled());
+                out.advance(n);
                 return Poll::Ready(Ok(()));
             }
             let mut rb = ReadBuf::new(&mut this.scratch);
@@ -407,7 +289,9 @@ impl AsyncRead for NoiseIo {
             if n == 0 {
                 return Poll::Ready(Ok(())); // EOF
             }
-            this.raw.extend_from_slice(&this.scratch[..n]);
+            this.noise
+                .handle_input(&this.scratch[..n])
+                .map_err(invalid)?;
         }
     }
 }
@@ -422,7 +306,7 @@ impl AsyncWrite for NoiseIo {
         // Backpressure: finish the last write before taking more.
         ready!(this.poll_flush_pending(cx))?;
         let take = data.len().min(16 * 1024);
-        this.transport.seal(&data[..take], &mut this.pending);
+        this.noise.seal(&data[..take], &mut this.pending);
         // Start writing; whatever does not fit is flushed on the next call.
         let _ = this.poll_flush_pending(cx)?;
         Poll::Ready(Ok(take))
@@ -445,6 +329,7 @@ impl AsyncWrite for NoiseIo {
 mod tests {
     use super::*;
     use crate::control::noise::tests::server_respond;
+    use crate::control::noise::EARLY_PAYLOAD_MAGIC;
 
     /// A connected client/server pair of Noise transports over a duplex pipe.
     fn pair() -> (NoiseIo, Transport, tokio::io::DuplexStream) {
@@ -455,7 +340,11 @@ mod tests {
         let (server, resp, _) = server_respond(&control, &init);
         let client = client.finish(&resp).unwrap();
         let (a, b) = tokio::io::duplex(1 << 16);
-        (NoiseIo::new(Box::new(a), client, Vec::new()), server, b)
+        (
+            NoiseIo::new(Box::new(a), client, Vec::new()).unwrap(),
+            server,
+            b,
+        )
     }
 
     async fn server_send(

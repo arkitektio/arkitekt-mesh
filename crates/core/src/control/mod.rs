@@ -3,6 +3,9 @@
 
 #[allow(unused_imports)]
 use crate::prelude::*;
+pub mod api;
+pub mod conn;
+pub mod http1;
 pub mod netmap;
 pub mod noise;
 pub mod stream;
