@@ -11,7 +11,9 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use mesh_core::time::{self as clock, Instant};
 
 use rand_core::{OsRng, RngCore};
 use smoltcp::iface::SocketHandle;
@@ -342,7 +344,7 @@ impl Node {
             home_region
         );
 
-        let now = Instant::now();
+        let now = clock::now();
         let limits = config.limits;
         let mut tunnel = Tunnel::new(node_key.clone());
         tunnel.set_max_queued(limits.handshake_queue);
@@ -559,7 +561,7 @@ impl Node {
     pub fn direct_path(&self, ip: IpAddr) -> Option<SocketAddr> {
         let state = self.shared.lock();
         let key = state.netmap.peer_by_ip(ip)?.key;
-        state.paths.direct(&key, Instant::now())
+        state.paths.direct(&key, clock::now())
     }
 
     /// A peer's tailnet address: an IP literal, or a name in the netmap
@@ -936,9 +938,9 @@ async fn run_loop(
         .as_ref()
         .and_then(|u| u.local_addr().ok())
         .map(|a| a.port());
-    let mut next_stun = Instant::now();
+    let mut next_stun = clock::now();
     // Measure every region right away, then every `netcheck_interval`.
-    let mut next_netcheck = Some(Instant::now());
+    let mut next_netcheck = Some(clock::now());
     let mut reported: BTreeSet<SocketAddr> = BTreeSet::new();
     // Aborted with this loop.
     let mut derp_tasks = Tasks::default();
@@ -952,7 +954,7 @@ async fn run_loop(
     }
 
     loop {
-        let now = Instant::now();
+        let now = clock::now();
         let (deadline, backlog) = {
             let mut state = shared.lock();
             let mut deadline = next_stun;
@@ -979,7 +981,7 @@ async fn run_loop(
                 let (data, src): (&[u8], SocketAddr) = ($data, canonical($src));
                 if stun::is_stun(data) {
                     if let Some((tx, addr)) = stun::parse_response(data) {
-                        let now = Instant::now();
+                        let now = clock::now();
                         if state.netcheck.answered(&tx, now).is_some() {
                             let addr = canonical(addr);
                             if addr.is_ipv4() {
@@ -1003,12 +1005,12 @@ async fn run_loop(
                         transmits.extend(s.paths.on_disco(
                             data,
                             Via::Udp(src),
-                            Instant::now(),
+                            clock::now(),
                             &s.netmap,
                         ));
                     }
                 } else if wg::is_wireguard(data) {
-                    transmits.extend(state.on_wireguard(data, Instant::now()));
+                    transmits.extend(state.on_wireguard(data, clock::now()));
                 }
             }};
         }
@@ -1049,7 +1051,7 @@ async fn run_loop(
                 let (mut next, mut taken) = (Some(first), 0);
                 while let Some(Received { region, event }) = next.take() {
                     if let Event::Packet { from, data } = event {
-                        let now = Instant::now();
+                        let now = clock::now();
                         if disco::looks_like_disco(&data) {
                             let s = &mut *state;
                             let via = Via::Derp { region, peer: from };
@@ -1088,7 +1090,7 @@ async fn run_loop(
                     None => std::future::pending().await,
                 }
             } => {}
-            _ = tokio::time::sleep_until(deadline.into()) => {}
+            _ = tokio::time::sleep_until(clock::to_std(deadline).into()) => {}
         }
 
         if shared
@@ -1123,14 +1125,14 @@ async fn run_loop(
                 ensure_derp(&mut state, home, &node_key, &derp_tx, &mut derp_tasks);
             }
             drop(state);
-            next_stun = Instant::now();
-            next_netcheck = Some(Instant::now());
+            next_stun = clock::now();
+            next_netcheck = Some(clock::now());
             reported.clear();
             tracing::info!("rebound: UDP port {local_port}");
         }
 
         // Pump the stack and timers, then send with the lock released.
-        let now = Instant::now();
+        let now = clock::now();
         let mut udp_sends = Vec::new();
         {
             let mut state = shared.lock();
@@ -1232,7 +1234,7 @@ async fn run_loop(
             .any(|e| !reported.contains(&e))
         };
         if unreported {
-            next_stun = next_stun.min(Instant::now() + Duration::from_millis(50));
+            next_stun = next_stun.min(clock::now() + Duration::from_millis(50));
         }
     }
 }

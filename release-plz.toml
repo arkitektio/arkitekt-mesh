@@ -8,6 +8,10 @@ git_release_enable = false
 git_tag_enable = false
 
 [[package]]
+name = "arkitekt-mesh-core"
+version_group = "arkitekt-mesh"
+
+[[package]]
 name = "arkitekt-mesh"
 version_group = "arkitekt-mesh"
 

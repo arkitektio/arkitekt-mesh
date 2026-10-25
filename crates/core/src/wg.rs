@@ -11,10 +11,11 @@
 //! As in Tailscale, the preshared key is all zeros and a peer's WireGuard
 //! public key is its node key.
 
-use std::collections::{HashMap, VecDeque};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-use rand_core::{OsRng, RngCore};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use crate::time::{Duration, Instant};
+use alloc::collections::VecDeque;
+use hashbrown::HashMap;
 
 use crate::crypto::{self, hash, hkdf, mac16, NonceOrder, HASH_LEN, TAG_LEN};
 use crate::keys::{NodePublic, PrivateKey, PublicKey};
@@ -335,7 +336,7 @@ impl Tunnel {
 
     fn fresh_index(&mut self, peer: NodePublic) -> u32 {
         loop {
-            let index = OsRng.next_u32();
+            let index = crate::random::u32();
             if index != 0 && !self.indices.contains_key(&index) {
                 self.indices.insert(index, peer);
                 return index;
@@ -492,7 +493,7 @@ impl Tunnel {
         if let Some(old) = p.previous.replace(session) {
             self.indices.remove(&old.local_index);
         }
-        std::mem::swap(&mut p.previous, &mut p.current);
+        core::mem::swap(&mut p.previous, &mut p.current);
         p.first_unanswered = None;
 
         // Flush what waited for the handshake, or confirm with a keepalive.
@@ -854,9 +855,7 @@ fn check_mac1(mac1_key: &[u8; HASH_LEN], msg: &[u8]) -> Result<(), WgError> {
 
 /// The current time as TAI64N: 8 bytes of seconds + 2^62, 4 of nanoseconds.
 fn tai64n() -> [u8; 12] {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
+    let now = crate::time::unix_now();
     let mut out = [0u8; 12];
     out[..8].copy_from_slice(&(0x4000_0000_0000_000a_u64 + now.as_secs()).to_be_bytes());
     // Whitened to 2^24 ns granularity, as wireguard-go does, so the
@@ -904,7 +903,7 @@ mod tests {
     #[test]
     fn handshake_then_data_both_ways() {
         let (mut a, mut b, ka, kb) = pair();
-        let now = Instant::now();
+        let now = crate::time::now();
         let packet = ipv4(b"hello");
 
         // a has no session: the packet waits behind an initiation.
@@ -938,7 +937,7 @@ mod tests {
         let mut b = Tunnel::new(PrivateKey::generate());
         let (ka, kb) = (a.public(), b.public());
         a.add_peer(kb);
-        let now = Instant::now();
+        let now = crate::time::now();
         let init = a.encapsulate(kb, &ipv4(b"x"), now).unwrap();
         assert!(!b.has_peer(&ka));
         assert_eq!(b.decapsulate(&init.send[0].1, now), Err(WgError::Unknown));
@@ -952,7 +951,7 @@ mod tests {
     #[test]
     fn replays_and_tampering_are_rejected() {
         let (mut a, mut b, _ka, kb) = pair();
-        let now = Instant::now();
+        let now = crate::time::now();
         let out = a.encapsulate(kb, &ipv4(b"x"), now).unwrap();
         let resp = deliver(out, &mut b, now);
         let data = deliver(resp, &mut a, now);
@@ -972,7 +971,7 @@ mod tests {
     fn unknown_peers_are_refused() {
         let (mut a, _b, _ka, kb) = pair();
         let mut stranger = Tunnel::new(PrivateKey::generate());
-        let now = Instant::now();
+        let now = crate::time::now();
         let out = a.encapsulate(kb, &ipv4(b"x"), now).unwrap();
         // The initiation is for b, so its mac1 does not check out for a stranger.
         assert_eq!(
@@ -985,7 +984,7 @@ mod tests {
     #[test]
     fn unanswered_initiations_are_retried_then_dropped() {
         let (mut a, _b, _ka, kb) = pair();
-        let t0 = Instant::now();
+        let t0 = crate::time::now();
         a.encapsulate(kb, &ipv4(b"x"), t0).unwrap();
         // No session yet: soon at first, then every REKEY_TIMEOUT.
         let mut t = t0;
@@ -1007,7 +1006,7 @@ mod tests {
     #[test]
     fn passive_keepalive_after_receiving() {
         let (mut a, mut b, ka, kb) = pair();
-        let t0 = Instant::now();
+        let t0 = crate::time::now();
         let out = a.encapsulate(kb, &ipv4(b"x"), t0).unwrap();
         let resp = deliver(out, &mut b, t0);
         let data = deliver(resp, &mut a, t0);
@@ -1030,7 +1029,7 @@ mod tests {
         for k in &keys {
             t.add_peer(*k);
         }
-        let t0 = Instant::now();
+        let t0 = crate::time::now();
         // Used in the order 2, 0; 1 never.
         t.encapsulate(keys[2], &ipv4(b"a"), t0).unwrap();
         t.encapsulate(keys[0], &ipv4(b"b"), t0 + Duration::from_secs(1))

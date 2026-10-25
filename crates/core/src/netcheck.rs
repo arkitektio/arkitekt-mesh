@@ -8,9 +8,12 @@
 //!
 //! Sans-IO: requests to send and answers received go in, a home comes out.
 
-use std::collections::{BTreeMap, HashMap};
-use std::net::SocketAddr;
-use std::time::{Duration, Instant};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use crate::time::{Duration, Instant};
+use alloc::collections::BTreeMap;
+use core::net::SocketAddr;
+use hashbrown::HashMap;
 
 use crate::stun::TxId;
 
@@ -126,7 +129,7 @@ pub fn targets(
         .flat_map(|r| {
             r.nodes.iter().flat_map(move |n| {
                 n.stun_addrs().into_iter().filter_map(move |(host, port)| {
-                    let ip: std::net::IpAddr = host.parse().ok()?;
+                    let ip: core::net::IpAddr = host.parse().ok()?;
                     Some((r.region_id, SocketAddr::new(ip, port)))
                 })
             })
@@ -147,7 +150,7 @@ mod tests {
     #[test]
     fn the_fastest_region_is_chosen_first() {
         let mut nc = Netcheck::new();
-        let t = Instant::now();
+        let t = crate::time::now();
         sample(&mut nc, 1, 120, t);
         sample(&mut nc, 2, 20, t);
         // Unmeasured current home (the start-up guess): take the best.
@@ -165,7 +168,7 @@ mod tests {
     #[test]
     fn switching_needs_a_clear_gain_and_time() {
         let mut nc = Netcheck::new();
-        let t = Instant::now();
+        let t = crate::time::now();
         sample(&mut nc, 1, 50, t);
         sample(&mut nc, 2, 45, t);
         let t1 = t + Duration::from_secs(1);
@@ -196,7 +199,7 @@ mod tests {
     #[test]
     fn unmeasured_regions_are_never_chosen() {
         let mut nc = Netcheck::new();
-        let t = Instant::now();
+        let t = crate::time::now();
         assert_eq!(
             nc.choose(Some(1), &[1, 2], t),
             None,
@@ -217,7 +220,7 @@ mod tests {
     #[test]
     fn samples_age_out_and_only_the_best_counts() {
         let mut nc = Netcheck::new();
-        let t = Instant::now();
+        let t = crate::time::now();
         sample(&mut nc, 1, 80, t);
         sample(&mut nc, 1, 30, t);
         sample(&mut nc, 1, 60, t);

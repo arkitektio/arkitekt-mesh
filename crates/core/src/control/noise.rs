@@ -5,6 +5,8 @@
 
 use crate::crypto::{self, hash, hkdf, NonceOrder, HASH_LEN, TAG_LEN};
 use crate::keys::{MachinePublic, PrivateKey, PublicKey};
+#[allow(unused_imports)]
+use crate::prelude::*;
 
 const PROTOCOL_NAME: &[u8] = b"Noise_IK_25519_ChaChaPoly_BLAKE2s";
 const TYPE_INITIATION: u8 = 1;
@@ -185,15 +187,13 @@ impl Transport {
 /// The server's optional first message: `FF FF FF 'T' 'S' ‖ u32 BE len ‖ JSON`.
 pub const EARLY_PAYLOAD_MAGIC: &[u8; 5] = b"\xff\xff\xffTS";
 
-#[cfg(test)]
-pub(crate) mod tests {
+/// The server half of the handshake, for tests here and in the drivers.
+#[cfg(any(test, feature = "testing"))]
+pub mod tests {
     use super::*;
 
     /// The server half, only for tests: enough to check both sides agree.
-    pub(crate) fn server_respond(
-        control: &PrivateKey,
-        init: &[u8],
-    ) -> (Transport, Vec<u8>, PublicKey) {
+    pub fn server_respond(control: &PrivateKey, init: &[u8]) -> (Transport, Vec<u8>, PublicKey) {
         let version = u16::from_be_bytes([init[0], init[1]]);
         assert_eq!(init[2], TYPE_INITIATION);
         let mut h = hash(&[PROTOCOL_NAME]);

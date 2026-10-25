@@ -1,9 +1,11 @@
 //! The userspace TCP/IP stack (smoltcp) that runs over the tunnel: IP
 //! packets in and out, TCP sockets on top. Sans-IO like the rest of the core.
 
-use std::collections::VecDeque;
-use std::net::{IpAddr, SocketAddr};
-use std::time::Instant;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use crate::time::Instant;
+use alloc::collections::VecDeque;
+use core::net::{IpAddr, SocketAddr};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium};
@@ -56,7 +58,7 @@ impl Netstack {
     pub fn new(addresses: &[IpAddr], now: Instant) -> Self {
         let mut device = Queues::default();
         let mut config = Config::new(HardwareAddress::Ip);
-        config.random_seed = rand_core::RngCore::next_u64(&mut rand_core::OsRng);
+        config.random_seed = crate::random::u64();
         let epoch = now;
         let mut iface = Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
         let mut stack = Self {
@@ -67,7 +69,7 @@ impl Netstack {
             sockets: SocketSet::new(Vec::new()),
             device,
             epoch,
-            next_port: 49152 + (rand_core::RngCore::next_u32(&mut rand_core::OsRng) % 16000) as u16,
+            next_port: 49152 + (crate::random::u32() % 16000) as u16,
             tcp_buffer: TCP_BUFFER,
             listen_buffer: TCP_BUFFER,
             congestion: Congestion::None,
@@ -203,7 +205,7 @@ impl Netstack {
     /// When [`poll`](Self::poll) should run next, if nothing arrives before.
     pub fn poll_at(&mut self, now: Instant) -> Option<Instant> {
         let at = self.iface.poll_at(self.now(now), &self.sockets)?;
-        Some(self.epoch + std::time::Duration::from_micros(at.total_micros().max(0) as u64))
+        Some(self.epoch + core::time::Duration::from_micros(at.total_micros().max(0) as u64))
     }
 }
 
@@ -283,7 +285,7 @@ mod tests {
     fn two_stacks_talk_tcp() {
         let a_ip: IpAddr = "100.64.0.1".parse().unwrap();
         let b_ip: IpAddr = "100.64.0.2".parse().unwrap();
-        let t0 = Instant::now();
+        let t0 = crate::time::now();
         let mut a = Netstack::new(&[a_ip], t0);
         let mut b = Netstack::new(&[b_ip], t0);
 
@@ -298,7 +300,7 @@ mod tests {
         let mut sent = false;
         let mut got = Vec::new();
         for step in 0..200 {
-            let now = t0 + std::time::Duration::from_millis(step);
+            let now = t0 + core::time::Duration::from_millis(step);
             for p in a.poll(now, usize::MAX) {
                 assert_eq!(destination(&p), Some(b_ip));
                 b.input(p);
@@ -337,7 +339,7 @@ mod tests {
     fn two_stacks_talk_udp() {
         let a_ip: IpAddr = "100.64.0.1".parse().unwrap();
         let b_ip: IpAddr = "100.64.0.2".parse().unwrap();
-        let t0 = Instant::now();
+        let t0 = crate::time::now();
         let mut a = Netstack::new(&[a_ip], t0);
         let mut b = Netstack::new(&[b_ip], t0);
         let (client, client_port) = a.bind_udp(0).unwrap();
@@ -351,7 +353,7 @@ mod tests {
             .unwrap();
         let mut got = Vec::new();
         for step in 0..20 {
-            let now = t0 + std::time::Duration::from_millis(step);
+            let now = t0 + core::time::Duration::from_millis(step);
             for p in a.poll(now, usize::MAX) {
                 assert_eq!(destination(&p), Some(b_ip));
                 b.input(p);

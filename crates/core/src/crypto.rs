@@ -2,6 +2,8 @@
 //! built from: BLAKE2s hashing, its HMAC and HKDF, ChaCha20-Poly1305, and
 //! X25519.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use blake2::digest::{FixedOutput, KeyInit, Update};
 use blake2::{Blake2s256, Blake2sMac, Digest};
 use chacha20poly1305::aead::AeadInPlace;

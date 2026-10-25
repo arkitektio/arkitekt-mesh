@@ -1,7 +1,9 @@
 //! STUN binding requests, as Tailscale sends them (RFC 5389 with
 //! `SOFTWARE=tailnode` and a `FINGERPRINT`), and parsing the reply.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 const BINDING_REQUEST: [u8; 2] = [0x00, 0x01];

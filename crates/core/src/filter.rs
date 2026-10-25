@@ -13,9 +13,11 @@
 //!
 //! Sans-IO like the rest of the core: packets and time in, a verdict out.
 
-use std::collections::HashMap;
-use std::net::IpAddr;
-use std::time::{Duration, Instant};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use crate::time::{Duration, Instant};
+use core::net::IpAddr;
+use hashbrown::HashMap;
 
 use serde::Deserialize;
 
@@ -183,9 +185,9 @@ impl Filter {
 /// (the whole set) or `PacketFilters` (named sets; `"*": null` clears all).
 /// `None` means unchanged. Returns whether anything changed.
 pub fn apply_update(
-    sets: &mut std::collections::BTreeMap<String, Vec<FilterRule>>,
+    sets: &mut alloc::collections::BTreeMap<String, Vec<FilterRule>>,
     whole: Option<Vec<FilterRule>>,
-    named: Option<std::collections::BTreeMap<String, Option<Vec<FilterRule>>>>,
+    named: Option<alloc::collections::BTreeMap<String, Option<Vec<FilterRule>>>>,
 ) -> bool {
     let mut changed = false;
     if let Some(rules) = whole {
@@ -213,7 +215,7 @@ pub fn apply_update(
 }
 
 /// Compile every named set into one filter.
-pub fn compile(sets: &std::collections::BTreeMap<String, Vec<FilterRule>>) -> Filter {
+pub fn compile(sets: &alloc::collections::BTreeMap<String, Vec<FilterRule>>) -> Filter {
     let all: Vec<FilterRule> = sets.values().flatten().cloned().collect();
     Filter::new(&all)
 }
@@ -443,7 +445,7 @@ mod tests {
         // lok's shape: the app may reach the hub, the hub never initiates.
         let mut fw = Firewall::new(16);
         fw.set_filter(rules(r#"[{"SrcIPs": ["100.64.0.2"], "DstPorts": [{"IP": "100.64.0.1", "Ports": {"First": 80, "Last": 80}}]}]"#));
-        let now = Instant::now();
+        let now = crate::time::now();
         assert!(fw.inbound(&tcp(APP, ME, 40000, 80, SYN), now));
         assert!(
             !fw.inbound(&tcp(APP, ME, 40000, 81, SYN), now),
@@ -462,7 +464,7 @@ mod tests {
     #[test]
     fn udp_needs_a_rule_or_a_flow_we_started() {
         let mut fw = Firewall::new(16);
-        let now = Instant::now();
+        let now = crate::time::now();
         // No filter yet: nothing new comes in.
         assert!(!fw.inbound(&udp(HUB, ME, 7882, 5000), now));
         // We send to the hub from :5000; its replies are let in.
@@ -487,7 +489,7 @@ mod tests {
     #[test]
     fn the_flow_table_is_bounded() {
         let mut fw = Firewall::new(2);
-        let now = Instant::now();
+        let now = crate::time::now();
         for port in 1..=3 {
             fw.outbound(
                 &udp(ME, HUB, port, 7882),
@@ -503,7 +505,7 @@ mod tests {
     #[test]
     fn icmp_echo_needs_a_rule_but_replies_pass() {
         let mut fw = Firewall::new(4);
-        let now = Instant::now();
+        let now = crate::time::now();
         assert!(
             !fw.inbound(&ipv4(ICMP4, HUB, ME, &[8, 0, 0, 0]), now),
             "echo request"
@@ -523,7 +525,7 @@ mod tests {
 
     #[test]
     fn named_sets_update_and_clear() {
-        use std::collections::BTreeMap;
+        use alloc::collections::BTreeMap;
         let rule = |ip: &str| FilterRule {
             src_ips: vec![ip.into()],
             dst_ports: vec![NetPortRange {
@@ -558,7 +560,7 @@ mod tests {
     #[test]
     fn garbage_is_dropped() {
         let mut fw = Firewall::new(4);
-        assert!(!fw.inbound(&[0x45, 0], Instant::now()));
-        assert!(!fw.inbound(&[], Instant::now()));
+        assert!(!fw.inbound(&[0x45, 0], crate::time::now()));
+        assert!(!fw.inbound(&[], crate::time::now()));
     }
 }

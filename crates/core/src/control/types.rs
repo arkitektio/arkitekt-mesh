@@ -4,8 +4,10 @@
 //! Key-typed fields are never sent as `""` (the zero key is sent instead),
 //! because Go servers reject malformed keys outright.
 
-use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use alloc::collections::BTreeMap;
+use core::net::{IpAddr, SocketAddr};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,7 +36,7 @@ pub struct RegisterRequest {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub followup: String,
     pub hostinfo: Hostinfo,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "core::ops::Not::not")]
     pub ephemeral: bool,
 }
 
@@ -124,9 +126,9 @@ pub struct MapRequest {
     pub node_key: NodePublic,
     pub disco_key: DiscoPublic,
     pub stream: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "core::ops::Not::not")]
     pub keep_alive: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "core::ops::Not::not")]
     pub omit_peers: bool,
     pub hostinfo: Hostinfo,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -361,10 +363,10 @@ impl DerpNode {
     /// its hostname (resolved). A non-IP value such as `"none"` disables
     /// that family.
     pub fn derp_dial_host(&self) -> String {
-        if let Ok(ip) = self.ipv4.parse::<std::net::Ipv4Addr>() {
+        if let Ok(ip) = self.ipv4.parse::<core::net::Ipv4Addr>() {
             return ip.to_string();
         }
-        if let Ok(ip) = self.ipv6.parse::<std::net::Ipv6Addr>() {
+        if let Ok(ip) = self.ipv6.parse::<core::net::Ipv6Addr>() {
             return ip.to_string();
         }
         self.host_name.clone()
@@ -400,7 +402,7 @@ impl DerpNode {
             return Vec::new();
         };
         let mut out = vec![(host.clone(), port)];
-        if self.ipv6.parse::<std::net::Ipv6Addr>().is_ok() && self.ipv6 != host {
+        if self.ipv6.parse::<core::net::Ipv6Addr>().is_ok() && self.ipv6 != host {
             out.push((self.ipv6.clone(), port));
         }
         out

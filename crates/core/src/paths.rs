@@ -13,12 +13,12 @@
 //! looked up in the [`Directory`] (the netmap) when needed, so a large
 //! tailnet costs nothing here until its peers are talked to.
 
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-use rand_core::{OsRng, RngCore};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use crate::time::{Duration, Instant};
+use alloc::sync::Arc;
+use core::net::SocketAddr;
+use hashbrown::HashMap;
 
 use crate::disco::{self, Message, TxId};
 use crate::keys::{DiscoPublic, NodePublic, PrivateKey};
@@ -405,7 +405,7 @@ impl Paths {
             return;
         };
         let mut tx = [0u8; 12];
-        OsRng.fill_bytes(&mut tx);
+        crate::random::fill(&mut tx);
         p.in_flight.insert(tx, (addr, now));
         p.candidates.insert(addr, Some(now));
         let ping = Message::Ping {
@@ -537,7 +537,7 @@ mod tests {
         let mut b = side("10.0.0.2:2000");
         introduce(&mut a, &b, 1);
         introduce(&mut b, &a, 1);
-        let t0 = Instant::now();
+        let t0 = crate::time::now();
 
         // No path yet: the data goes via DERP, with a ping and a CallMeMaybe.
         let out = a.paths.route(&b.node, b"wg".to_vec(), t0, &a.dir);
@@ -603,7 +603,7 @@ mod tests {
                 region: 3,
                 peer: a.node,
             },
-            Instant::now(),
+            crate::time::now(),
             &b.dir,
         );
         assert_eq!(out.len(), 1);
@@ -632,7 +632,7 @@ mod tests {
         a.paths.set_udp(false);
         let out = a
             .paths
-            .route(&b.node, b"wg".to_vec(), Instant::now(), &a.dir);
+            .route(&b.node, b"wg".to_vec(), crate::time::now(), &a.dir);
         assert_eq!(out.len(), 1);
         assert!(matches!(out[0].via, Via::Derp { .. }));
     }
@@ -643,7 +643,7 @@ mod tests {
         let mut b = side("10.0.0.2:2000");
         introduce(&mut a, &b, 1);
         introduce(&mut b, &a, 1);
-        let t0 = Instant::now();
+        let t0 = crate::time::now();
         let out = a.paths.route(&b.node, b"wg".to_vec(), t0, &a.dir);
         let replies = deliver(out, &a, &mut b, t0);
         deliver(replies, &b, &mut a, t0);
@@ -674,7 +674,7 @@ mod tests {
         let mut b = side("10.0.0.2:2000");
         introduce(&mut a, &b, 1);
         introduce(&mut b, &a, 1);
-        let t0 = Instant::now();
+        let t0 = crate::time::now();
         let b_disco = b.disco;
         let ping = |tx: u8| {
             disco::seal(
@@ -716,7 +716,7 @@ mod tests {
         );
         assert!(a
             .paths
-            .on_disco(&ping, Via::Udp(stranger.addr), Instant::now(), &a.dir)
+            .on_disco(&ping, Via::Udp(stranger.addr), crate::time::now(), &a.dir)
             .is_empty());
     }
 }

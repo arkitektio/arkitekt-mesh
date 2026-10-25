@@ -5,9 +5,10 @@
 //! control connection), the node key (the WireGuard identity; peers address
 //! it by this) and the disco key (path discovery, rotated every start).
 
-use std::fmt;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::fmt;
 
-use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
@@ -22,7 +23,7 @@ pub struct PrivateKey([u8; 32]);
 impl PrivateKey {
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        OsRng.fill_bytes(&mut bytes);
+        crate::random::fill(&mut bytes);
         Self::from_bytes(bytes)
     }
 

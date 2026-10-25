@@ -17,12 +17,12 @@ name = "mesh"
 
 [dependencies]
 # The sans-IO core: keys, codecs and protocol state machines.
+mesh-core.workspace = true
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 blake2 = "0.10"
 # Tailnet lock (tka.rs): trusted keys and node-key signatures.
 ed25519-dalek = { version = "2", default-features = false, features = ["std", "fast"] }
-argon2 = { version = "0.5", default-features = false, features = ["alloc"], optional = true }
 crypto_box = { version = "0.9", features = ["salsa20"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 zeroize = "1"
@@ -73,9 +73,9 @@ default = ["tokio", "ring", "udp", "tka-disable", "portmap"]
 portmap = ["tokio"]
 # Verify a tailnet-lock disablement secret (Argon2i, 16 MiB): without it a
 # node stays locked, fail-closed, when a tailnet's lock is disabled.
-tka-disable = ["dep:argon2"]
+tka-disable = ["mesh-core/tka-disable"]
 # UDP sockets over the tunnel (`Node::bind_udp`).
-udp = ["smoltcp/socket-udp"]
+udp = ["mesh-core/udp", "smoltcp/socket-udp"]
 # A node with its state directory (identity, remembered control url, one
 # node per directory) and the local HTTP proxy into the mesh
 # (`driver::Session`): what meshd, fakts and the Python bindings run.
@@ -100,6 +100,7 @@ tokio = [
 ]
 
 [dev-dependencies]
+mesh-core = { workspace = true, features = ["testing"] }
 # The ESP32 firmware's TLS provider, for tests/lab_firmware_tls.rs.
 rustls-rustcrypto = "0.0.2-alpha"
 axum.workspace = true

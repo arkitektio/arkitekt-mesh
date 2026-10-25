@@ -5,9 +5,11 @@
 //! discovery need, parsed out of each node as it arrives, nothing else. A
 //! large tailnet costs a few hundred bytes per peer.
 
-use std::collections::BTreeMap;
-use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use core::net::{IpAddr, SocketAddr};
 
 use serde::Deserialize;
 
@@ -225,7 +227,7 @@ impl NetMap {
     /// Keep only the peers `trusted` accepts; the rest become invisible
     /// until a later call accepts them. Returns how many are hidden.
     pub fn retain_trusted(&mut self, mut trusted: impl FnMut(&Peer) -> bool) -> usize {
-        let mut all = std::mem::take(&mut self.peers);
+        let mut all = core::mem::take(&mut self.peers);
         all.append(&mut self.untrusted);
         all.sort_unstable_by_key(|p| p.id);
         let (keep, hide): (Vec<Peer>, Vec<Peer>) = all.into_iter().partition(|p| trusted(p));

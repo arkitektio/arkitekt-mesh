@@ -8,6 +8,8 @@
 
 use super::netmap::Peer;
 use super::types::MapResponse;
+#[allow(unused_imports)]
+use crate::prelude::*;
 
 /// Top-level members kept (besides the streamed peer lists).
 const KEEP: &[&str] = &[
@@ -171,7 +173,7 @@ impl MapReader {
                 if b.is_ascii_whitespace() {
                     return Ok(());
                 }
-                let key = std::str::from_utf8(&self.key).unwrap_or_default();
+                let key = core::str::from_utf8(&self.key).unwrap_or_default();
                 if b == b'[' && STREAMED.contains(&key) {
                     self.changed = key == "PeersChanged";
                     self.state = State::Array;

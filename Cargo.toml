@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/core",
     "crates/mesh",
     "crates/meshd",
     "crates/mesh-py",
@@ -15,6 +16,7 @@ homepage = "https://github.com/arkitektio/arkitekt-mesh"
 
 [workspace.dependencies]
 mesh = { path = "crates/mesh", version = "0.7.0", package = "arkitekt-mesh" }
+mesh-core = { path = "crates/core", version = "0.7.0", package = "arkitekt-mesh-core" }
 
 async-trait = "0.1"
 base64 = "0.22"

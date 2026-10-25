@@ -4,7 +4,9 @@
 //! On the wire: `"TS💬" ‖ sender disco key(32) ‖ nacl box(type ‖ 0 ‖ payload)`.
 //! Addresses are 16-byte IPs (IPv4 v4-mapped) plus a big-endian port.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 use crate::keys::{DiscoPublic, NodePublic, PrivateKey, PublicKey};
 use crate::nacl::SharedBox;

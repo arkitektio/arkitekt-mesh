@@ -16,7 +16,9 @@
 //! Not implemented: resolving forks (Go's weighted pick between competing
 //! children), compaction, disablement (argon2 with 16 MiB), and signing.
 
-use std::fmt;
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::fmt;
 
 use blake2::{Blake2s256, Digest};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -108,7 +110,7 @@ impl<'a> Reader<'a> {
             }
             3 => {
                 let n = self.argument(info)? as usize;
-                let s = std::str::from_utf8(self.take(n)?).map_err(|_| TkaError::Cbor("text"))?;
+                let s = core::str::from_utf8(self.take(n)?).map_err(|_| TkaError::Cbor("text"))?;
                 Ok(Value::Text(s))
             }
             4 => {

@@ -1,0 +1,63 @@
+[package]
+name = "arkitekt-mesh-core"
+description = "The sans-IO core of arkitekt-mesh: Tailscale's control protocol, DERP, disco, WireGuard and a netstack, as codecs and state machines without I/O"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["tailscale", "wireguard", "mesh", "derp", "no-std"]
+categories = ["network-programming", "no-std"]
+readme = "README.md"
+
+[lib]
+name = "mesh_core"
+
+# no_std + alloc unless `std` (default): every dependency without its own
+# defaults, `std` turns them on.
+[dependencies]
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize", "precomputed-tables"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+blake2 = { version = "0.10", default-features = false }
+# Tailnet lock (tka.rs): trusted keys and node-key signatures.
+ed25519-dalek = { version = "2", default-features = false, features = ["fast"] }
+argon2 = { version = "0.5", default-features = false, features = ["alloc"], optional = true }
+crypto_box = { version = "0.9", default-features = false, features = ["salsa20", "alloc"] }
+rand_core = { version = "0.6", default-features = false }
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+thiserror = { version = "2", default-features = false }
+tracing = { version = "0.1", default-features = false }
+hashbrown = "0.15"
+spin = { version = "0.10", default-features = false, features = ["once"] }
+smoltcp = { version = "0.13", default-features = false, features = [
+    "alloc",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "socket-tcp-reno",
+    "socket-tcp-cubic",
+    "async",
+] }
+
+[features]
+default = ["std"]
+# The OS's randomness and clock, std's types where the API meets std.
+std = [
+    "rand_core/getrandom", "chacha20poly1305/std", "ed25519-dalek/std", "zeroize/std", "hex/std",
+    "base64/std", "serde/std", "serde_json/std", "thiserror/std", "tracing/std", "smoltcp/std",
+]
+# Verify a tailnet-lock disablement secret (Argon2i, 16 MiB): without it a
+# node stays locked, fail-closed, when a tailnet's lock is disabled.
+tka-disable = ["dep:argon2"]
+# UDP sockets over the tunnel.
+udp = ["smoltcp/socket-udp"]
+# Test helpers for the drivers' tests (the server half of the control Noise).
+testing = []
+
+[dev-dependencies]
+hmac = "0.12"

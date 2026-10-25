@@ -10,6 +10,7 @@ major_on_zero = false
 version_toml = [
     "Cargo.toml:workspace.package.version",
     "Cargo.toml:workspace.dependencies.mesh.version",
+    "Cargo.toml:workspace.dependencies.mesh-core.version",
 ]
 # Cargo.lock carries the workspace's own versions too.
 build_command = "cargo update --workspace"

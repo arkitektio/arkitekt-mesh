@@ -61,9 +61,11 @@ time and spawns its connections.
   (`u64`), with `Duration` arithmetic; drivers convert from
   `std::time::Instant`, `embassy_time::Instant` or the JS clock. The
   netstack converts to `smoltcp::time::Instant` at its edge.
-- **Randomness:** `&mut dyn CryptoRngCore` passed in where keys, nonces,
-  STUN transactions and jitter are made. `generate()`-style
-  constructors keep a std wrapper over `OsRng`.
+- **Randomness and the wall clock:** platform hooks, as arkirust's runtime
+  interface: `random::set_source` and `time::set_wall_clock` (WireGuard's
+  TAI64N handshake timestamps), installed once by a driver without std;
+  with std, `OsRng` and `SystemTime`. Monotonic time stays an argument, so
+  tests stay deterministic.
 - **Maps:** `BTreeMap` (small, ordered, deterministic in tests), or
   hashbrown where a large tailnet makes it matter (`paths`, `wg`).
 - **smoltcp:** 0.13.1, which embassy-net 0.9 uses too: one copy on a board.
@@ -196,7 +198,9 @@ Each phase ends green and could be released. Gates every time:
 `mesh`, `mesh-native` and `mesh-relay`, the ESP-IDF firmware with
 `--features mesh`, `esp32-mesh-demo`.
 
-1. **The core crate, without std.** `arkitekt-mesh-core` takes the codecs
+1. **The core crate, without std** (done: builds for `thumbv7em-none-eabihf`,
+   `wasm32-unknown-unknown` and `xtensa-esp32s3-none-elf`; every test
+   unchanged). `arkitekt-mesh-core` takes the codecs
    and state machines; `mesh::time::Instant`, injected randomness, the
    maps; it builds for `thumbv7em-none-eabihf` and `xtensa-esp32s3-none-elf`
    in CI. `arkitekt-mesh` re-exports it at the old paths. No behaviour

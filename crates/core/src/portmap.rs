@@ -6,7 +6,9 @@
 //!
 //! Sans-IO: requests to send, responses parsed. UPnP IGD is not done.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[allow(unused_imports)]
+use crate::prelude::*;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// The port both protocols listen on.
 pub const PORT: u16 = 5351;

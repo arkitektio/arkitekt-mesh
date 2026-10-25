@@ -49,6 +49,18 @@ jobs:
       - run: cargo check -p arkitekt-mesh --no-default-features
       - run: cargo check -p arkitekt-mesh --no-default-features --features tokio
 
+  # The core without std, for a microcontroller (embassy) and the browser.
+  no-std:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf, wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p arkitekt-mesh-core --no-default-features --features tka-disable,udp --target thumbv7em-none-eabihf -- -D warnings
+      - run: cargo clippy -p arkitekt-mesh-core --no-default-features --features tka-disable,udp --target wasm32-unknown-unknown -- -D warnings
+
   # Squash-merged PR titles become the commits semantic-release reads, so enforce Conventional Commits.
   pr-title:
     if: github.event_name == 'pull_request'
@@ -66,7 +78,7 @@ jobs:
   # `vX.Y.Z` and creates the GitHub release; then the crates go to crates.io,
   # the Python bindings to PyPI and the meshd binaries onto the release.
   release:
-    needs: [test, native, embedded]
+    needs: [test, native, embedded, no-std]
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'arkitektio'
     runs-on: ubuntu-latest
     concurrency:

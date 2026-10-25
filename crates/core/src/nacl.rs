@@ -1,9 +1,10 @@
 //! NaCl `crypto_box` (X25519 + XSalsa20-Poly1305), as DERP and disco seal
 //! their messages: `nonce(24) ‖ tag(16) ‖ ciphertext`.
 
+#[allow(unused_imports)]
+use crate::prelude::*;
 use crypto_box::aead::AeadInPlace;
 use crypto_box::{Nonce, SalsaBox, Tag};
-use rand_core::{OsRng, RngCore};
 
 use crate::crypto::CryptoError;
 use crate::keys::{PrivateKey, PublicKey};
@@ -24,7 +25,7 @@ impl SharedBox {
     /// Seal with a fresh random nonce.
     pub fn seal(&self, plaintext: &[u8]) -> Vec<u8> {
         let mut nonce = [0u8; NONCE_LEN];
-        OsRng.fill_bytes(&mut nonce);
+        crate::random::fill(&mut nonce);
         self.seal_with_nonce(&nonce, plaintext)
     }
 
