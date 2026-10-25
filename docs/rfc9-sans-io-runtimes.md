@@ -234,6 +234,13 @@ Each phase ends green and could be released. Gates every time:
    with the embassy driver (phase 5), its first second user.
 4. **DerpConn.** The DERP connection machine (and over WebSocket); tokio's
    DERP task only moves bytes.
+   Done: `mesh_core::derp::conn::DerpConn` (the upgrade or a driver's
+   WebSocket, the handshake, pongs, the quiet limit, restarting) and
+   `Backoff`; tokio's task keeps the sockets, dialing a region's nodes and
+   the pacing. Reads are a TLS record (16 KiB): 4 KiB reads cost about a
+   fifth of 8-stream DERP download. ionskale's `/derp` served only the HTTP
+   upgrade; it now takes the WebSocket form too (derper's wrapper), and
+   `tests/lab_derp_conn.rs` relays between a client of each kind.
 5. **The embassy driver.** A conformance run on the host against
    `testcontrol` and ionskale:
    an embassy executor on std with async-io UDP and TCP (as arkirust's

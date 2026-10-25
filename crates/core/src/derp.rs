@@ -10,6 +10,8 @@ use crate::nacl::SharedBox;
 #[allow(unused_imports)]
 use crate::prelude::*;
 
+pub mod conn;
+
 pub const MAGIC: &[u8; 8] = b"DERP\xf0\x9f\x94\x91";
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const HEADER_LEN: usize = 5;

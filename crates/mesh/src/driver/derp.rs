@@ -9,8 +9,10 @@ use tokio::sync::mpsc;
 
 use super::net::{self, Tls};
 use crate::control::types::DerpRegion;
-use crate::derp::{self, DerpError, Event};
+use crate::derp::conn::{Backoff, ConnError, DerpConn};
+use crate::derp::Event;
 use crate::keys::PrivateKey;
+use mesh_core::time as clock;
 
 /// What a DERP connection reports to the node.
 #[derive(Debug)]
@@ -36,7 +38,7 @@ const PACE: Duration = Duration::from_millis(1);
 const PACED_FRAME: usize = 256;
 
 /// Run a connection to `region` until `outgoing` closes. `outgoing` carries
-/// ready-made frames (e.g. [`derp::send_packet`]).
+/// ready-made frames (e.g. [`crate::derp::send_packet`]).
 pub async fn run(
     region: DerpRegion,
     node_key: PrivateKey,
@@ -45,10 +47,13 @@ pub async fn run(
     mut outgoing: mpsc::Receiver<Vec<u8>>,
     sending: Sending,
 ) {
-    let mut backoff = Duration::from_millis(100);
+    let mut backoff = Backoff::default();
     loop {
         let ended = session(&region, &node_key, home, &events, &mut outgoing, &sending).await;
-        sending.up.store(false, Ordering::Relaxed);
+        // A connection that came up starts the delays over.
+        if sending.up.swap(false, Ordering::Relaxed) {
+            backoff.reset();
+        }
         match ended {
             Ok(()) => return, // the node dropped us
             Err(e) => {
@@ -63,8 +68,7 @@ pub async fn run(
         if events.is_closed() || outgoing.is_closed() {
             return;
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_secs(5));
+        tokio::time::sleep(backoff.next_delay()).await;
     }
 }
 
@@ -73,7 +77,7 @@ enum SessionError {
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error("{0}")]
-    Derp(#[from] DerpError),
+    Conn(#[from] ConnError),
     #[error("{0}")]
     Other(String),
 }
@@ -94,26 +98,35 @@ async fn session(
             Some(name) if !node.insecure_for_tests => (Tls::Verify, name),
             _ => (Tls::NoVerify, node.host_name.clone()),
         };
+        let authority = if node.derp_port() == 443 {
+            node.host_name.clone()
+        } else {
+            format!("{}:{}", node.host_name, node.derp_port())
+        };
+        let mut conn = DerpConn::new(&authority, node_key.clone(), home, clock::now());
+        // Connect, upgrade and shake hands.
         let connect = tokio::time::timeout(Duration::from_secs(10), async {
             let mut io = net::connect_named(&host, node.derp_port(), tls, &name).await?;
-            let authority = if node.derp_port() == 443 {
-                node.host_name.clone()
-            } else {
-                format!("{}:{}", node.host_name, node.derp_port())
-            };
-            io.write_all(derp::upgrade_request(&authority).as_bytes())
-                .await?;
-            let head = net::read_head(&mut io).await?;
-            if head.status != 101 {
-                return Err(SessionError::Other(format!(
-                    "upgrade to DERP failed with HTTP {}",
-                    head.status
-                )));
+            let mut buf = vec![0u8; 4096];
+            while !conn.is_up() {
+                if let Some(out) = conn.poll_transmit() {
+                    io.write_all(&out).await?;
+                }
+                let n = io.read(&mut buf).await?;
+                if n == 0 {
+                    return Err(SessionError::Other(
+                        "the DERP server closed the connection".into(),
+                    ));
+                }
+                conn.handle_input(clock::now(), &buf[..n])?;
             }
-            Ok::<_, SessionError>((io, head.rest))
+            if let Some(out) = conn.poll_transmit() {
+                io.write_all(&out).await?;
+            }
+            Ok::<_, SessionError>(io)
         });
-        let (mut io, mut buf) = match connect.await {
-            Ok(Ok(conn)) => conn,
+        let io = match connect.await {
+            Ok(Ok(io)) => io,
             Ok(Err(e)) => {
                 last_err = e;
                 continue;
@@ -123,49 +136,44 @@ async fn session(
                 continue;
             }
         };
-
-        // Handshake: server key, our info, the server's info.
-        let (kind, payload) = read_frame(&mut io, &mut buf).await?;
-        let server = derp::parse_server_key(kind, &payload)?;
-        io.write_all(&derp::client_info(node_key, &server)).await?;
-        let (kind, payload) = read_frame(&mut io, &mut buf).await?;
-        derp::check_server_info(node_key, &server, kind, &payload)?;
-        if home {
-            io.write_all(&derp::note_preferred(true)).await?;
-        }
         tracing::debug!("connected to DERP region {} via {host}", region.region_id);
         sending.up.store(true, Ordering::Relaxed);
 
         let (mut rd, mut wr) = tokio::io::split(io);
         let (pong_tx, mut pong_rx) = mpsc::channel::<Vec<u8>>(8);
         let reader = async {
+            // On the heap (small devices have small task stacks), a TLS
+            // record at a time: smaller reads cost relayed throughput.
+            let mut buf = vec![0u8; 16 << 10];
             loop {
-                // The server sends a keepalive every minute.
-                let (kind, payload) =
-                    tokio::time::timeout(super::node::QUIET_LIMIT, read_frame(&mut rd, &mut buf))
-                        .await
-                        .map_err(|_| {
-                            SessionError::Other("the DERP connection went quiet".into())
-                        })??;
-                match derp::parse_event(kind, payload)? {
-                    Event::Ping(data) => {
-                        let _ = pong_tx.try_send(derp::pong(&data));
+                let quiet = clock::to_std(conn.poll_timeout());
+                let n = match tokio::time::timeout_at(quiet.into(), rd.read(&mut buf)).await {
+                    Ok(n) => n?,
+                    Err(_) => {
+                        conn.handle_timeout(clock::now())?;
+                        continue;
                     }
-                    Event::Restarting => {
-                        return Err(SessionError::Other("server restarting".into()))
+                };
+                if n == 0 {
+                    return Err(SessionError::Other(
+                        "the DERP server closed the connection".into(),
+                    ));
+                }
+                conn.handle_input(clock::now(), &buf[..n])?;
+                // Pongs: written beside the packets.
+                if let Some(out) = conn.poll_transmit() {
+                    let _ = pong_tx.try_send(out);
+                }
+                while let Some(event) = conn.poll_event() {
+                    if matches!(event, Event::Other) {
+                        continue;
                     }
-                    Event::Other => {}
-                    event => {
-                        if events
-                            .send(Received {
-                                region: region.region_id,
-                                event,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            return Ok(());
-                        }
+                    let received = Received {
+                        region: region.region_id,
+                        event,
+                    };
+                    if events.send(received).await.is_err() {
+                        return Ok(());
                     }
                 }
             }
@@ -206,24 +214,4 @@ async fn session(
         };
     }
     Err(last_err)
-}
-
-async fn read_frame(
-    io: &mut (impl tokio::io::AsyncRead + Unpin),
-    buf: &mut Vec<u8>,
-) -> Result<(u8, Vec<u8>), SessionError> {
-    loop {
-        if let Some(frame) = derp::take_frame(buf)? {
-            return Ok(frame);
-        }
-        // Read straight into the frame buffer (no stack buffer: small
-        // devices have small task stacks).
-        buf.reserve(4096);
-        let n = io.read_buf(buf).await?;
-        if n == 0 {
-            return Err(SessionError::Other(
-                "the DERP server closed the connection".into(),
-            ));
-        }
-    }
 }
