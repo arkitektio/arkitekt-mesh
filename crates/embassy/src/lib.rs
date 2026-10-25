@@ -331,17 +331,20 @@ impl Mesh {
         core.paths().direct(&key, now())
     }
 
-    /// A peer's address by its name (`host` or `host.tailnet…`), or an IP.
+    /// A peer's address by its name (`host` or `host.<tailnet domain>`), or
+    /// an IP.
     pub fn resolve(&self, name: &str) -> Option<core::net::IpAddr> {
         if let Ok(ip) = name.parse() {
             return Some(ip);
         }
         let inner = self.inner.borrow();
-        let netmap = inner.core.as_ref()?.netmap();
-        let short = name.split('.').next().unwrap_or(name);
-        netmap
-            .peer_by_name(name)
-            .or_else(|| netmap.peer_by_name(short))
-            .and_then(|p| p.addresses.first().copied())
+        // A bare hostname, or one in the tailnet's domain: never another
+        // domain's name that happens to start with a peer's.
+        inner
+            .core
+            .as_ref()?
+            .netmap()
+            .peer_by_name(name.trim_start_matches('[').trim_end_matches(']'))?
+            .primary_address()
     }
 }
