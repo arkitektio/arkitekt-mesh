@@ -255,8 +255,11 @@ Each phase ends green and could be released. Gates every time:
    `embassy`, in the release's `needs`) joins `testcontrol` and reaches its
    peer (HTTP, a 64 KiB echo), directly and DERP-only; against the lab's
    ionskale by hand (`cargo run -- lab`). Builds for
-   `xtensa-esp32s3-none-elf`. Not yet: a `LockStore` (the chain is
-   re-bootstrapped each start), DERP send pacing, IPv6, incoming TCP.
+   `xtensa-esp32s3-none-elf`. The check asserts a direct path comes up
+   (unless DERP-only) and runs the harness's two regions (both slots,
+   rehoming). Not yet: DERP send pacing, IPv6, incoming TCP, `rebind`
+   after a Wi-Fi rejoin, and the board's TLS (embedded-tls) under the
+   driver's cancelled reads, untested (the host check's TLS is poll-based).
 6. **The web driver.** DERP-only, control and DERP over WebSocket; run
    under node against ionskale, like arkirust's wasm e2e.
 7. **arkirust and the board.** The joiner contract and the routing

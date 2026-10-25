@@ -157,7 +157,20 @@ async fn echo(mesh: &Mesh, ip: &str, size: usize) {
     assert!(back == data, "the echo came back different");
 }
 
-async fn scenario(mesh: &Mesh, target: &Target) {
+/// A direct UDP path to the peer comes up (unless DERP only).
+async fn direct(mesh: &Mesh, peer_ip: &str) {
+    let ip = peer_ip.parse().unwrap();
+    for _ in 0..100 {
+        if let Some(path) = mesh.direct_path(ip) {
+            println!("direct path to {peer_ip}: {path}");
+            return;
+        }
+        embassy_time::Timer::after_millis(100).await;
+    }
+    panic!("no direct path to {peer_ip} within 10 s");
+}
+
+async fn scenario(mesh: &Mesh, target: &Target, derp_only: bool) {
     mesh.joined().await;
     println!("joined as {:?}", mesh.addresses());
     let response = http_get(mesh, &target.peer).await;
@@ -170,6 +183,15 @@ async fn scenario(mesh: &Mesh, target: &Target) {
     if target.echo {
         echo(mesh, &target.peer_ip, 64 << 10).await;
         println!("64 KiB through the peer's echo");
+    }
+    if derp_only {
+        assert_eq!(
+            mesh.direct_path(target.peer_ip.parse().unwrap()),
+            None,
+            "DERP only"
+        );
+    } else {
+        direct(mesh, &target.peer_ip).await;
     }
 }
 
@@ -209,7 +231,7 @@ async fn main(_spawner: Spawner) {
     let dial = host::HostDial::new();
 
     let run = async {
-        match select(mesh.run(&udp, &dial), scenario(&mesh, &target)).await {
+        match select(mesh.run(&udp, &dial), scenario(&mesh, &target, derp_only)).await {
             Either::First(result) => panic!("the node ended: {result:?}"),
             Either::Second(()) => {}
         }

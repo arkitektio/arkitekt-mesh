@@ -85,6 +85,11 @@ jobs:
         working-directory: checks/embassy
       - run: cargo run -- harness --derp-only
         working-directory: checks/embassy
+      # Two DERP regions: the node's second slot, and rehoming.
+      - run: cargo run -- harness --derp-only
+        working-directory: checks/embassy
+        env:
+          MESH_HARNESS_TWO_REGIONS: "1"
 
   # Squash-merged PR titles become the commits semantic-release reads, so enforce Conventional Commits.
   pr-title:

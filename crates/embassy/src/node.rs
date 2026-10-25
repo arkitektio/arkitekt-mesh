@@ -125,23 +125,23 @@ impl Mesh {
             };
             match event {
                 Event::ConnectDerp { region, info, home } => {
-                    // The region's slot, a free one, or (for home) any.
+                    // The region's slot, a free one, else one not home (its
+                    // region closed, as far as the core knows: it asks
+                    // again when it needs it). Home always keeps one.
+                    let is_home = |s: &crate::Slot| s.region.as_ref().is_some_and(|(_, _, h)| *h);
                     let slot = inner
                         .slots
                         .iter()
                         .position(|s| s.region.as_ref().is_some_and(|(r, _, _)| *r == region))
                         .or_else(|| inner.slots.iter().position(|s| s.region.is_none()))
-                        .or_else(|| {
-                            home.then(|| {
-                                inner
-                                    .slots
-                                    .iter()
-                                    .position(|s| !s.region.as_ref().is_some_and(|(_, _, h)| *h))
-                            })
-                            .flatten()
-                        });
+                        .or_else(|| inner.slots.iter().position(|s| !is_home(s)))
+                        .or_else(|| home.then_some(0));
                     let Some(i) = slot else {
-                        tracing::debug!("no DERP slot free for region {region}");
+                        // Not linked after all: the core asks again when needed.
+                        tracing::debug!("no DERP slot for region {region}");
+                        if let Some(core) = inner.core.as_mut() {
+                            core.derp_closed(region);
+                        }
                         continue;
                     };
                     if let Some((old, _, _)) = inner.slots[i].region.take() {

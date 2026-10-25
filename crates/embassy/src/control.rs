@@ -23,6 +23,10 @@ use mesh_core::node::NodeCore;
 
 use crate::{at, now, Dial, Mesh, MeshError, Tls};
 
+/// A connection to control (dial, TLS, `GET /key`, the second dial) gives
+/// up after this long: a hanging handshake must not stall control.
+const CONNECT_TIMEOUT: embassy_time::Duration = embassy_time::Duration::from_secs(30);
+
 /// Control's URL, taken apart.
 pub(crate) struct Url {
     https: bool,
@@ -103,9 +107,18 @@ impl Mesh {
                 match event {
                     Event::Connect => {
                         live = None;
-                        match self.connect_control(url, dial).await {
-                            Ok(l) => live = Some(l),
-                            Err(e) => self.inner.borrow_mut().session.connect_failed(now(), &e),
+                        let connecting = embassy_time::with_timeout(
+                            CONNECT_TIMEOUT,
+                            self.connect_control(url, dial),
+                        );
+                        match connecting.await {
+                            Ok(Ok(l)) => live = Some(l),
+                            Ok(Err(e)) => self.inner.borrow_mut().session.connect_failed(now(), &e),
+                            Err(_) => self
+                                .inner
+                                .borrow_mut()
+                                .session
+                                .connect_failed(now(), "connecting timed out"),
                         }
                     }
                     Event::Disconnect => live = None,

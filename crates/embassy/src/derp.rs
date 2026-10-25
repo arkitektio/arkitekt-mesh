@@ -100,9 +100,12 @@ impl Mesh {
             Some(name) if !node.insecure_for_tests => Tls::Verify(name),
             _ => Tls::Unverified(&node.host_name),
         };
-        let mut stream = dial
-            .dial(&host, port, tls)
+        // Dialing and the handshake take at most this long (then the
+        // region's next node), as in the tokio driver.
+        let handshake_by = embassy_time::Instant::now() + embassy_time::Duration::from_secs(10);
+        let mut stream = embassy_time::with_deadline(handshake_by, dial.dial(&host, port, tls))
             .await
+            .map_err(|_| format!("connecting to {host} timed out"))?
             .map_err(|e| format!("{host}: {e}"))?;
         let authority = if port == 443 {
             node.host_name.clone()
@@ -132,7 +135,11 @@ impl Mesh {
                 // Room in the queue again: the node may send on.
                 self.node_wake.signal(());
             }
-            let quiet = at(conn.poll_timeout());
+            let quiet = if conn.is_up() {
+                at(conn.poll_timeout())
+            } else {
+                handshake_by.min(at(conn.poll_timeout()))
+            };
             match select3(
                 stream.read(&mut buf),
                 self.slot_wake[i].wait(),
@@ -150,6 +157,11 @@ impl Mesh {
                 }
                 Either3::First(Err(e)) => return Err(format!("read: {e:?}")),
                 Either3::Second(()) => {}
+                Either3::Third(())
+                    if !conn.is_up() && embassy_time::Instant::now() >= handshake_by =>
+                {
+                    return Err(format!("the handshake with {host} timed out"));
+                }
                 Either3::Third(()) => conn.handle_timeout(now()).map_err(|e| format!("{e}"))?,
             }
         }

@@ -114,6 +114,10 @@ pub struct Config {
     pub http2: http2::Config,
     /// Packets queued per DERP connection.
     pub derp_queue: usize,
+    /// Where the verified tailnet-lock chain is kept (flash, on a board).
+    /// Without one, each start takes control's genesis again, so a
+    /// compromised control could swap the trusted keys across a reboot.
+    pub lock_store: Option<alloc::sync::Arc<dyn mesh_core::lock::LockStore>>,
 }
 
 impl Config {
@@ -146,6 +150,7 @@ impl Config {
                 max_header_list: 16 << 10,
             },
             derp_queue: 32,
+            lock_store: None,
         }
     }
 }
@@ -240,7 +245,7 @@ impl Mesh {
                     paths: Some(paths),
                     netmap: Default::default(),
                     filter_sets: Default::default(),
-                    lock: Default::default(),
+                    lock: mesh_core::lock::Lock::new(config.lock_store.clone()),
                 }),
                 session,
                 udp_out: VecDeque::new(),
@@ -293,6 +298,15 @@ impl Mesh {
             .as_ref()
             .map(|c| c.netmap().self_addresses().to_vec())
             .unwrap_or_default()
+    }
+
+    /// The direct UDP path to the peer at `ip`, if one is up (else its
+    /// packets go through DERP).
+    pub fn direct_path(&self, ip: core::net::IpAddr) -> Option<SocketAddr> {
+        let inner = self.inner.borrow();
+        let core = inner.core.as_ref()?;
+        let key = core.netmap().peer_by_ip(ip)?.key;
+        core.paths().direct(&key, now())
     }
 
     /// A peer's address by its name (`host` or `host.tailnet…`), or an IP.
