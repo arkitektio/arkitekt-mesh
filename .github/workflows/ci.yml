@@ -25,7 +25,7 @@ jobs:
       - run: cargo clippy --workspace --exclude arkitekt-mesh-smoltcp --all-targets --all-features
       - run: cargo clippy -p arkitekt-mesh-smoltcp --all-targets
       # The fork's simulator: upstream's snapshot, and SACK recovery's gain.
-      - run: cargo test -p arkitekt-mesh-smoltcp --release --features _netsim,socket-tcp-cubic --test netsim
+      - run: cargo test -p arkitekt-mesh-smoltcp --release --features _netsim,socket-tcp-cubic,socket-tcp-reno --test netsim
       - run: cargo test --workspace
       # mesh-core alone: on upstream smoltcp (the workspace has `fast-tcp`).
       - run: cargo test -p arkitekt-mesh-core

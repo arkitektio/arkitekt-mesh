@@ -41,6 +41,13 @@ meant to go upstream.
   back-off a loss (to 0.7), slow start after a timeout, Reno's W_est where
   it is faster, and RFC 6928's initial window of 10 segments. Two upstream
   tests changed with it (the 100 ms update throttle, ssthresh = cwnd / 2).
+- `socket::tcp::congestion::reno`: RFC 5681 as written. Upstream, in
+  congestion avoidance, set ssthresh to the window and grew it a segment
+  every ACK (doubling it a round trip), never cut it on duplicate ACKs and
+  halved it on a timeout. Now: slow start by octets ACKed, a segment a
+  window in congestion avoidance, half on a loss, one segment after a
+  timeout, an initial window of 10. With SACK recovery it is what a board
+  runs (no FPU for cubic's f64).
 - `socket::tcp::Socket::set_tx_buffer_max`: send buffer auto-tuning, as
   Linux's `tcp_sndbuf_expand`: an ACK to a full buffer grows it to twice
   what the path holds (the smaller of the congestion and the remote

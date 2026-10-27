@@ -70,6 +70,9 @@ enum Mode {
     Cubic,
     #[cfg(feature = "socket-tcp-cubic")]
     CubicSack,
+    /// What a board would run.
+    #[cfg(feature = "socket-tcp-reno")]
+    RenoSack,
 }
 
 impl Mode {
@@ -81,6 +84,11 @@ impl Mode {
             #[cfg(feature = "socket-tcp-cubic")]
             Mode::CubicSack => {
                 socket.set_congestion_control(tcp::CongestionControl::Cubic);
+                socket.set_sack_recovery(true);
+            }
+            #[cfg(feature = "socket-tcp-reno")]
+            Mode::RenoSack => {
+                socket.set_congestion_control(tcp::CongestionControl::Reno);
                 socket.set_sack_recovery(true);
             }
         }
@@ -97,7 +105,10 @@ fn netsim_sack_recovery() {
     let mut table = String::new();
     let mut at = std::collections::HashMap::new();
     for buffer in [65536, 1048576] {
-        for mode in [Mode::Upstream, Mode::Cubic, Mode::CubicSack] {
+        let mut modes = vec![Mode::Upstream, Mode::Cubic, Mode::CubicSack];
+        #[cfg(feature = "socket-tcp-reno")]
+        modes.push(Mode::RenoSack);
+        for mode in modes {
             write!(&mut table, "{buffer:8} {mode:10?}").unwrap();
             for loss in losses {
                 let (rate, efficiency) = run_case(TestCase {
@@ -124,21 +135,26 @@ fn netsim_sack_recovery() {
     // not).
     for loss in [10, 20, 50] {
         let (_, upstream) = at[&(1048576, Mode::Upstream, loss)];
-        let (rate, sack) = at[&(1048576, Mode::CubicSack, loss)];
-        assert!(
-            sack > 0.9,
-            "{loss}/1000 lost: {sack} of what SACK recovery sent was delivered"
-        );
-        assert!(
-            sack > upstream,
-            "{loss}/1000 lost: SACK {sack} vs go-back-N {upstream}"
-        );
-        // And no worse than Reno's 1.22 MSS / (RTT sqrt(p)), halved.
-        let mathis = 1.22 * 1460.0 / (0.1 * (loss as f64 / 1000.0).sqrt());
-        assert!(
-            rate > mathis / 2.0,
-            "{loss}/1000 lost: {rate} under Mathis' {mathis}"
-        );
+        let mut sacking = vec![Mode::CubicSack];
+        #[cfg(feature = "socket-tcp-reno")]
+        sacking.push(Mode::RenoSack);
+        for mode in sacking {
+            let (rate, sack) = at[&(1048576, mode, loss)];
+            assert!(
+                sack > 0.9,
+                "{mode:?}, {loss}/1000 lost: {sack} delivered of what was sent"
+            );
+            assert!(
+                sack > upstream,
+                "{mode:?}, {loss}/1000 lost: {sack} vs go-back-N {upstream}"
+            );
+            // And no worse than Reno's 1.22 MSS / (RTT sqrt(p)), halved.
+            let mathis = 1.22 * 1460.0 / (0.1 * (loss as f64 / 1000.0).sqrt());
+            assert!(
+                rate > mathis / 2.0,
+                "{mode:?}, {loss}/1000 lost: {rate} under Mathis' {mathis}"
+            );
+        }
     }
 }
 
