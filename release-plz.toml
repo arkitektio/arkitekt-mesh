@@ -15,6 +15,11 @@ version_group = "arkitekt-mesh"
 name = "arkitekt-mesh"
 version_group = "arkitekt-mesh"
 
+# Our smoltcp fork, for mesh-core's `fast-tcp`.
+[[package]]
+name = "arkitekt-mesh-smoltcp"
+version_group = "arkitekt-mesh"
+
 [[package]]
 name = "arkitekt-mesh-embassy"
 version_group = "arkitekt-mesh"

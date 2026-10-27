@@ -15,7 +15,8 @@ name = "mesh_web"
 
 # Only on wasm32: elsewhere the crate is empty.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-mesh-core.workspace = true
+# A browser has the machine to spare: the fork's faster TCP.
+mesh-core = { workspace = true, features = ["fast-tcp"] }
 mesh-embassy.workspace = true
 embassy-time = "0.5"
 # Our own time driver (performance.now, setTimeout): embassy-time's wasm
