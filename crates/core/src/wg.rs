@@ -776,7 +776,9 @@ impl ReplayWindow {
         }
         let total = Self::WORDS as u64 * 64;
         if counter >= self.next {
-            let current_word = self.next / 64;
+            // The word of the highest counter so far: every word after it,
+            // up to the new one, still holds bits from a lap ago.
+            let current_word = self.next.saturating_sub(1) / 64;
             let new_word = counter / 64;
             let clear = (new_word - current_word).min(Self::WORDS as u64);
             for i in 1..=clear {
@@ -1049,6 +1051,18 @@ mod tests {
         assert!(w.accept(5000));
         assert!(!w.accept(10), "too old");
         assert!(w.accept(4999));
+    }
+
+    #[test]
+    fn a_late_packet_is_not_a_replay_after_a_long_run_in_order() {
+        let mut w = ReplayWindow::default();
+        // In order, well past the window's size, but for one held back.
+        for counter in (0..10_000).filter(|&c| c != 9_990) {
+            assert!(w.accept(counter));
+        }
+        assert!(w.accept(9_990), "a late packet within the window");
+        assert!(!w.accept(9_990));
+        assert!(!w.accept(9_000), "a replay within the window");
     }
 
     #[test]
