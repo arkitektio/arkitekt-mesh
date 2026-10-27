@@ -52,6 +52,7 @@ pub struct Netstack {
     tcp_buffer: usize,
     listen_buffer: usize,
     tcp_buffer_max: usize,
+    tcp_send_buffer_max: usize,
     congestion: Congestion,
 }
 
@@ -74,6 +75,7 @@ impl Netstack {
             tcp_buffer: TCP_BUFFER,
             listen_buffer: TCP_BUFFER,
             tcp_buffer_max: 0,
+            tcp_send_buffer_max: 0,
             congestion: Congestion::None,
         };
         stack.set_addresses(addresses);
@@ -91,11 +93,18 @@ impl Netstack {
         self.listen_buffer = bytes.max(1024);
     }
 
-    /// How far the receive buffer of sockets opened from now on may grow,
-    /// as their application keeps up (0: not at all). Only with `fast-tcp`,
+    /// How far the receive buffers may grow, all together, as their
+    /// applications keep up (0: not at all); each socket's window scale is
+    /// chosen for all of it. Only with `fast-tcp`,
     /// whose smoltcp fork tunes it; upstream's buffers stay as they start.
     pub fn set_tcp_buffer_max(&mut self, bytes: usize) {
         self.tcp_buffer_max = bytes;
+    }
+
+    /// How far the transmit buffer of sockets opened from now on may grow,
+    /// as the path takes more than it holds (0: not at all; `fast-tcp`).
+    pub fn set_tcp_send_buffer_max(&mut self, bytes: usize) {
+        self.tcp_send_buffer_max = bytes;
     }
 
     /// The congestion control of sockets opened from now on.
@@ -140,11 +149,17 @@ impl Netstack {
         // floor), not RFC 6298's 1 s.
         #[cfg(feature = "fast-tcp")]
         socket.set_min_rto(crate::tcpip::time::Duration::from_millis(200));
-        // And a receive buffer that grows to what the application reads in
-        // a round trip (the window, so a connection's rate, follows).
+        // And buffers that grow: the receive buffer to what the application
+        // reads in a round trip (the window, so the rate, follows), the
+        // transmit buffer to what the path holds in flight.
         #[cfg(feature = "fast-tcp")]
-        if self.tcp_buffer_max > buffer {
-            socket.set_rx_buffer_max(self.tcp_buffer_max);
+        {
+            if self.tcp_buffer_max > buffer {
+                socket.set_rx_buffer_max(self.tcp_buffer_max);
+            }
+            if self.tcp_send_buffer_max > buffer {
+                socket.set_tx_buffer_max(self.tcp_send_buffer_max);
+            }
         }
         socket
     }
@@ -217,8 +232,39 @@ impl Netstack {
     pub fn poll(&mut self, now: Instant, room: usize) -> Vec<Vec<u8>> {
         let now = self.now(now);
         self.device.room = room;
+        #[cfg(feature = "fast-tcp")]
+        self.share_rx_budget();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.device.tx.drain(..).collect()
+    }
+
+    /// The receive buffers grow from one budget, `tcp_buffer_max` for all of
+    /// them: what they let the peers have in flight arrives through one UDP
+    /// socket and one loop, and past what those take it is dropped (8
+    /// streams of 8 MiB each in the lab: 10,000 datagrams a run). Each
+    /// socket may grow by what the others leave.
+    #[cfg(feature = "fast-tcp")]
+    fn share_rx_budget(&mut self) {
+        use crate::tcpip::socket::AnySocket;
+        if self.tcp_buffer_max == 0 {
+            return;
+        }
+        let open = |s: &tcp::Socket| s.state() != tcp::State::Closed;
+        let held: usize = self
+            .sockets
+            .iter()
+            .filter_map(|(_, s)| tcp::Socket::downcast(s))
+            .filter(|s| open(s))
+            .map(|s| s.recv_capacity())
+            .sum();
+        let spare = self.tcp_buffer_max.saturating_sub(held);
+        for (_, socket) in self.sockets.iter_mut() {
+            if let Some(s) = tcp::Socket::downcast_mut(socket) {
+                if open(s) {
+                    s.set_rx_buffer_max(s.recv_capacity() + spare);
+                }
+            }
+        }
     }
 
     /// When [`poll`](Self::poll) should run next, if nothing arrives before.
@@ -349,6 +395,34 @@ mod tests {
             }
         }
         panic!("no echo; got {got:?}");
+    }
+
+    /// The receive buffers grow from one budget: a socket alone may take
+    /// all of it, several get what the others leave.
+    #[cfg(feature = "fast-tcp")]
+    #[test]
+    fn receive_buffers_grow_from_one_budget() {
+        let t0 = crate::time::now();
+        let mut a = Netstack::new(&["100.64.0.1".parse().unwrap()], t0);
+        a.set_tcp_buffer(64 << 10);
+        a.set_tcp_buffer_max(256 << 10);
+        let peer = SocketAddr::new("100.64.0.2".parse().unwrap(), 7);
+
+        let one = a.connect(peer).unwrap();
+        a.poll(t0, usize::MAX);
+        assert_eq!(a.socket(one).rx_buffer_max(), 256 << 10);
+
+        let two = a.connect(peer).unwrap();
+        let three = a.connect(peer).unwrap();
+        a.poll(t0, usize::MAX);
+        for socket in [one, two, three] {
+            // 3 x 64 KiB held, 64 KiB left to grow by.
+            assert_eq!(a.socket(socket).rx_buffer_max(), 128 << 10);
+        }
+
+        a.remove(three);
+        a.poll(t0, usize::MAX);
+        assert_eq!(a.socket(one).rx_buffer_max(), 192 << 10);
     }
 
     /// Two stacks wired back to back exchange datagrams; unbound ports get

@@ -493,6 +493,8 @@ pub struct Socket<'a> {
     timer: Timer,
     rtte: RttEstimator,
     rx_auto: RxAutoTune,
+    /// The largest the transmit buffer may grow to; 0: it does not grow.
+    tx_buffer_max: usize,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
@@ -603,6 +605,7 @@ impl<'a> Socket<'a> {
             timer: Timer::new(),
             rtte: RttEstimator::default(),
             rx_auto: RxAutoTune::default(),
+            tx_buffer_max: 0,
             assembler: Assembler::new(),
             tx_buffer,
             rx_buffer,
@@ -821,6 +824,24 @@ impl<'a> Socket<'a> {
             let rx_cap_log2 = mem::size_of::<usize>() * 8 - rx_largest.leading_zeros() as usize;
             self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         }
+    }
+
+    /// Return how far the transmit buffer may grow (0: it does not).
+    ///
+    /// See also the [set_tx_buffer_max](#method.set_tx_buffer_max) method.
+    pub fn tx_buffer_max(&self) -> usize {
+        self.tx_buffer_max
+    }
+
+    /// Let the transmit buffer grow, up to `max` octets, while the
+    /// application fills it faster than the path takes it away (send buffer
+    /// auto-tuning, as Linux's): when an ACK arrives on a full buffer it
+    /// grows to twice what the path holds (the smaller of the congestion
+    /// and the remote window). It only grows, and only owned storage (a
+    /// `Vec`) does. 0 (the default) turns it off.
+    #[cfg(feature = "alloc")]
+    pub fn set_tx_buffer_max(&mut self, max: usize) {
+        self.tx_buffer_max = max;
     }
 
     /// Return the lower bound of the retransmission timeout.
@@ -1429,6 +1450,26 @@ impl<'a> Socket<'a> {
         }
         self.rx_auto.round_from = Some(now);
         self.rx_auto.copied = 0;
+    }
+
+    /// Send buffer auto-tuning, on an ACK to a full buffer: the application
+    /// is held back by it, so it grows to twice what the path holds in
+    /// flight (Linux's `tcp_sndbuf_expand`), as the ACKs show.
+    #[cfg(feature = "alloc")]
+    fn tx_auto_tune(&mut self) {
+        let capacity = self.tx_buffer.capacity();
+        if self.tx_buffer_max <= capacity {
+            return;
+        }
+        let path = self
+            .congestion_controller
+            .inner()
+            .window()
+            .min(self.remote_win_len);
+        let want = path.saturating_mul(2).min(self.tx_buffer_max);
+        if want > capacity && self.tx_buffer.grow(want) {
+            net_debug!("tx buffer: grown to {} octets", want);
+        }
     }
 
     fn recv_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, RecvError>
@@ -2157,7 +2198,12 @@ impl<'a> Socket<'a> {
                 ack_len,
                 self.tx_buffer.len() - ack_len
             );
+            let was_full = self.tx_buffer.window() == 0;
             self.tx_buffer.dequeue_allocated(ack_len);
+            #[cfg(feature = "alloc")]
+            if was_full {
+                self.tx_auto_tune();
+            }
 
             // There's new room available in tx_buffer, wake the waiting task if any.
             #[cfg(feature = "async")]
@@ -8939,6 +8985,62 @@ mod test {
             let _ = s.socket.dispatch(&mut s.cx, |_, _| Ok::<(), ()>(()));
         }
         assert_eq!(s.rx_buffer.capacity(), 1024);
+    }
+
+    #[test]
+    fn test_tx_buffer_grows_when_full_and_the_path_takes_more() {
+        let mut s = socket_established_with_buffer_sizes(64, 64);
+        s.set_tx_buffer_max(4096);
+        s.remote_win_len = 1024;
+        s.send_slice(&[0x5a; 64]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0x5a; 64],
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(s.tx_buffer.window(), 0, "full");
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 32),
+                window_len: 1024,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.tx_buffer.capacity(), 2048, "twice the remote window");
+        assert_eq!(s.tx_buffer.len(), 32, "the unacknowledged rest kept");
+    }
+
+    #[test]
+    fn test_tx_buffer_stays_when_not_full() {
+        let mut s = socket_established_with_buffer_sizes(64, 64);
+        s.set_tx_buffer_max(4096);
+        s.remote_win_len = 1024;
+        s.send_slice(&[0x5a; 32]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &[0x5a; 32],
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 32),
+                window_len: 1024,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.tx_buffer.capacity(), 64);
     }
 
     #[test]

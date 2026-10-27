@@ -49,9 +49,11 @@ pub struct Settings {
     pub ipv4: bool,
     pub tcp_buffer: usize,
     pub listen_buffer: usize,
-    /// How far a TCP receive buffer may grow as its application keeps up
-    /// (`fast-tcp` only; 0: it stays as it starts).
+    /// How far a TCP receive buffer may grow as its application keeps up,
+    /// and a transmit buffer as the path does (`fast-tcp` only; 0: they
+    /// stay as they start).
     pub tcp_buffer_max: usize,
+    pub tcp_send_buffer_max: usize,
     pub congestion: Congestion,
     /// Packets held per peer while a handshake is in flight.
     pub handshake_queue: usize,
@@ -151,6 +153,7 @@ impl NodeCore {
         netstack.set_tcp_buffer(settings.tcp_buffer);
         netstack.set_listen_buffer(settings.listen_buffer);
         netstack.set_tcp_buffer_max(settings.tcp_buffer_max);
+        netstack.set_tcp_send_buffer_max(settings.tcp_send_buffer_max);
         netstack.set_congestion(settings.congestion);
         let mut firewall = Firewall::new(settings.udp_flows);
         firewall.set_filter(crate::filter::compile(&filter_sets));

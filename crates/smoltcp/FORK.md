@@ -17,6 +17,11 @@ meant to go upstream.
   the maximum, never shrinking; the window scale is chosen for the
   maximum. Off (0) by default. arkitekt-mesh allows 8 MiB, as tailscale's
   netstack does.
+- `socket::tcp::Socket::set_tx_buffer_max`: send buffer auto-tuning, as
+  Linux's `tcp_sndbuf_expand`: an ACK to a full buffer grows it to twice
+  what the path holds (the smaller of the congestion and the remote
+  window). Off by default; arkitekt-mesh keeps it off until retransmits are
+  selective, since with go-back-N a big flight collapses on loss.
 - `storage::RingBuffer::grow`: for the above, owned storage only, keeping
   what is held and what is reassembled past it at the same offsets.
 - Tests: `cargo test -p arkitekt-mesh-smoltcp`, and the network simulator

@@ -25,6 +25,8 @@ jobs:
       - run: cargo clippy --workspace --exclude arkitekt-mesh-smoltcp --all-targets --all-features
       - run: cargo clippy -p arkitekt-mesh-smoltcp --all-targets
       - run: cargo test --workspace
+      # mesh-core alone: on upstream smoltcp (the workspace has `fast-tcp`).
+      - run: cargo test -p arkitekt-mesh-core
 
   # The node on every platform meshd ships for.
   native:

@@ -65,10 +65,17 @@ pub struct Limits {
     /// TCP buffer, each way, of listening sockets (allocated while they
     /// wait) and the connections they accept.
     pub listen_buffer: usize,
-    /// How far a TCP receive buffer grows, from the sizes above, while its
-    /// application reads what arrives (receive buffer auto-tuning, feature
-    /// `fast-tcp`; 0: never). tailscale's netstack allows 8 MiB.
+    /// How far the TCP receive buffers grow, all together, from the sizes
+    /// above, while their applications read what arrives (receive buffer
+    /// auto-tuning, feature `fast-tcp`; 0: never): one stream may take it
+    /// all, several share it. More than the UDP buffer takes in a burst is
+    /// dropped. tailscale's netstack allows 8 MiB a connection.
     pub tcp_buffer_max: usize,
+    /// How far a TCP transmit buffer grows while the path takes more than
+    /// it holds (`fast-tcp`; 0: never, the default). Off until smoltcp
+    /// retransmits selectively: with megabytes in flight, one loss has it
+    /// send them all again (8 streams at 20 ms in the lab: 230 -> 9 MiB/s).
+    pub tcp_send_buffer_max: usize,
     /// How TCP senders hold back on loss.
     pub congestion: netstack::Congestion,
     /// Packets queued per DERP connection (and from all of DERP to the node).
@@ -113,6 +120,7 @@ impl Default for Limits {
             tcp_buffer: 1 << 20,
             listen_buffer: netstack::TCP_BUFFER,
             tcp_buffer_max: 8 << 20,
+            tcp_send_buffer_max: 0,
             congestion: netstack::Congestion::Cubic,
             derp_queue: 1024,
             derp_burst: 32,
@@ -136,6 +144,7 @@ impl Limits {
             tcp_buffer: 8 * 1024,
             listen_buffer: 4 * 1024,
             tcp_buffer_max: 0,
+            tcp_send_buffer_max: 0,
             congestion: netstack::Congestion::None,
             derp_queue: 32,
             derp_burst: 0,
@@ -307,6 +316,7 @@ impl Node {
                 tcp_buffer: limits.tcp_buffer,
                 listen_buffer: limits.listen_buffer,
                 tcp_buffer_max: limits.tcp_buffer_max,
+                tcp_send_buffer_max: limits.tcp_send_buffer_max,
                 congestion: limits.congestion,
                 handshake_queue: limits.handshake_queue,
                 max_active_peers: limits.max_active_peers,
