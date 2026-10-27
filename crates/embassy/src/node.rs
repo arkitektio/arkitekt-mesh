@@ -17,33 +17,31 @@ impl Mesh {
         let mut buf = vec![0u8; 2048];
         let mut ports_set = false;
         loop {
-            let deadline = {
+            let deadline = 'pass: {
                 let mut guard = self.inner.borrow_mut();
                 let inner = &mut *guard;
-                if inner.core.is_none() {
-                    None
-                } else {
-                    let t = now();
-                    let room = self.derp_room(inner);
-                    let core = inner.core.as_mut().expect("core");
-                    if !ports_set {
-                        core.set_udp_ports(udp.local_port(), None);
-                        ports_set = true;
-                    }
-                    let pumped = core.pump(t, room);
-                    let stun = if core.stun_due(t) {
-                        core.stun(t, udp.local_endpoint(), None)
-                    } else {
-                        Vec::new()
-                    };
-                    core.link_derp_for(&pumped.transmits);
-                    inner.udp_out.extend(stun);
-                    self.dispatch(inner, pumped.transmits);
-                    self.events(inner);
-                    let core = inner.core.as_mut().expect("core");
-                    core.after_pass(t);
-                    Some(core.poll_timeout(t, pumped.held_back))
+                let t = now();
+                let room = self.derp_room(inner);
+                let Some(core) = inner.core.as_mut() else {
+                    break 'pass None;
+                };
+                if !ports_set {
+                    core.set_udp_ports(udp.local_port(), None);
+                    ports_set = true;
                 }
+                let pumped = core.pump(t, room);
+                let stun = if core.stun_due(t) {
+                    core.stun(t, udp.local_endpoint(), None)
+                } else {
+                    Vec::new()
+                };
+                core.link_derp_for(&pumped.transmits);
+                inner.udp_out.extend(stun);
+                self.dispatch(inner, pumped.transmits);
+                self.events(inner);
+                let core = inner.core.as_mut().expect("core");
+                core.after_pass(t);
+                Some(core.poll_timeout(t, pumped.held_back))
             };
             // Send with the state released.
             loop {
