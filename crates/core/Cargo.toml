@@ -71,7 +71,12 @@ udp = ["smoltcp/socket-udp", "mesh-smoltcp?/socket-udp"]
 # Our smoltcp fork (crates/smoltcp) as the TCP/IP stack: faster loss
 # recovery, for machines where throughput matters. Without it upstream
 # smoltcp, as on a board (which shares it with embassy-net).
-fast-tcp = ["dep:mesh-smoltcp"]
+fast-tcp = [
+    "dep:mesh-smoltcp",
+    # 32 out-of-order ranges held per socket, not 4: past 4 holes a
+    # receiver drops what arrives and the sender has to send it again.
+    "mesh-smoltcp/assembler-max-segment-count-32",
+]
 # Test helpers for the drivers' tests (the server half of the control Noise).
 testing = []
 

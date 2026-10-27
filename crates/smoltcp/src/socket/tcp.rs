@@ -176,6 +176,8 @@ struct RttEstimator {
     timestamp: Option<(Instant, TcpSeqNumber)>,
     max_seq_sent: Option<TcpSeqNumber>,
     rto_count: u8,
+    /// The lower bound of `rto`, in ms: `RTTE_MIN_RTO` unless set.
+    min_rto: u32,
 }
 
 impl Default for RttEstimator {
@@ -188,6 +190,7 @@ impl Default for RttEstimator {
             timestamp: None,
             max_seq_sent: None,
             rto_count: 0,
+            min_rto: RTTE_MIN_RTO,
         }
     }
 }
@@ -212,7 +215,7 @@ impl RttEstimator {
 
         // RFC 6298 (2.2), (2.3)
         let margin = RTTE_MIN_MARGIN.max(self.rttvar * RTTE_K);
-        self.rto = (self.srtt + margin).clamp(RTTE_MIN_RTO, RTTE_MAX_RTO);
+        self.rto = (self.srtt + margin).clamp(self.min_rto, RTTE_MAX_RTO);
 
         self.rto_count = 0;
 
@@ -768,6 +771,21 @@ impl<'a> Socket<'a> {
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
 
+    /// Return the lower bound of the retransmission timeout.
+    ///
+    /// See also the [set_min_rto](#method.set_min_rto) method.
+    pub fn min_rto(&self) -> Duration {
+        Duration::from_millis(self.rtte.min_rto as _)
+    }
+
+    /// Set the lower bound of the retransmission timeout, which RFC 6298 (2.4)
+    /// puts at 1 second (the default). Linux uses 200 ms: on a link with
+    /// short round trips a lost segment is then sent again 200 ms after it
+    /// was due, not 1 s. It is kept across a reset of the socket.
+    pub fn set_min_rto(&mut self, duration: Duration) {
+        self.rtte.min_rto = duration.total_millis().clamp(1, RTTE_MAX_RTO as u64) as u32;
+    }
+
     /// Set the timeout duration.
     ///
     /// A socket with a timeout duration set will abort the connection if either of the following
@@ -891,7 +909,10 @@ impl<'a> Socket<'a> {
 
         self.state = State::Closed;
         self.timer = Timer::new();
-        self.rtte = RttEstimator::default();
+        self.rtte = RttEstimator {
+            min_rto: self.rtte.min_rto,
+            ..RttEstimator::default()
+        };
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
         self.rx_buffer.clear();
@@ -8709,6 +8730,27 @@ mod test {
             r.sample(2000);
             assert_eq!(r.retransmission_timeout(), Duration::from_millis(rto));
         }
+    }
+
+    #[test]
+    fn test_min_rto() {
+        let mut s = socket_established();
+        assert_eq!(s.min_rto(), Duration::from_millis(1000));
+        s.rtte.sample(20);
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(1000));
+
+        s.set_min_rto(Duration::from_millis(200));
+        assert_eq!(s.min_rto(), Duration::from_millis(200));
+        s.rtte.sample(20);
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(200));
+
+        // Backing off still doubles it.
+        s.rtte.on_retransmit();
+        assert_eq!(s.rtte.retransmission_timeout(), Duration::from_millis(400));
+
+        // Kept across a reset.
+        s.reset();
+        assert_eq!(s.min_rto(), Duration::from_millis(200));
     }
 
     #[test]

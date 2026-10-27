@@ -127,6 +127,10 @@ impl Netstack {
         });
         socket.set_keep_alive(Some(crate::tcpip::time::Duration::from_secs(30)));
         socket.set_timeout(Some(crate::tcpip::time::Duration::from_secs(120)));
+        // The fork's: a lost segment is sent again after 200 ms (Linux's
+        // floor), not RFC 6298's 1 s.
+        #[cfg(feature = "fast-tcp")]
+        socket.set_min_rto(crate::tcpip::time::Duration::from_millis(200));
         socket
     }
 
