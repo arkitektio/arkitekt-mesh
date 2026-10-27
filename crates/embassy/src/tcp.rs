@@ -8,8 +8,8 @@ use core::task::Poll;
 
 use embedded_io_async::{ErrorKind, ErrorType, Read, Write};
 use embedded_nal_async::{AddrType, Dns, TcpConnect};
-use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp::State;
+use mesh_core::tcpip::iface::SocketHandle;
+use mesh_core::tcpip::socket::tcp::State;
 
 use crate::Mesh;
 

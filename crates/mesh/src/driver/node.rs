@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use mesh_core::time as clock;
 
-use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp::State as TcpState;
+use mesh_core::tcpip::iface::SocketHandle;
+use mesh_core::tcpip::socket::tcp::State as TcpState;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Notify};

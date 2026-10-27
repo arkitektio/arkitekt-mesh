@@ -18,8 +18,8 @@ use core::net::{IpAddr, SocketAddr};
 #[allow(unused_imports)]
 use crate::prelude::*;
 
-use smoltcp::iface::SocketHandle;
-use smoltcp::socket::tcp::State as TcpState;
+use crate::tcpip::iface::SocketHandle;
+use crate::tcpip::socket::tcp::State as TcpState;
 
 use crate::control::netmap::NetMap;
 use crate::control::types::{DerpRegion, EndpointType, MapResponse};

@@ -22,6 +22,14 @@ pub(crate) mod prelude {
     pub use alloc::{format, vec};
 }
 
+/// The TCP/IP stack under [`netstack`]: our smoltcp fork (crates/smoltcp)
+/// with `fast-tcp`, upstream smoltcp otherwise. The drivers name its types
+/// from here, so they always get the one in use.
+#[cfg(feature = "fast-tcp")]
+pub use mesh_smoltcp as tcpip;
+#[cfg(not(feature = "fast-tcp"))]
+pub use smoltcp as tcpip;
+
 pub mod control;
 pub mod crypto;
 pub mod derp;

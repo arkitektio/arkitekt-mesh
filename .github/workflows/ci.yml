@@ -21,7 +21,9 @@ jobs:
           go-version-file: crates/mesh/tests/harness/go.mod
           cache-dependency-path: crates/mesh/tests/harness/go.sum
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features
+      # The smoltcp fork's `*-count-N` features exclude each other.
+      - run: cargo clippy --workspace --exclude arkitekt-mesh-smoltcp --all-targets --all-features
+      - run: cargo clippy -p arkitekt-mesh-smoltcp --all-targets
       - run: cargo test --workspace
 
   # The node on every platform meshd ships for.

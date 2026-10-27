@@ -11,9 +11,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::task::Poll;
 
-use smoltcp::iface::SocketHandle;
-use smoltcp::socket::udp::{RecvError, SendError};
-use smoltcp::wire::IpEndpoint;
+use mesh_core::tcpip::iface::SocketHandle;
+use mesh_core::tcpip::socket::udp::{RecvError, SendError};
+use mesh_core::tcpip::wire::IpEndpoint;
 
 use super::node::Shared;
 use crate::netstack::MAX_UDP_PAYLOAD;

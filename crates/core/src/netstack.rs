@@ -7,12 +7,12 @@ use crate::time::Instant;
 use alloc::collections::VecDeque;
 use core::net::{IpAddr, SocketAddr};
 
-use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp;
+use crate::tcpip::iface::{Config, Interface, SocketHandle, SocketSet};
+use crate::tcpip::phy::{Device, DeviceCapabilities, Medium};
+use crate::tcpip::socket::tcp;
 #[cfg(feature = "udp")]
-use smoltcp::socket::udp;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
+use crate::tcpip::socket::udp;
+use crate::tcpip::wire::{HardwareAddress, IpAddress, IpCidr};
 
 /// Tailscale's MTU for the tunnel.
 pub const MTU: usize = 1280;
@@ -60,7 +60,7 @@ impl Netstack {
         let mut config = Config::new(HardwareAddress::Ip);
         config.random_seed = crate::random::u64();
         let epoch = now;
-        let mut iface = Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
+        let mut iface = Interface::new(config, &mut device, crate::tcpip::time::Instant::ZERO);
         let mut stack = Self {
             iface: {
                 iface.set_any_ip(false);
@@ -108,9 +108,9 @@ impl Netstack {
         });
     }
 
-    fn now(&self, now: Instant) -> smoltcp::time::Instant {
-        smoltcp::time::Instant::from_micros(
-            now.saturating_duration_since(self.epoch).as_micros() as i64
+    fn now(&self, now: Instant) -> crate::tcpip::time::Instant {
+        crate::tcpip::time::Instant::from_micros(
+            now.saturating_duration_since(self.epoch).as_micros() as i64,
         )
     }
 
@@ -125,8 +125,8 @@ impl Netstack {
             Congestion::Reno => tcp::CongestionControl::Reno,
             Congestion::Cubic => tcp::CongestionControl::Cubic,
         });
-        socket.set_keep_alive(Some(smoltcp::time::Duration::from_secs(30)));
-        socket.set_timeout(Some(smoltcp::time::Duration::from_secs(120)));
+        socket.set_keep_alive(Some(crate::tcpip::time::Duration::from_secs(30)));
+        socket.set_timeout(Some(crate::tcpip::time::Duration::from_secs(120)));
         socket
     }
 
@@ -222,12 +222,12 @@ impl Device for Queues {
     type RxToken<'a> = Rx;
     type TxToken<'a> = Tx<'a>;
 
-    fn receive(&mut self, _: smoltcp::time::Instant) -> Option<(Rx, Tx<'_>)> {
+    fn receive(&mut self, _: crate::tcpip::time::Instant) -> Option<(Rx, Tx<'_>)> {
         let packet = self.rx.pop_front()?;
         Some((Rx(packet), Tx(&mut self.tx)))
     }
 
-    fn transmit(&mut self, _: smoltcp::time::Instant) -> Option<Tx<'_>> {
+    fn transmit(&mut self, _: crate::tcpip::time::Instant) -> Option<Tx<'_>> {
         (self.tx.len() < self.room).then_some(Tx(&mut self.tx))
     }
 
@@ -241,7 +241,7 @@ impl Device for Queues {
 
 struct Rx(Vec<u8>);
 
-impl smoltcp::phy::RxToken for Rx {
+impl crate::tcpip::phy::RxToken for Rx {
     fn consume<R, F: FnOnce(&[u8]) -> R>(self, f: F) -> R {
         f(&self.0)
     }
@@ -249,7 +249,7 @@ impl smoltcp::phy::RxToken for Rx {
 
 struct Tx<'a>(&'a mut VecDeque<Vec<u8>>);
 
-impl smoltcp::phy::TxToken for Tx<'_> {
+impl crate::tcpip::phy::TxToken for Tx<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
         let mut packet = vec![0; len];
         let r = f(&mut packet);

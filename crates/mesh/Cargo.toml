@@ -32,16 +32,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-smoltcp = { version = "0.13", default-features = false, features = [
-    "std",
-    "medium-ip",
-    "proto-ipv4",
-    "proto-ipv6",
-    "socket-tcp",
-    "socket-tcp-reno",
-    "socket-tcp-cubic",
-    "async",
-] }
 
 # The tokio driver.
 tokio = { version = "1", default-features = false, features = ["rt", "net", "time", "sync", "macros", "io-util"], optional = true }
@@ -67,7 +57,7 @@ webrtc-util = { version = "0.17", default-features = false, features = ["conn"],
 async-trait = { workspace = true, optional = true }
 
 [features]
-default = ["tokio", "ring", "udp", "tka-disable", "portmap"]
+default = ["tokio", "ring", "udp", "tka-disable", "portmap", "fast-tcp"]
 # Ask the gateway for a port mapping (PCP, NAT-PMP) so peers behind hard
 # NATs still get direct paths.
 portmap = ["tokio"]
@@ -75,7 +65,9 @@ portmap = ["tokio"]
 # node stays locked, fail-closed, when a tailnet's lock is disabled.
 tka-disable = ["mesh-core/tka-disable"]
 # UDP sockets over the tunnel (`Node::bind_udp`).
-udp = ["mesh-core/udp", "smoltcp/socket-udp"]
+udp = ["mesh-core/udp"]
+# mesh-core's faster TCP (our smoltcp fork): see its `fast-tcp`.
+fast-tcp = ["mesh-core/fast-tcp"]
 # A node with its state directory (identity, remembered control url, one
 # node per directory) and the local HTTP proxy into the mesh
 # (`driver::Session`): what meshd, fakts and the Python bindings run.
