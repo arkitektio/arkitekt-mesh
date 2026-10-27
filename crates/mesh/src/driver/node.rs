@@ -71,10 +71,11 @@ pub struct Limits {
     /// all, several share it. More than the UDP buffer takes in a burst is
     /// dropped. tailscale's netstack allows 8 MiB a connection.
     pub tcp_buffer_max: usize,
-    /// How far a TCP transmit buffer grows while the path takes more than
-    /// it holds (`fast-tcp`; 0: never, the default). Off until smoltcp
-    /// retransmits selectively: with megabytes in flight, one loss has it
-    /// send them all again (8 streams at 20 ms in the lab: 230 -> 9 MiB/s).
+    /// How far the TCP transmit buffers grow, all together, while the
+    /// paths take more than they hold (`fast-tcp`; 0: never). Safe with
+    /// the fork's SACK recovery only: without it, one loss in megabytes in
+    /// flight has them all sent again (8 uploads at 20 ms in the lab: 230
+    /// -> 9 MiB/s).
     pub tcp_send_buffer_max: usize,
     /// How TCP senders hold back on loss.
     pub congestion: netstack::Congestion,
@@ -120,7 +121,7 @@ impl Default for Limits {
             tcp_buffer: 1 << 20,
             listen_buffer: netstack::TCP_BUFFER,
             tcp_buffer_max: 8 << 20,
-            tcp_send_buffer_max: 0,
+            tcp_send_buffer_max: 8 << 20,
             congestion: netstack::Congestion::Cubic,
             derp_queue: 1024,
             derp_burst: 32,

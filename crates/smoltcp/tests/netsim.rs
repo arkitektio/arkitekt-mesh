@@ -44,6 +44,7 @@ fn netsim() {
                 rtt: Duration::from_millis(100),
                 buffer,
                 loss,
+                mode: Mode::Upstream,
             });
             write!(&mut s, " {r:9.2}").unwrap();
         }
@@ -57,9 +58,97 @@ struct TestCase {
     rtt: Duration,
     loss: f64,
     buffer: usize,
+    /// arkitekt-mesh's fork: how the sender recovers (upstream's defaults
+    /// when `Upstream`).
+    mode: Mode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Mode {
+    Upstream,
+    #[cfg(feature = "socket-tcp-cubic")]
+    Cubic,
+    #[cfg(feature = "socket-tcp-cubic")]
+    CubicSack,
+}
+
+impl Mode {
+    fn apply(self, socket: &mut tcp::Socket) {
+        match self {
+            Mode::Upstream => {}
+            #[cfg(feature = "socket-tcp-cubic")]
+            Mode::Cubic => socket.set_congestion_control(tcp::CongestionControl::Cubic),
+            #[cfg(feature = "socket-tcp-cubic")]
+            Mode::CubicSack => {
+                socket.set_congestion_control(tcp::CongestionControl::Cubic);
+                socket.set_sack_recovery(true);
+            }
+        }
+    }
+}
+
+/// arkitekt-mesh's fork: SACK recovery against go-back-N, with the buffers
+/// a desktop has, at 100 ms; MB/s.
+#[cfg(feature = "socket-tcp-cubic")]
+#[test]
+fn netsim_sack_recovery() {
+    // (netsim's logger: one a process.)
+    let losses = [0.0, 0.001, 0.01, 0.02, 0.05];
+    let mut table = String::new();
+    let mut at = std::collections::HashMap::new();
+    for buffer in [65536, 1048576] {
+        for mode in [Mode::Upstream, Mode::Cubic, Mode::CubicSack] {
+            write!(&mut table, "{buffer:8} {mode:10?}").unwrap();
+            for loss in losses {
+                let (rate, efficiency) = run_case(TestCase {
+                    rtt: Duration::from_millis(100),
+                    buffer,
+                    loss,
+                    mode,
+                });
+                write!(
+                    &mut table,
+                    " {:7.3} MB/s {:4.0}%",
+                    rate / 1e6,
+                    efficiency * 100.0
+                )
+                .unwrap();
+                at.insert((buffer, mode, (loss * 1000.0) as u32), (rate, efficiency));
+            }
+            writeln!(&mut table).unwrap();
+        }
+    }
+    println!("rate, and delivered/sent, at 100 ms, loss {losses:?}\n{table}");
+    // What SACK buys: a loss costs the lost segment, not the window after
+    // it (go-back-N, which upstream's sender does, congestion control or
+    // not).
+    for loss in [10, 20, 50] {
+        let (_, upstream) = at[&(1048576, Mode::Upstream, loss)];
+        let (rate, sack) = at[&(1048576, Mode::CubicSack, loss)];
+        assert!(
+            sack > 0.9,
+            "{loss}/1000 lost: {sack} of what SACK recovery sent was delivered"
+        );
+        assert!(
+            sack > upstream,
+            "{loss}/1000 lost: SACK {sack} vs go-back-N {upstream}"
+        );
+        // And no worse than Reno's 1.22 MSS / (RTT sqrt(p)), halved.
+        let mathis = 1.22 * 1460.0 / (0.1 * (loss as f64 / 1000.0).sqrt());
+        assert!(
+            rate > mathis / 2.0,
+            "{loss}/1000 lost: {rate} under Mathis' {mathis}"
+        );
+    }
 }
 
 fn run_test(case: TestCase) -> f64 {
+    run_case(case).0
+}
+
+/// The rate (octets/s), and the share of what the sender sent that was
+/// delivered data (1.0: nothing sent twice, nor any headers).
+fn run_case(case: TestCase) -> (f64, f64) {
     let mut time = Instant::ZERO;
 
     let params = QueueParams {
@@ -83,13 +172,17 @@ fn run_test(case: TestCase) -> f64 {
     let socket_a = {
         let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; case.buffer]);
         let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; case.buffer]);
-        tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
+        let mut socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+        case.mode.apply(&mut socket);
+        socket
     };
 
     let socket_b = {
         let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; case.buffer]);
         let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; case.buffer]);
-        tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
+        let mut socket = tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer);
+        case.mode.apply(&mut socket);
+        socket
     };
 
     let mut sockets_a: [_; 2] = Default::default();
@@ -155,7 +248,11 @@ fn run_test(case: TestCase) -> f64 {
     }
 
     let duration = time - Instant::ZERO;
-    processed as f64 / duration.total_micros() as f64 * 1e6
+    let sent = queue_b_to_a.borrow().sent;
+    (
+        processed as f64 / duration.total_micros() as f64 * 1e6,
+        processed as f64 / sent.max(1) as f64,
+    )
 }
 
 struct Packet {
@@ -195,6 +292,8 @@ struct PacketQueue {
     next_id: u64,
     params: QueueParams,
     rng: ChaCha20Rng,
+    /// Octets pushed in, lost or not.
+    sent: usize,
 }
 
 impl PacketQueue {
@@ -204,6 +303,7 @@ impl PacketQueue {
             next_id: 0,
             params,
             rng: ChaCha20Rng::seed_from_u64(seed),
+            sent: 0,
         }
     }
 
@@ -215,6 +315,7 @@ impl PacketQueue {
     }
 
     pub fn push(&mut self, data: Vec<u8>, timestamp: Instant) {
+        self.sent += data.len();
         if self.rng.r#gen::<f64>() < self.params.loss {
             log::info!("PACKET LOST!");
             return;

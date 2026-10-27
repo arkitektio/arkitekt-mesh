@@ -6,17 +6,26 @@ use super::Controller;
 // See RFC 8312.
 const BETA_CUBIC: f64 = 0.7;
 const C: f64 = 0.4;
+/// RFC 6928's initial window, in segments.
+const INITIAL_WINDOW: usize = 10;
 
+// arkitekt-mesh's fork: RFC 8312 as written. Upstream computed W(t) in
+// octets with C meant for segments (regaining a 1 MiB window took some 90
+// s), and cut the window on every duplicate ACK, not once a loss.
 #[derive(Debug)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Cubic {
-    cwnd: usize,     // Congestion window
+    cwnd: usize,     // Congestion window, octets
     min_cwnd: usize, // The minimum size of congestion window
-    w_max: usize,    // Window size just before congestion
-    recovery_start: Option<Instant>,
+    mss: usize,
+    w_max: usize, // Window size just before congestion, octets
+    /// When the congestion avoidance epoch began, and its K (seconds).
+    epoch: Option<(Instant, f64)>,
     rwnd: usize, // Remote window
-    last_update: Instant,
     ssthresh: usize,
+    /// The smoothed round trip, ms (0: none yet), for the Reno-friendly
+    /// window.
+    srtt_ms: u32,
 }
 
 impl Cubic {
@@ -24,12 +33,24 @@ impl Cubic {
         Cubic {
             cwnd: 1024 * 2,
             min_cwnd: 1024 * 2,
+            mss: 1024,
             w_max: 1024 * 2,
-            recovery_start: None,
+            epoch: None,
             rwnd: 64 * 1024,
-            last_update: Instant::from_millis(0),
             ssthresh: usize::MAX,
+            srtt_ms: 0,
         }
+    }
+
+    /// A loss: back off to `BETA_CUBIC` of the window, and grow from there
+    /// on the cubic curve back towards where the loss happened.
+    fn loss(&mut self, now: Instant) {
+        self.w_max = self.cwnd;
+        self.ssthresh = ((self.cwnd as f64 * BETA_CUBIC) as usize).max(2 * self.mss);
+        // K = cubic_root(W_max * (1 - beta) / C), W in segments.
+        let w_max = self.w_max as f64 / self.mss as f64;
+        let k = cube_root(w_max * (1.0 - BETA_CUBIC) / C).unwrap_or(0.0);
+        self.epoch = Some((now, k));
     }
 }
 
@@ -38,16 +59,16 @@ impl Controller for Cubic {
         self.cwnd
     }
 
+    /// A retransmission timeout: the window is gone, slow start again.
     fn on_retransmit(&mut self, now: Instant) {
-        self.w_max = self.cwnd;
-        self.ssthresh = self.cwnd >> 1;
-        self.recovery_start = Some(now);
+        self.loss(now);
+        self.cwnd = self.min_cwnd;
     }
 
+    /// A loss found by duplicate ACKs (the socket calls it once a loss).
     fn on_duplicate_ack(&mut self, now: Instant) {
-        self.w_max = self.cwnd;
-        self.ssthresh = self.cwnd >> 1;
-        self.recovery_start = Some(now);
+        self.loss(now);
+        self.cwnd = self.ssthresh;
     }
 
     fn set_remote_window(&mut self, remote_window: usize) {
@@ -56,56 +77,61 @@ impl Controller for Cubic {
         }
     }
 
-    fn on_ack(&mut self, _now: Instant, len: usize, _rtt: &crate::socket::tcp::RttEstimator) {
+    fn on_ack(&mut self, _now: Instant, len: usize, rtt: &crate::socket::tcp::RttEstimator) {
+        if rtt.have_measurement {
+            self.srtt_ms = rtt.srtt;
+        }
         // Slow start.
         if self.cwnd < self.ssthresh {
             self.cwnd = self
                 .cwnd
                 .saturating_add(len)
+                .min(self.ssthresh.max(self.cwnd))
                 .min(self.rwnd)
                 .max(self.min_cwnd);
         }
     }
 
     fn pre_transmit(&mut self, now: Instant) {
-        let Some(recovery_start) = self.recovery_start else {
-            self.recovery_start = Some(now);
-            return;
-        };
-
-        let now_millis = now.total_millis();
-
-        // If the last update was less than 100ms ago, don't update the congestion window.
-        if self.last_update > recovery_start && now_millis - self.last_update.total_millis() < 100 {
+        // Congestion avoidance only.
+        if self.cwnd < self.ssthresh {
             return;
         }
-
-        // Elapsed time since the start of the recovery phase.
-        let t = now_millis - recovery_start.total_millis();
-        if t < 0 {
+        let (start, k) = match self.epoch {
+            Some(epoch) => epoch,
+            None => {
+                // Left slow start without a loss: the curve starts here.
+                self.w_max = self.cwnd;
+                self.epoch = Some((now, 0.0));
+                (now, 0.0)
+            }
+        };
+        if now < start {
             return;
         }
-
-        // K = (w_max * (1 - beta) / C)^(1/3)
-        let k3 = ((self.w_max as f64) * (1.0 - BETA_CUBIC)) / C;
-        let k = if let Some(k) = cube_root(k3) {
-            k
-        } else {
-            return;
-        };
-
-        // cwnd = C(T - K)^3 + w_max
+        let t = (now - start).total_millis();
+        // W(t) = C (t - K)^3 + W_max, in segments.
+        let w_max = self.w_max as f64 / self.mss as f64;
         let s = t as f64 / 1000.0 - k;
-        let s = s * s * s;
-        let cwnd = C * s + self.w_max as f64;
-
-        self.last_update = now;
-
-        self.cwnd = (cwnd as usize).max(self.min_cwnd).min(self.rwnd);
+        let mut w = C * s * s * s + w_max;
+        // Where it would grow slower than Reno does (small windows, short
+        // round trips: the curve takes seconds to come back), Reno's:
+        // W_est(t) = W_max beta + 3 (1 - beta) / (1 + beta) t / RTT.
+        if self.srtt_ms > 0 {
+            let w_est = w_max * BETA_CUBIC
+                + 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC) * t as f64 / self.srtt_ms as f64;
+            w = w.max(w_est);
+        }
+        let cwnd = (w * self.mss as f64).max(0.0) as usize;
+        self.cwnd = cwnd.max(self.min_cwnd).min(self.rwnd.max(self.min_cwnd));
     }
 
     fn set_mss(&mut self, mss: usize) {
         self.min_cwnd = mss;
+        self.mss = mss.max(1);
+        if self.epoch.is_none() && self.ssthresh == usize::MAX {
+            self.cwnd = self.cwnd.max(INITIAL_WINDOW * mss);
+        }
     }
 }
 
@@ -254,8 +280,10 @@ mod test {
             cwnd2, cwnd3, cwnd4
         );
 
-        assert_eq!(cwnd2, cwnd3);
-        assert_ne!(cwnd2, cwnd4);
+        // Out of slow start, the window follows the curve, back up to
+        // where it was long after the loss.
+        assert!(cwnd2 <= cwnd3);
+        assert!(cwnd3 < cwnd4);
     }
 
     #[test]
@@ -281,13 +309,39 @@ mod test {
 
         let cwnd = cubic.window();
         cubic.on_retransmit(t3);
-        assert_eq!(cwnd >> 1, cubic.ssthresh);
+        assert_eq!((cwnd as f64 * BETA_CUBIC) as usize, cubic.ssthresh);
+        assert_eq!(cubic.window(), cubic.min_cwnd);
     }
 
     #[test]
     fn cubic_pre_transmit() {
         let mut cubic = Cubic::new();
         cubic.pre_transmit(Instant::from_micros(2000));
+    }
+
+    #[test]
+    fn a_loss_backs_off_once_and_the_curve_regains_it() {
+        let mut cubic = Cubic::new();
+        cubic.set_remote_window(64 << 20);
+        cubic.set_mss(1000);
+        assert_eq!(cubic.window(), 10_000, "the initial window");
+        // Slow start to 1 MB.
+        cubic.on_ack(Instant::ZERO, 990_000, &RttEstimator::default());
+        assert_eq!(cubic.window(), 1_000_000);
+
+        let at = Instant::from_secs(1);
+        cubic.on_duplicate_ack(at);
+        assert_eq!(cubic.window(), 700_000);
+        // K = cbrt(1000 * 0.3 / 0.4) = 9.1 s: back at W_max then, not
+        // (as with octets for segments) after 90 s.
+        cubic.pre_transmit(at + crate::time::Duration::from_millis(9086));
+        assert!(
+            (990_000..=1_010_000).contains(&cubic.window()),
+            "{}",
+            cubic.window()
+        );
+        cubic.pre_transmit(at + crate::time::Duration::from_secs(15));
+        assert!(cubic.window() > 1_050_000, "and past it, probing");
     }
 
     #[test]
