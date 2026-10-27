@@ -1,6 +1,191 @@
 # CHANGELOG
 
 
+## v0.9.0 (2026-10-27)
+
+### Bug Fixes
+
+- **core**: The replay window forgets the lap before, so late packets get through
+  ([`b279f85`](https://github.com/arkitektio/arkitekt-mesh/commit/b279f8560c70176dccc8bff74ed110a8fe3a8f2e))
+
+Arriving in order, a counter never cleared its word of the ring: the clearing started from the word
+  of the next counter, not of the highest one (wireguard-go's last >> 6). Once the ring had gone
+  round, every packet that came later than a newer one was taken for a replay and dropped, and TCP
+  saw a loss where there was only reordering.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **embassy**: Resolve only the tailnet's names
+  ([`b0ef613`](https://github.com/arkitektio/arkitekt-mesh/commit/b0ef613d95ec13747df1c2dd1f28848c02273ec2))
+
+Mesh::resolve also tried a name's first label, so "example.com" found a peer named "example": in
+  front of all of an app's DNS (RFC-9's routing TcpConnect) it would take other domains' names. It
+  now resolves as the tokio node does: bare hostnames and names in the tailnet's domain, to the
+  peer's primary address.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **smoltcp**: Reno as RFC 5681 has it
+  ([`6c3c0c9`](https://github.com/arkitektio/arkitekt-mesh/commit/6c3c0c9663576cc2d123d6632379289ee31ead86))
+
+Upstream's grew the window a segment every ACK in congestion avoidance (doubling it a round trip),
+  never cut it on duplicate ACKs, and halved it on a timeout; harmless while the window bounded
+  nothing, not with SACK recovery. Reno with SACK recovery is what a board runs (cubic is f64,
+  software floats on an ESP32), and joins the simulator's comparison.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Build System
+
+- The web node on fast-tcp, the fork in release-plz's list
+  ([`6fe8d94`](https://github.com/arkitektio/arkitekt-mesh/commit/6fe8d94da53c073d6a413eb786fb92570b67aff7))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Code Style
+
+- **embassy**: The node task without an expect after a check
+  ([`ab6d5a8`](https://github.com/arkitektio/arkitekt-mesh/commit/ab6d5a8bc458582721f1e78d30801375f4c5f567))
+
+clippy's unnecessary_unwrap (Rust 1.93) failed the embassy and web jobs.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Documentation
+
+- **rfc9**: Phases 7b and 7c
+  ([`a00f336`](https://github.com/arkitektio/arkitekt-mesh/commit/a00f33667945e6b1abbb8bd6bac3598f6d6704a6))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Features
+
+- **core**: A fast-tcp mode on our own smoltcp fork
+  ([`4ee0171`](https://github.com/arkitektio/arkitekt-mesh/commit/4ee01719280944190f67b35c494a6ca763c52ef2))
+
+crates/smoltcp is smoltcp 0.13.1, published as arkitekt-mesh-smoltcp and unchanged so far (lints
+  aside): the place for faster loss recovery than upstream's. mesh-core's `fast-tcp` takes it as the
+  TCP/IP stack; without it upstream smoltcp, as a board has (shared with embassy-net, so no second
+  copy in flash). arkitekt-mesh turns it on by default.
+
+mesh_core::tcpip is the stack in use, so the drivers name its types from there and no longer depend
+  on smoltcp themselves.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **core**: Fast-tcp grows a receive buffer to what its application reads
+  ([`6328107`](https://github.com/arkitektio/arkitekt-mesh/commit/632810741447b8e888d7d373663ef99e50537b5e))
+
+The fork tunes a socket's receive buffer as gVisor and Linux do (once a round trip, twice what the
+  application read in it, up to a maximum, never shrinking; Socket::set_rx_buffer_max).
+  Limits::tcp_buffer_max (8 MiB, tailscale's; 0 for small()) is that maximum: a connection starts at
+  tcp_buffer and its window follows the reader, so one stream is no longer capped at 1 MiB a round
+  trip.
+
+Lab, direct download, one stream: 25 -> 78-89 MiB/s at 20 ms, 8.5 -> 20 at 100 ms (tsnet, same lab:
+  93, 22).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **core**: Fast-tcp repairs losses from SACKs, so send buffers grow too
+  ([`b64b001`](https://github.com/arkitektio/arkitekt-mesh/commit/b64b001bfb5c11dab0f6f2a41634af20ba2d6789))
+
+The fork gains SACK loss recovery (Socket::set_sack_recovery, RFC 6675 style): a scoreboard of what
+  the peer SACKed, the holes sent again instead of everything after the first (go-back-N), one
+  congestion event a loss instead of one a duplicate ACK, and the congestion window bounding what is
+  in flight, which upstream's never did. Its cubic is RFC 8312 in segments: upstream's worked in
+  octets and took ~90 s to regain a 1 MiB window.
+
+With it, fast-tcp's send buffers grow as the receive buffers do, from a shared 8 MiB budget
+  (Limits::tcp_send_buffer_max).
+
+Simulator, 100 ms, 1 MiB buffers, delivered/sent: 45% -> 95% at 1% loss. Lab, direct upload: one
+  stream 41 -> 103 MiB/s at 20 ms, 8.8 -> 23 at 100 ms; 8 streams at 20 ms 206 (9 with send growth
+  but no SACK).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **core**: Fast-tcp retransmits after 200 ms and holds 32 out-of-order ranges
+  ([`4b3f686`](https://github.com/arkitektio/arkitekt-mesh/commit/4b3f686d33679569bb459ea2edf2e3f29c779762))
+
+The fork gains Socket::set_min_rto (RFC 6298's 1 s stays the default); fast-tcp sets Linux's 200 ms,
+  and smoltcp's assembler holds 32 ranges instead of 4, so a receiver with more holes keeps what
+  arrives.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **core**: Fast-tcp's receive buffers grow from one budget; send growth, off
+  ([`fe7ccf1`](https://github.com/arkitektio/arkitekt-mesh/commit/fe7ccf1b442c3626d686c1a597333676819ce340))
+
+The receive buffers now grow from Limits::tcp_buffer_max for all of them, not each: what their
+  windows let the peers send arrives through one UDP socket and one loop, and 8 streams of 8 MiB
+  each overran it (10,000 dropped datagrams a run in the lab). One stream may still take all of it.
+
+The fork also grows a transmit buffer (Socket::set_tx_buffer_max, as Linux's tcp_sndbuf_expand),
+  behind Limits::tcp_send_buffer_max, which stays 0: with megabytes in flight and go-back-N
+  retransmits, one loss resends them all (8 uploads at 20 ms in the lab: 230 -> 9 MiB/s), until
+  retransmits are selective.
+
+CI also tests mesh-core alone, on upstream smoltcp.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **embassy**: Mesh::restart, the same node started over
+  ([`412493c`](https://github.com/arkitektio/arkitekt-mesh/commit/412493c000af2b550a3736e7f819f7a7837955cb))
+
+After control refused a node or could not be reached before it joined, run() ends; a board then made
+  a new Mesh for every attempt, leaking one each time. Mesh::restart(config) starts the same node
+  over in place (the config is a RefCell now, borrowed briefly). checks/embassy `--restart` (in CI):
+  refused with a wrong key, restarted with the right one, then the usual scenario.
+
+tests/lab.rs: a node ionskale knows rejoins without its key and with its key expired (a board's
+  later boots), as ionskale's registration takes a known machine and node key whatever the auth key.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **smoltcp**: Smoltcp's name for the fork, for a firmware's patch
+  ([`54edbd9`](https://github.com/arkitektio/arkitekt-mesh/commit/54edbd969f409d08ffda7cec462135c24d858d79))
+
+crates/smoltcp-patch is a package named smoltcp 0.13.1 (unpublished, outside the workspace) that
+  re-exports the fork with every feature, so a firmware's [patch.crates-io] puts embassy-net on it
+  too: one TCP/IP stack with SACK recovery, not upstream's plus ours. ESP32-S3 with the mesh: +5.5
+  KB of flash over upstream, against +40 KB for both stacks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Testing
+
+- **embassy**: The board's TLS under the driver (RFC-9 phase 7a)
+  ([`a3bfc24`](https://github.com/arkitektio/arkitekt-mesh/commit/a3bfc24cdf804beeb99cf65a1ab5a5b70bb1a559))
+
+checks/embassy `--board-tls` dials control and DERP through arkitekt-embassy's conn::open (the
+  firmware's TLS) over the host's TCP, with arkitekt-embassy's runtime for its clock;
+  MESH_CHECK_ECHO_KIB sets the echo's size. It found that embedded-tls (arkirust 0.16) loses a
+  record header when a read is cancelled: a 256 KiB echo over DERP stalled every time, where rustls
+  passed in 3 s. arkitekt-embassy's TLS is now rustls's unbuffered client (arkirust, unreleased): 1
+  MiB in 4.4 s through it. RFC-9 records it; the CI step follows arkirust's release.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **lab**: The peer on one CPU, and netem's queue out of the way
+  ([`a4e6df8`](https://github.com/arkitektio/arkitekt-mesh/commit/a4e6df8692f7d04fcdbaceafa0ce70a87c7d0fc4))
+
+Spread over several CPUs, the packets netem held back overtook each other in blocks of up to 64,
+  which cost a smoltcp receiver 3x at 20 ms; and netem's 1000-packet queue capped our datagrams (but
+  not tsnet's GSO batches) at ~12 MiB/s at 100 ms, which stalled 8-stream uploads.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+- **lab**: The relay's queue depth as a knob, the peer's tailscale counters
+  ([`5b8c5dd`](https://github.com/arkitektio/arkitekt-mesh/commit/5b8c5dd6eeefebd4c66371a80e8cc551357ba86e))
+
+MESH_LAB_DERP_QUEUE sets ionskale's per-receiver DERP queue
+  (TS_DEBUG_DERP_PER_CLIENT_SEND_QUEUE_DEPTH); the peer serves tailscale's clientmetrics at
+  /debug/metrics (e.g. its DERP sends dropped).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.8.0 (2026-10-25)
 
 ### Bug Fixes
