@@ -51,6 +51,7 @@ pub struct Netstack {
     next_port: u16,
     tcp_buffer: usize,
     listen_buffer: usize,
+    tcp_buffer_max: usize,
     congestion: Congestion,
 }
 
@@ -72,6 +73,7 @@ impl Netstack {
             next_port: 49152 + (crate::random::u32() % 16000) as u16,
             tcp_buffer: TCP_BUFFER,
             listen_buffer: TCP_BUFFER,
+            tcp_buffer_max: 0,
             congestion: Congestion::None,
         };
         stack.set_addresses(addresses);
@@ -87,6 +89,13 @@ impl Netstack {
     /// connections they accept, from now on.
     pub fn set_listen_buffer(&mut self, bytes: usize) {
         self.listen_buffer = bytes.max(1024);
+    }
+
+    /// How far the receive buffer of sockets opened from now on may grow,
+    /// as their application keeps up (0: not at all). Only with `fast-tcp`,
+    /// whose smoltcp fork tunes it; upstream's buffers stay as they start.
+    pub fn set_tcp_buffer_max(&mut self, bytes: usize) {
+        self.tcp_buffer_max = bytes;
     }
 
     /// The congestion control of sockets opened from now on.
@@ -131,6 +140,12 @@ impl Netstack {
         // floor), not RFC 6298's 1 s.
         #[cfg(feature = "fast-tcp")]
         socket.set_min_rto(crate::tcpip::time::Duration::from_millis(200));
+        // And a receive buffer that grows to what the application reads in
+        // a round trip (the window, so a connection's rate, follows).
+        #[cfg(feature = "fast-tcp")]
+        if self.tcp_buffer_max > buffer {
+            socket.set_rx_buffer_max(self.tcp_buffer_max);
+        }
         socket
     }
 

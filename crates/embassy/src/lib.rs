@@ -159,6 +159,7 @@ impl Config {
                 ipv4: true,
                 tcp_buffer: 16 << 10,
                 listen_buffer: 16 << 10,
+                tcp_buffer_max: 0,
                 congestion: Congestion::Reno,
                 handshake_queue: 8,
                 max_active_peers: 8,

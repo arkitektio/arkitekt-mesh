@@ -141,6 +141,28 @@ impl fmt::Display for State {
     }
 }
 
+/// Receive buffer auto-tuning (arkitekt-mesh's fork), as gVisor's and Linux's
+/// "dynamic right-sizing": once a round trip, the buffer grows to twice what
+/// the application read in the last one, never past `max`, never shrinking.
+#[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+struct RxAutoTune {
+    /// The largest the receive buffer may grow to; 0: it does not grow.
+    max: usize,
+    /// The smallest round trip seen from this end: the time it takes for
+    /// data a whole window past what was acknowledged to arrive.
+    rtt: Option<Duration>,
+    /// The round trip being measured: when, and the sequence number that
+    /// ends it.
+    rtt_from: Option<(Instant, TcpSeqNumber)>,
+    /// When the current round of `copied` began.
+    round_from: Option<Instant>,
+    /// Octets the application read this round, and in the last round the
+    /// buffer grew.
+    copied: usize,
+    prev_copied: usize,
+}
+
 /// RFC 6298: (2.1) Until a round-trip time (RTT) measurement has been made for a
 /// segment sent between the sender and receiver, the sender SHOULD
 /// set RTO <- 1 second,
@@ -470,6 +492,7 @@ pub struct Socket<'a> {
     state: State,
     timer: Timer,
     rtte: RttEstimator,
+    rx_auto: RxAutoTune,
     assembler: Assembler,
     rx_buffer: SocketBuffer<'a>,
     rx_fin_received: bool,
@@ -563,6 +586,7 @@ impl<'a> Socket<'a> {
     {
         let (rx_buffer, tx_buffer) = (rx_buffer.into(), tx_buffer.into());
         let rx_capacity = rx_buffer.capacity();
+        // (The window scale follows the buffer's largest size: see reset.)
 
         // From RFC 1323:
         // [...] the above constraints imply that 2 * the max window size must be less
@@ -578,6 +602,7 @@ impl<'a> Socket<'a> {
             state: State::Closed,
             timer: Timer::new(),
             rtte: RttEstimator::default(),
+            rx_auto: RxAutoTune::default(),
             assembler: Assembler::new(),
             tx_buffer,
             rx_buffer,
@@ -771,6 +796,33 @@ impl<'a> Socket<'a> {
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
 
+    /// Return how far the receive buffer may grow (0: it does not).
+    ///
+    /// See also the [set_rx_buffer_max](#method.set_rx_buffer_max) method.
+    pub fn rx_buffer_max(&self) -> usize {
+        self.rx_auto.max
+    }
+
+    /// Let the receive buffer grow, up to `max` octets, as the application
+    /// reads what arrives (receive buffer auto-tuning: once a round trip,
+    /// twice what was read in the last one). It only grows, and only owned
+    /// storage (a `Vec`) does. The window scale is chosen for `max`, so set
+    /// it before [connect](#method.connect) or [listen](#method.listen);
+    /// it is kept across a reset. 0 (the default) turns it off.
+    #[cfg(feature = "alloc")]
+    pub fn set_rx_buffer_max(&mut self, max: usize) {
+        #[cfg(not(target_pointer_width = "16"))]
+        if max > (1 << 30) {
+            panic!("receiving buffer too large, cannot exceed 1 GiB")
+        }
+        self.rx_auto.max = max;
+        if self.state == State::Closed {
+            let rx_largest = self.rx_buffer.capacity().max(max);
+            let rx_cap_log2 = mem::size_of::<usize>() * 8 - rx_largest.leading_zeros() as usize;
+            self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
+        }
+    }
+
     /// Return the lower bound of the retransmission timeout.
     ///
     /// See also the [set_min_rto](#method.set_min_rto) method.
@@ -904,14 +956,19 @@ impl<'a> Socket<'a> {
     }
 
     fn reset(&mut self) {
-        let rx_cap_log2 =
-            mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
+        // A buffer that may grow gets the window scale of its largest size.
+        let rx_largest = self.rx_buffer.capacity().max(self.rx_auto.max);
+        let rx_cap_log2 = mem::size_of::<usize>() * 8 - rx_largest.leading_zeros() as usize;
 
         self.state = State::Closed;
         self.timer = Timer::new();
         self.rtte = RttEstimator {
             min_rto: self.rtte.min_rto,
             ..RttEstimator::default()
+        };
+        self.rx_auto = RxAutoTune {
+            max: self.rx_auto.max,
+            ..RxAutoTune::default()
         };
         self.assembler = Assembler::new();
         self.tx_buffer.clear();
@@ -1318,6 +1375,62 @@ impl<'a> Socket<'a> {
         Ok(())
     }
 
+    /// Receive buffer auto-tuning, as in-order data arrives: measure the
+    /// round trip from this end, and once a round trip grow the buffer to
+    /// what the application keeps up with (gVisor's `ModerateRecvBuf`).
+    #[cfg(feature = "alloc")]
+    fn rx_auto_tune(&mut self, now: Instant) {
+        if self.rx_auto.max == 0 {
+            return;
+        }
+        // The round trip: from acknowledging up to `next` until data one
+        // window past it arrives (dynamic right-sizing; an upper bound
+        // unless the sender is held back by the window, the smallest kept).
+        let next = self.remote_seq_no + self.rx_buffer.len();
+        let advertised = (self.remote_last_win as usize) << self.remote_win_shift;
+        match self.rx_auto.rtt_from {
+            Some((from, until)) if next >= until => {
+                let rtt = now - from;
+                if self.rx_auto.rtt.is_none_or(|known| rtt < known) {
+                    self.rx_auto.rtt = Some(rtt);
+                }
+                self.rx_auto.rtt_from = Some((now, next + advertised));
+            }
+            Some(_) => {}
+            None => self.rx_auto.rtt_from = Some((now, next + advertised)),
+        }
+
+        let Some(rtt) = self.rx_auto.rtt else { return };
+        let Some(round_from) = self.rx_auto.round_from else {
+            // The first round, against an initial window's worth (Linux's
+            // rcvq_space): a sender that fills the buffer in a round trip
+            // has it doubled, until the sender, not the window, holds back.
+            self.rx_auto.round_from = Some(now);
+            self.rx_auto.prev_copied = self.rx_buffer.capacity().min(10 * self.remote_mss);
+            self.rx_auto.copied = 0;
+            return;
+        };
+        if now - round_from < rtt {
+            return;
+        }
+        let (copied, prev) = (self.rx_auto.copied, self.rx_auto.prev_copied);
+        if copied > prev {
+            // Twice what was read (for losses) and 16 segments to spare,
+            // more while the reads grow as a sender in slow start does.
+            let mss = self.remote_mss;
+            let want = (copied * 2 + 16 * mss) as u64;
+            let growth = want * (copied - prev) as u64 / prev.max(1) as u64;
+            let want = (want + 2 * growth).min(self.rx_auto.max as u64) as usize;
+            let want = want.max((2 * 10 * mss).min(self.rx_auto.max));
+            if want > self.rx_buffer.capacity() && self.rx_buffer.grow(want) {
+                net_debug!("rx buffer: grown to {} octets (rtt {})", want, rtt);
+            }
+            self.rx_auto.prev_copied = copied;
+        }
+        self.rx_auto.round_from = Some(now);
+        self.rx_auto.copied = 0;
+    }
+
     fn recv_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, RecvError>
     where
         F: FnOnce(&'b mut SocketBuffer<'a>) -> (usize, R),
@@ -1327,6 +1440,7 @@ impl<'a> Socket<'a> {
         let _old_length = self.rx_buffer.len();
         let (size, result) = f(&mut self.rx_buffer);
         self.remote_seq_no += size;
+        self.rx_auto.copied += size;
         if size > 0 {
             #[cfg(any(test, feature = "verbose"))]
             tcp_trace!(
@@ -2189,6 +2303,8 @@ impl<'a> Socket<'a> {
                 self.rx_buffer.len() + contig_len
             );
             self.rx_buffer.enqueue_unallocated(contig_len);
+            #[cfg(feature = "alloc")]
+            self.rx_auto_tune(cx.now());
 
             // There's new data in rx_buffer, notify waiting task if any.
             #[cfg(feature = "async")]
@@ -8751,6 +8867,78 @@ mod test {
         // Kept across a reset.
         s.reset();
         assert_eq!(s.min_rto(), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn test_rx_buffer_max_sets_the_window_scale() {
+        let mut s = socket_with_buffer_sizes(64, 64);
+        assert_eq!(s.remote_win_shift, 0);
+        s.set_rx_buffer_max(1 << 20);
+        assert_eq!(s.rx_buffer_max(), 1 << 20);
+        assert_eq!(s.remote_win_shift, 5);
+        // Kept across a reset, with its window scale.
+        s.reset();
+        assert_eq!(s.remote_win_shift, 5);
+    }
+
+    #[test]
+    fn test_rx_buffer_grows_with_the_reads() {
+        let mut s = socket_established_with_buffer_sizes(64, 16 * 1024);
+        s.set_rx_buffer_max(64 * 1024);
+        let mut seq = REMOTE_SEQ + 1;
+        // A sender held back by the window, a round trip of 10 ms, and an
+        // application that reads everything at once.
+        for round in 0..40 {
+            let at = Instant::from_millis(round * 10);
+            let len = s.rx_buffer.window();
+            let payload = vec![0x5a; len];
+            send(
+                &mut s,
+                at,
+                &TcpRepr {
+                    seq_number: seq,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &payload,
+                    ..SEND_TEMPL
+                },
+            );
+            seq += len;
+            let mut sink = vec![0; s.rx_buffer.len()];
+            assert_eq!(s.recv_slice(&mut sink), Ok(sink.len()));
+            // The ACK, with the window the read opened.
+            let _ = s.socket.dispatch(&mut s.cx, |_, _| Ok::<(), ()>(()));
+        }
+        assert_eq!(s.rx_buffer.capacity(), 64 * 1024, "grown up to its max");
+    }
+
+    #[test]
+    fn test_rx_buffer_stays_when_the_application_does_not_read() {
+        let mut s = socket_established_with_buffer_sizes(64, 1024);
+        s.set_rx_buffer_max(64 * 1024);
+        let mut seq = REMOTE_SEQ + 1;
+        for round in 0..40 {
+            let at = Instant::from_millis(round * 10);
+            let len = s.rx_buffer.window().min(64);
+            if len > 0 {
+                let payload = vec![0x5a; len];
+                send(
+                    &mut s,
+                    at,
+                    &TcpRepr {
+                        seq_number: seq,
+                        ack_number: Some(LOCAL_SEQ + 1),
+                        payload: &payload,
+                        ..SEND_TEMPL
+                    },
+                );
+                seq += len;
+            }
+            // A slow reader: 32 octets a round trip.
+            let mut sink = [0; 32];
+            let _ = s.recv_slice(&mut sink);
+            let _ = s.socket.dispatch(&mut s.cx, |_, _| Ok::<(), ()>(()));
+        }
+        assert_eq!(s.rx_buffer.capacity(), 1024);
     }
 
     #[test]

@@ -56,6 +56,31 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
         self.storage.len()
     }
 
+    /// Grow the buffer's storage to `capacity` elements, keeping what it
+    /// holds, and what is written past its end (as the unallocated octets a
+    /// TCP socket reassembles there), at the same offsets. Only owned
+    /// storage grows: returns whether the capacity is now at least
+    /// `capacity`. (arkitekt-mesh's fork.)
+    #[cfg(feature = "alloc")]
+    pub fn grow(&mut self, capacity: usize) -> bool
+    where
+        T: Clone + Default,
+    {
+        if capacity <= self.capacity() {
+            return true;
+        }
+        let ManagedSlice::Owned(old) = &self.storage else {
+            return false;
+        };
+        let mut new = alloc::vec::Vec::with_capacity(capacity);
+        new.extend_from_slice(&old[self.read_at..]);
+        new.extend_from_slice(&old[..self.read_at]);
+        new.resize(capacity, T::default());
+        self.storage = ManagedSlice::Owned(new);
+        self.read_at = 0;
+        true
+    }
+
     /// Clear the ring buffer, and reset every element.
     pub fn reset(&mut self)
     where
@@ -410,6 +435,35 @@ impl<'a, T: 'a> From<ManagedSlice<'a, T>> for RingBuffer<'a, T> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "alloc")]
+    fn test_grow_keeps_the_contents_and_what_is_past_them() {
+        let mut ring = RingBuffer::new(vec![0u8; 8]);
+        // Wrapped round: held "cdef", "gh" written past them (not yet
+        // enqueued, as out-of-order data is).
+        assert_eq!(ring.enqueue_slice(b"abcdef"), 6);
+        assert_eq!(ring.dequeue_slice(&mut [0; 2]), 2);
+        assert_eq!(ring.write_unallocated(0, b"gh"), 2);
+        assert!(ring.grow(16));
+        assert_eq!(ring.capacity(), 16);
+        assert_eq!(ring.len(), 4);
+        ring.enqueue_unallocated(2);
+        let mut out = [0; 6];
+        assert_eq!(ring.dequeue_slice(&mut out), 6);
+        assert_eq!(&out, b"cdefgh");
+        assert!(ring.grow(4), "never shrinks");
+        assert_eq!(ring.capacity(), 16);
+    }
+
+    #[test]
+    fn test_borrowed_storage_does_not_grow() {
+        let mut storage = [0u8; 8];
+        let mut ring = RingBuffer::new(&mut storage[..]);
+        #[cfg(feature = "alloc")]
+        assert!(!ring.grow(16));
+        assert_eq!(ring.capacity(), 8);
+    }
 
     #[test]
     fn test_buffer_length_changes() {

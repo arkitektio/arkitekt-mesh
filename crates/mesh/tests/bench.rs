@@ -13,7 +13,8 @@
 //!
 //! `MESH_BENCH_MIB` (64) bounds each transfer and `MESH_BENCH_SECS` (10) its
 //! time, whichever comes first. To compare settings: `MESH_BENCH_TCP_KIB`
-//! (the TCP buffer), `MESH_BENCH_CONGESTION` (`none`, `reno`, `cubic`),
+//! (the TCP buffer), `MESH_BENCH_TCP_MAX_KIB` (how far a receive buffer
+//! grows, with `fast-tcp`), `MESH_BENCH_CONGESTION` (`none`, `reno`, `cubic`),
 //! `MESH_BENCH_DERP_BURST`, and
 //! `MESH_BENCH_NETEM` and `MESH_BENCH_ROWS` (only the lab's link conditions,
 //! and transfers, whose name holds it). `MESH_BENCH_PART` runs one part:
@@ -90,6 +91,9 @@ fn limits() -> Limits {
     let mut limits = Limits::default();
     if let Ok(kib) = std::env::var("MESH_BENCH_TCP_KIB") {
         limits.tcp_buffer = kib.parse::<usize>().expect("MESH_BENCH_TCP_KIB") << 10;
+    }
+    if let Ok(kib) = std::env::var("MESH_BENCH_TCP_MAX_KIB") {
+        limits.tcp_buffer_max = kib.parse::<usize>().expect("MESH_BENCH_TCP_MAX_KIB") << 10;
     }
     if let Ok(burst) = std::env::var("MESH_BENCH_DERP_BURST") {
         limits.derp_burst = burst.parse().expect("MESH_BENCH_DERP_BURST");
