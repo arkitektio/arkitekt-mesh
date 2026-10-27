@@ -46,6 +46,11 @@ services:
     # For `lab.sh netem`: tc on the peer's own interface.
     cap_add:
       - NET_ADMIN
+    # On one CPU: spread over several, the packets netem holds back come
+    # out in blocks that overtake each other (up to 64 late), which no real
+    # link does and which costs a smoltcp receiver (no D-SACK) 3x at 20 ms.
+    # `MESH_LAB_PEER_CPUS=` (empty) lets it use them all.
+    cpuset: ${MESH_LAB_PEER_CPUS-0}
 
   # A LiveKit server that is only on the mesh: tailscaled with a real TUN
   # interface (joined to ionskale as lab-livekit), and livekit-server in its

@@ -14,7 +14,8 @@
 #   ./lab.sh prune              delete the machines tests left behind (t-*)
 #   ./lab.sh restart            restart ionskale (clients should reconnect)
 #   ./lab.sh netem SPEC...|off  shape what the peer sends (tc netem, e.g. `delay 20ms`,
-#                               `delay 100ms loss 1%`): a round trip for the benchmarks
+#                               `delay 100ms loss 1%`; queue `limit 100000` unless given):
+#                               a round trip for the benchmarks
 #   ./lab.sh ionscale ARGS...   any ionscale CLI command against the lab
 #   ./lab.sh livekit            start a LiveKit server that is only on the mesh
 #                               (lab-livekit:7880, dev keys; for the lovekit tests)
@@ -429,6 +430,10 @@ case "${1:-}" in
     if [ "$1" = off ]; then
       compose --profile peer exec -T peer tc qdisc del dev eth0 root 2>/dev/null || true
     else
+      # netem queues 1000 packets unless told: a GSO batch (tsnet's 64
+      # segments) is one, one datagram (ours) is one too, so at 100 ms the
+      # queue, not TCP, would cap us at ~12 MiB/s and not tsnet.
+      case " $* " in *" limit "*) ;; *) set -- "$@" limit 100000 ;; esac
       compose --profile peer exec -T peer tc qdisc replace dev eth0 root netem "$@"
     fi ;;
   ionscale) shift; ionscale "$@" ;;
