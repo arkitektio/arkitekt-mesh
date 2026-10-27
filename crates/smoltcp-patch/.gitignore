@@ -1,0 +1,4 @@
+# Its own workspace (outside the repo's): build output, and a lock a
+# firmware makes for itself.
+/target
+/Cargo.lock

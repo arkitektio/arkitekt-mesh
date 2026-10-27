@@ -9,6 +9,9 @@ members = [
     "crates/meshd",
     "crates/mesh-py",
 ]
+# smoltcp's name for the fork, for a firmware's [patch.crates-io]: a second
+# package called smoltcp beside upstream's would confuse `-p smoltcp`.
+exclude = ["crates/smoltcp-patch"]
 
 [workspace.package]
 version = "0.8.0"

@@ -26,6 +26,9 @@ jobs:
       - run: cargo clippy -p arkitekt-mesh-smoltcp --all-targets
       # The fork's simulator: upstream's snapshot, and SACK recovery's gain.
       - run: cargo test -p arkitekt-mesh-smoltcp --release --features _netsim,socket-tcp-cubic,socket-tcp-reno --test netsim
+      # smoltcp's name for the fork (a firmware's [patch.crates-io]), with
+      # what embassy-net asks of smoltcp.
+      - run: cargo check --manifest-path crates/smoltcp-patch/Cargo.toml --no-default-features --features medium-ethernet,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-udp,socket-dns,socket-dhcpv4,async
       - run: cargo test --workspace
       # mesh-core alone: on upstream smoltcp (the workspace has `fast-tcp`).
       - run: cargo test -p arkitekt-mesh-core

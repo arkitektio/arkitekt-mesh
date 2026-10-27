@@ -1,5 +1,12 @@
 # What the fork changes
 
+A firmware can put the fork under embassy-net too, so the board has one
+TCP/IP stack: `crates/smoltcp-patch` is a package named `smoltcp` 0.13.1 that
+re-exports it (cargo patches a crate only with one of its name, which
+crates.io will not take for us), for `[patch.crates-io]`, with the mesh
+crates from the same checkout or tag. On an ESP32-S3 with the mesh, that is
+5.5 KB more flash than upstream; the fork beside upstream is 40 KB.
+
 Forked from smoltcp 0.13.1 (crates.io). Each change is off by default and
 meant to go upstream.
 
