@@ -20,8 +20,9 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "arkitekt-mesh-core"
-version = "0.7.0"
+version = "0.10.0"
 dependencies = [
+ "arkitekt-mesh-smoltcp",
  "base64",
  "blake2",
  "chacha20poly1305",
@@ -42,7 +43,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-embassy"
-version = "0.7.0"
+version = "0.10.0"
 dependencies = [
  "arkitekt-mesh-core",
  "embassy-futures",
@@ -50,14 +51,25 @@ dependencies = [
  "embassy-time",
  "embedded-io-async",
  "embedded-nal-async",
- "smoltcp",
  "thiserror",
  "tracing",
 ]
 
 [[package]]
+name = "arkitekt-mesh-smoltcp"
+version = "0.10.0"
+dependencies = [
+ "bitflags",
+ "byteorder",
+ "cfg-if",
+ "defmt 0.3.101",
+ "heapless",
+ "managed",
+]
+
+[[package]]
 name = "arkitekt-mesh-web"
-version = "0.7.0"
+version = "0.10.0"
 dependencies = [
  "arkitekt-mesh-core",
  "arkitekt-mesh-embassy",
