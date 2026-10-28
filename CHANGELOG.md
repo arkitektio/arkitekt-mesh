@@ -1,6 +1,33 @@
 # CHANGELOG
 
 
+## v0.10.0 (2026-10-28)
+
+### Bug Fixes
+
+- **embassy**: A DERP region's slot is assigned before its packets go
+  ([`2e7d345`](https://github.com/arkitektio/arkitekt-mesh/commit/2e7d345eb70f5cf5517b8917076d2c5d497e7a22))
+
+The driver dispatched a batch of transmits before handling the events the same step raised, so the
+  first packets for a region just linked (the peer's home, on first contact) found no slot and were
+  dropped (the board's first WireGuard handshake and disco ping to the hub's node). The events go
+  first now; the packets wait in the new slot's queue until its connection is up.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Features
+
+- **smoltcp**: Ipv4-clear-dont-frag, IPv4 out without Don't Fragment
+  ([`0633151`](https://github.com/arkitektio/arkitekt-mesh/commit/063315145cd998a7af1552e78ae21815002c019d))
+
+smoltcp sets DF on every IPv4 packet but does no path MTU discovery, so on a path with a smaller MTU
+  a large packet and all its retransmissions are lost. A board on eduroam (path MTU ~1276) never got
+  its 1340-byte WireGuard datagrams through: the agent's REGISTER stalled. With the feature, routers
+  fragment them instead.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.9.0 (2026-10-27)
 
 ### Bug Fixes
