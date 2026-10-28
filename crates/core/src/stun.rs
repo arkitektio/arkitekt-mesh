@@ -109,7 +109,7 @@ fn crc32(data: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -126,7 +126,7 @@ mod tests {
     }
 
     /// A response like tailscale's stun server writes: one XOR-MAPPED-ADDRESS.
-    fn response(tx: &TxId, addr: SocketAddr) -> Vec<u8> {
+    pub(crate) fn response(tx: &TxId, addr: SocketAddr) -> Vec<u8> {
         let mut attr = vec![0];
         let mut key = MAGIC_COOKIE.to_vec();
         key.extend_from_slice(tx);

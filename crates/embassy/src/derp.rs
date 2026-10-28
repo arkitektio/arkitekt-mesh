@@ -6,7 +6,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 
-use embassy_futures::select::{select, select3, Either3};
+use embassy_futures::select::{select, select3, Either, Either3};
 use embedded_io_async::{Read, Write};
 
 use mesh_core::control::types::{DerpNode, DerpRegion};
@@ -108,19 +108,26 @@ impl Mesh {
         } else {
             format!("{}:{port}", node.host_name)
         };
+        // A slot given another region (or none) meanwhile gives up the dial:
+        // its TLS handshake is seconds of a board's CPU, for a region the
+        // core no longer wants (the default home, rehomed a moment later).
         let (opened, mut conn) = if D::WEBSOCKET {
             // By name: the WebSocket's TLS checks the certificate for it.
             let url = format!("wss://{authority}/derp");
-            let opened =
-                embassy_time::with_deadline(handshake_by, dial.websocket(&url, WEBSOCKET_PROTOCOL))
-                    .await;
+            let dialing =
+                embassy_time::with_deadline(handshake_by, dial.websocket(&url, WEBSOCKET_PROTOCOL));
+            let Either::First(opened) = select(dialing, self.moved_on(i, generation)).await else {
+                return Ok(());
+            };
             (
                 opened,
                 DerpConn::upgraded(self.config().node_key.clone(), home, now()),
             )
         } else {
-            let opened =
-                embassy_time::with_deadline(handshake_by, dial.dial(&host, port, tls)).await;
+            let dialing = embassy_time::with_deadline(handshake_by, dial.dial(&host, port, tls));
+            let Either::First(opened) = select(dialing, self.moved_on(i, generation)).await else {
+                return Ok(());
+            };
             (
                 opened,
                 DerpConn::new(&authority, self.config().node_key.clone(), home, now()),
@@ -184,6 +191,13 @@ impl Mesh {
     }
 
     /// Packets from the server into the core.
+    /// Done once slot `i` is no longer at `generation`.
+    async fn moved_on(&self, i: usize, generation: u32) {
+        while self.inner.borrow().slots[i].generation == generation {
+            self.slot_wake[i].wait().await;
+        }
+    }
+
     fn derp_events(&self, conn: &mut DerpConn, region: i32) {
         let mut inner = self.inner.borrow_mut();
         let inner = &mut *inner;

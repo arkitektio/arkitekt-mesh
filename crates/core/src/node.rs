@@ -35,6 +35,11 @@ use crate::{disco, stun};
 
 /// How often to ask STUN for our endpoint (plus up to 6 s of jitter).
 pub const STUN_INTERVAL: Duration = Duration::from_secs(20);
+/// How long a node with UDP waits for its first netcheck answer before it
+/// connects the default home region anyway (STUN blocked): connecting the
+/// default first and switching a moment later costs a TLS handshake, seconds
+/// on a board.
+pub const HOME_WAIT: Duration = Duration::from_secs(2);
 
 /// The home region and every measured region's latency (`<region>-v4`, in
 /// seconds), as control's `NetInfo` takes them.
@@ -99,6 +104,9 @@ pub struct NodeCore {
     netstack: Netstack,
     netmap: NetMap,
     home_region: Option<i32>,
+    /// Until when the home region waits for a netcheck before it is
+    /// connected; `None` once connected.
+    home_wait: Option<Instant>,
     /// The DERP connections asked for, by region, with the description
     /// each was made for.
     derp: BTreeMap<i32, DerpRegion>,
@@ -162,6 +170,7 @@ impl NodeCore {
             paths,
             netstack,
             home_region: pick_home(&netmap),
+            home_wait: Some(now + HOME_WAIT),
             netmap,
             derp: BTreeMap::new(),
             closing: Vec::new(),
@@ -186,10 +195,8 @@ impl NodeCore {
         };
         node.apply_lock();
         node.sync_peers();
-        // Connect the home region right away, so peers can reach us.
-        if let Some(home) = node.home_region {
-            node.link_derp(home);
-        }
+        // The home region is connected once the first netcheck answers (it
+        // may pick another), or at `HOME_WAIT`; see `link_home_when_due`.
         node
     }
 
@@ -214,6 +221,7 @@ impl NodeCore {
                         self.stun_endpoint6 = Some(addr);
                     }
                     self.rehome(now);
+                    self.link_home_when_due(now);
                 }
             }
             Vec::new()
@@ -280,13 +288,13 @@ impl NodeCore {
         for region in core::mem::take(&mut self.derp).into_keys() {
             self.events.push_back(Event::DropDerp { region });
         }
-        // A new network: old latencies say nothing about it.
+        // A new network: old latencies say nothing about it, and the home
+        // waits for new ones.
         self.netcheck = Netcheck::new();
         self.stun_endpoint = None;
         self.stun_endpoint6 = None;
-        if let Some(home) = self.home_region {
-            self.link_derp(home);
-        }
+        self.home_wait = Some(now + HOME_WAIT);
+        self.link_home_when_due(now);
         self.next_stun = now;
         self.next_netcheck = Some(now);
         self.reported.clear();
@@ -319,6 +327,7 @@ impl NodeCore {
     /// way a packet will go, so this holds back every socket (sending on would
     /// only drop packets and have TCP send them again).
     pub fn pump(&mut self, now: Instant, room: usize) -> Pumped {
+        self.link_home_when_due(now);
         let mut out = Pumped::default();
         let mut room = room;
         for _ in 0..64 {
@@ -462,6 +471,7 @@ impl NodeCore {
     pub fn poll_timeout(&mut self, now: Instant, held_back: bool) -> Instant {
         let mut deadline = self.next_stun;
         for d in [
+            self.home_wait,
             self.tunnel.next_deadline(),
             self.paths.next_deadline(now),
             // Held back, the stack always has something to send.
@@ -674,6 +684,7 @@ impl NodeCore {
                     self.events.push_back(Event::DropDerp { region: old });
                 }
             }
+            self.home_wait = None;
             self.link_derp(new);
             self.latencies_reported = !latencies.is_empty();
             self.events.push_back(Event::Home((Some(new), latencies)));
@@ -682,6 +693,23 @@ impl NodeCore {
             self.latencies_reported = true;
             self.events
                 .push_back(Event::Home((self.home_region, latencies)));
+        }
+    }
+
+    /// Connect the home region once it stops waiting: a netcheck answered
+    /// (`rehome` keeps it or picks another), `HOME_WAIT` passed, or there is
+    /// no UDP to measure with (a browser).
+    fn link_home_when_due(&mut self, now: Instant) {
+        let Some(until) = self.home_wait else {
+            return;
+        };
+        let measured = !self.netcheck.latencies(now).is_empty();
+        let no_udp = self.udp_port == 0 && self.udp_port6.is_none();
+        if measured || no_udp || now >= until {
+            self.home_wait = None;
+            if let Some(home) = self.home_region {
+                self.link_derp(home);
+            }
         }
     }
 
@@ -715,8 +743,10 @@ impl NodeCore {
             self.derp.remove(&region);
             self.events.push_back(Event::DropDerp { region });
         }
-        if let Some(home) = self.home_region {
-            self.link_derp(home);
+        if self.home_wait.is_none() {
+            if let Some(home) = self.home_region {
+                self.link_derp(home);
+            }
         }
     }
 }
@@ -763,6 +793,103 @@ mod tests {
     use super::*;
     use crate::control::types::Node as NetNode;
     use crate::keys::PublicKey;
+
+    /// A node of a tailnet with DERP regions 1 and 4, nothing measured yet.
+    fn two_regions(now: Instant) -> NodeCore {
+        let region = |id: u8| {
+            format!(
+                r#""{id}": {{"RegionID": {id}, "Nodes": [{{"Name": "r{id}", "HostName": "127.0.0.{id}",
+                    "IPv4": "127.0.0.{id}", "IPv6": "none", "STUNPort": 3478, "DERPPort": 443}}]}}"#
+            )
+        };
+        let json = format!(
+            r#"{{"Node": {{"ID": 1, "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000001",
+                 "Addresses": ["100.64.0.9/32"]}},
+                 "DERPMap": {{"Regions": {{{}, {}}}}}}}"#,
+            region(1),
+            region(4)
+        );
+        let mut netmap = NetMap::default();
+        netmap.apply(serde_json::from_str(&json).unwrap());
+        let node_key = PrivateKey::generate();
+        let paths = Paths::new(PrivateKey::generate(), NodePublic(node_key.public()));
+        let settings = Settings {
+            direct: true,
+            ipv4: true,
+            tcp_buffer: 4096,
+            listen_buffer: 4096,
+            tcp_buffer_max: 0,
+            tcp_send_buffer_max: 0,
+            congestion: Congestion::Reno,
+            handshake_queue: 8,
+            max_active_peers: 8,
+            udp_flows: 16,
+            netcheck_interval: None,
+        };
+        NodeCore::new(
+            node_key,
+            paths,
+            netmap,
+            BTreeMap::new(),
+            Lock::new(None),
+            settings,
+            now,
+        )
+    }
+
+    fn derp_connects(node: &mut NodeCore) -> Vec<i32> {
+        core::iter::from_fn(|| node.poll_event())
+            .filter_map(|e| match e {
+                Event::ConnectDerp { region, .. } => Some(region),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The default home (region 1) is not dialled when the first netcheck
+    /// answer picks another: one TLS handshake fewer, seconds on a board.
+    #[test]
+    fn the_home_waits_for_the_first_netcheck() {
+        let now = Instant::ZERO;
+        let mut node = two_regions(now);
+        node.set_udp_ports(41641, None);
+        node.pump(now, 64);
+        assert_eq!(derp_connects(&mut node), Vec::<i32>::new());
+
+        let requests = node.stun(now, None, None);
+        let (to, probe) = requests
+            .iter()
+            .find(|(addr, _)| addr.ip().to_string() == "127.0.0.4")
+            .unwrap();
+        let tx = stun::transaction(probe).unwrap();
+        let answer = stun::tests::response(&tx, "198.51.100.7:41641".parse().unwrap());
+        node.handle_datagram(now + Duration::from_millis(20), *to, &answer);
+        node.pump(now + Duration::from_millis(20), 64);
+        assert_eq!(derp_connects(&mut node), [4]);
+        assert_eq!(node.home_region(), Some(4));
+    }
+
+    /// No answer (STUN blocked): the default home after `HOME_WAIT`.
+    #[test]
+    fn without_a_netcheck_answer_the_default_home_after_the_wait() {
+        let now = Instant::ZERO;
+        let mut node = two_regions(now);
+        node.set_udp_ports(41641, None);
+        node.pump(now, 64);
+        let _ = node.stun(now, None, None);
+        assert_eq!(node.poll_timeout(now, false), now + HOME_WAIT);
+        node.pump(now + HOME_WAIT, 64);
+        assert_eq!(derp_connects(&mut node), [1]);
+    }
+
+    /// Without UDP (a browser) nothing is measured: the home right away.
+    #[test]
+    fn without_udp_the_home_right_away() {
+        let now = Instant::ZERO;
+        let mut node = two_regions(now);
+        node.pump(now, 64);
+        assert_eq!(derp_connects(&mut node), [1]);
+    }
 
     fn packet(src: [u8; 4], dst: [u8; 4]) -> Vec<u8> {
         let mut p = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 6, 0, 0];
