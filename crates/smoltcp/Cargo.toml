@@ -103,6 +103,13 @@ defmt = ["dep:defmt", "heapless/defmt"]
 # Automatically reply on an ICMP echo request
 "auto-icmp-echo-reply" = []
 
+# (arkitekt-mesh) IPv4 packets go out without Don't Fragment, so a router on
+# a path with a smaller MTU fragments them instead of dropping them. smoltcp
+# does no path MTU discovery (it ignores ICMP "fragmentation needed"), so with
+# DF a packet over the path's MTU is lost, and so is every retransmission: a
+# board on eduroam (path MTU ~1276) sends 1340-byte WireGuard datagrams.
+"ipv4-clear-dont-frag" = ["proto-ipv4"]
+
 default = [
   "std", "log", # needed for `cargo test --no-default-features --features default` :/
   "medium-ethernet", "medium-ip", "medium-ieee802154",

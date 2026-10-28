@@ -595,7 +595,7 @@ impl Repr {
         packet.set_ident(0);
         packet.clear_flags();
         packet.set_more_frags(false);
-        packet.set_dont_frag(true);
+        packet.set_dont_frag(!cfg!(feature = "ipv4-clear-dont-frag"));
         packet.set_frag_offset(0);
         packet.set_hop_limit(self.hop_limit);
         packet.set_next_header(self.next_header);
@@ -853,6 +853,7 @@ pub(crate) mod test {
     }
 
     #[test]
+    #[cfg(not(feature = "ipv4-clear-dont-frag"))]
     fn test_emit() {
         let repr = packet_repr();
         let mut bytes = vec![0xa5; repr.buffer_len() + REPR_PAYLOAD_BYTES.len()];
@@ -860,6 +861,24 @@ pub(crate) mod test {
         repr.emit(&mut packet, &ChecksumCapabilities::default());
         packet.payload_mut().copy_from_slice(&REPR_PAYLOAD_BYTES);
         assert_eq!(&*packet.into_inner(), &REPR_PACKET_BYTES[..]);
+    }
+
+    #[test]
+    #[cfg(feature = "ipv4-clear-dont-frag")]
+    fn test_emit_without_dont_frag() {
+        let repr = packet_repr();
+        let mut bytes = vec![0xa5; repr.buffer_len() + REPR_PAYLOAD_BYTES.len()];
+        let mut packet = Packet::new_unchecked(&mut bytes);
+        repr.emit(&mut packet, &ChecksumCapabilities::default());
+        packet.payload_mut().copy_from_slice(&REPR_PAYLOAD_BYTES);
+        let bytes = packet.into_inner();
+        let packet = Packet::new_checked(&*bytes).unwrap();
+        assert!(!packet.dont_frag());
+        assert!(packet.verify_checksum());
+        assert_eq!(
+            Repr::parse(&packet, &ChecksumCapabilities::default()),
+            Ok(packet_repr())
+        );
     }
 
     #[test]
