@@ -196,8 +196,10 @@ impl Mesh {
             };
             let transmits = core.handle_derp(now(), region, from, &data);
             core.link_derp_for(&transmits);
-            self.dispatch(inner, transmits);
+            // The slots first: a packet for a region just linked waits in
+            // its queue instead of being dropped.
             self.events(inner);
+            self.dispatch(inner, transmits);
         }
         self.node_wake.signal(());
     }

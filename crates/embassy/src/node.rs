@@ -37,8 +37,10 @@ impl Mesh {
                 };
                 core.link_derp_for(&pumped.transmits);
                 inner.udp_out.extend(stun);
-                self.dispatch(inner, pumped.transmits);
+                // The slots first: a packet for a region just linked waits
+                // in its queue instead of being dropped.
                 self.events(inner);
+                self.dispatch(inner, pumped.transmits);
                 let core = inner.core.as_mut().expect("core");
                 core.after_pass(t);
                 Some(core.poll_timeout(t, pumped.held_back))
@@ -66,8 +68,8 @@ impl Mesh {
                 if let Some(core) = inner.core.as_mut() {
                     let transmits = core.handle_datagram(now(), src, &buf[..n]);
                     core.link_derp_for(&transmits);
-                    self.dispatch(inner, transmits);
                     self.events(inner);
+                    self.dispatch(inner, transmits);
                 }
             }
         }
