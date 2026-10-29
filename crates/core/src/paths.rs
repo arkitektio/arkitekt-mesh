@@ -20,7 +20,7 @@ use alloc::sync::Arc;
 use core::net::SocketAddr;
 use hashbrown::HashMap;
 
-use crate::disco::{self, Message, TxId};
+use crate::disco::{self, DiscoKeys, Message, TxId};
 use crate::keys::{DiscoPublic, NodePublic, PrivateKey};
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
@@ -120,7 +120,7 @@ impl Peer {
 }
 
 pub struct Paths {
-    disco: PrivateKey,
+    disco: DiscoKeys,
     node_key: NodePublic,
     /// Peers in use.
     peers: HashMap<NodePublic, Peer>,
@@ -133,7 +133,7 @@ pub struct Paths {
 impl Paths {
     pub fn new(disco: PrivateKey, node_key: NodePublic) -> Self {
         Self {
-            disco,
+            disco: DiscoKeys::new(disco),
             node_key,
             peers: HashMap::new(),
             endpoints: Vec::new(),
@@ -142,7 +142,7 @@ impl Paths {
     }
 
     pub fn disco_public(&self) -> DiscoPublic {
-        DiscoPublic(self.disco.public())
+        self.disco.public()
     }
 
     /// Turn direct UDP paths off (DERP only).
@@ -253,7 +253,7 @@ impl Paths {
             return out;
         };
         let node = info.node_key;
-        let Some((_, msg)) = disco::open(&self.disco, packet) else {
+        let Some(msg) = self.disco.open(&sender, packet) else {
             return out;
         };
         // Pings and CallMeMaybe start a conversation; pongs answer ours.
@@ -291,7 +291,7 @@ impl Paths {
                 if !allowed {
                     return out;
                 }
-                let pong = disco::seal(&self.disco, &their_disco, &Message::Pong { tx, src });
+                let pong = self.disco.seal(&their_disco, &Message::Pong { tx, src });
                 out.push(Transmit { via, data: pong });
             }
             Message::Pong { tx, .. } => {
@@ -412,9 +412,10 @@ impl Paths {
             tx,
             node_key: Some(self.node_key),
         };
+        let to = p.info.disco_key;
         out.push(Transmit {
             via: Via::Udp(addr),
-            data: disco::seal(&self.disco, &p.info.disco_key, &ping),
+            data: self.disco.seal(&to, &ping),
         });
     }
 
@@ -457,7 +458,7 @@ impl Paths {
             };
             out.push(Transmit {
                 via: derp,
-                data: disco::seal(&self.disco, &disco_key, &cmm),
+                data: self.disco.seal(&disco_key, &cmm),
             });
         }
     }
@@ -590,7 +591,7 @@ mod tests {
         introduce(&mut a, &b, 3);
         introduce(&mut b, &a, 3);
         let ping = disco::seal(
-            &a.paths.disco,
+            &a.paths.disco.private,
             &b.disco,
             &Message::Ping {
                 tx: [5; 12],
@@ -614,7 +615,7 @@ mod tests {
                 peer: a.node
             }
         );
-        let (_, pong) = disco::open(&a.paths.disco, &out[0].data).unwrap();
+        let (_, pong) = disco::open(&a.paths.disco.private, &out[0].data).unwrap();
         assert_eq!(
             pong,
             Message::Pong {
@@ -678,7 +679,7 @@ mod tests {
         let b_disco = b.disco;
         let ping = |tx: u8| {
             disco::seal(
-                &a.paths.disco,
+                &a.paths.disco.private,
                 &b_disco,
                 &Message::Ping {
                     tx: [tx; 12],
@@ -707,7 +708,7 @@ mod tests {
         let stranger = side("10.0.0.3:3000");
         introduce(&mut a, &b, 1);
         let ping = disco::seal(
-            &stranger.paths.disco,
+            &stranger.paths.disco.private,
             &a.disco,
             &Message::Ping {
                 tx: [1; 12],

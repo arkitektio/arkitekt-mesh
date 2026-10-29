@@ -8,6 +8,8 @@
 use crate::prelude::*;
 use core::net::{IpAddr, Ipv6Addr, SocketAddr};
 
+use hashbrown::HashMap;
+
 use crate::keys::{DiscoPublic, NodePublic, PrivateKey, PublicKey};
 use crate::nacl::SharedBox;
 
@@ -124,24 +126,105 @@ fn get_addr(b: &[u8]) -> Option<SocketAddr> {
 
 /// Seal `msg` from us to the peer with disco key `to`.
 pub fn seal(ours: &PrivateKey, to: &DiscoPublic, msg: &Message) -> Vec<u8> {
-    let mut out = MAGIC.to_vec();
-    out.extend_from_slice(&ours.public().0);
-    out.extend_from_slice(&SharedBox::new(ours, &to.0).seal(&msg.encode()));
-    out
+    sealed(
+        &DiscoPublic(ours.public()),
+        &SharedBox::new(ours, &to.0),
+        msg,
+    )
 }
 
 /// Open a disco packet addressed to us: `(sender, message)`.
 pub fn open(ours: &PrivateKey, packet: &[u8]) -> Option<(DiscoPublic, Message)> {
     let from = sender(packet)?;
-    let plain = SharedBox::new(ours, &from.0)
-        .open(&packet[HEADER_LEN..])
-        .ok()?;
-    Some((from, Message::decode(&plain)?))
+    let message = opened(&SharedBox::new(ours, &from.0), packet)?;
+    Some((from, message))
+}
+
+fn sealed(ours: &DiscoPublic, shared: &SharedBox, msg: &Message) -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    out.extend_from_slice(&ours.0 .0);
+    out.extend_from_slice(&shared.seal(&msg.encode()));
+    out
+}
+
+fn opened(shared: &SharedBox, packet: &[u8]) -> Option<Message> {
+    Message::decode(&shared.open(&packet[HEADER_LEN..]).ok()?)
+}
+
+/// Peers' boxes kept at most; past that the cache starts over.
+const BOXES: usize = 64;
+
+/// Our disco key, with its public half and the box shared with each peer
+/// computed once. Each is an X25519: on an ESP32-S3 about 18 ms, and a
+/// ping answered with a pong took three of them.
+pub struct DiscoKeys {
+    pub(crate) private: PrivateKey,
+    public: DiscoPublic,
+    boxes: HashMap<DiscoPublic, SharedBox>,
+}
+
+impl DiscoKeys {
+    pub fn new(private: PrivateKey) -> Self {
+        Self {
+            public: DiscoPublic(private.public()),
+            private,
+            boxes: HashMap::new(),
+        }
+    }
+
+    pub fn public(&self) -> DiscoPublic {
+        self.public
+    }
+
+    /// Seal `msg` from us to the peer with disco key `to`.
+    pub fn seal(&mut self, to: &DiscoPublic, msg: &Message) -> Vec<u8> {
+        let public = self.public;
+        sealed(&public, self.shared(to), msg)
+    }
+
+    /// Open a packet from `from` (its [`sender`], already known to be a
+    /// peer: only peers get a box kept).
+    pub fn open(&mut self, from: &DiscoPublic, packet: &[u8]) -> Option<Message> {
+        opened(self.shared(from), packet)
+    }
+
+    fn shared(&mut self, peer: &DiscoPublic) -> &SharedBox {
+        if self.boxes.len() >= BOXES && !self.boxes.contains_key(peer) {
+            self.boxes.clear();
+        }
+        let private = &self.private;
+        self.boxes
+            .entry(*peer)
+            .or_insert_with(|| SharedBox::new(private, &peer.0))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kept_boxes_speak_with_fresh_ones_one_per_peer() {
+        let a = PrivateKey::generate();
+        let b = PrivateKey::generate();
+        let b_public = DiscoPublic(b.public());
+        let mut keys = DiscoKeys::new(a.clone());
+        let ping = Message::Ping {
+            tx: [7; 12],
+            node_key: None,
+        };
+        let sealed = keys.seal(&b_public, &ping);
+        assert_eq!(open(&b, &sealed), Some((keys.public(), ping)));
+
+        let pong = Message::Pong {
+            tx: [7; 12],
+            src: "1.2.3.4:5".parse().unwrap(),
+        };
+        let answer = seal(&b, &keys.public(), &pong);
+        assert_eq!(sender(&answer), Some(b_public));
+        assert_eq!(keys.open(&b_public, &answer), Some(pong));
+        assert_eq!(keys.boxes.len(), 1);
+    }
 
     #[test]
     fn messages_round_trip() {
