@@ -1,6 +1,22 @@
 # CHANGELOG
 
 
+## v0.10.2 (2026-10-29)
+
+### Performance Improvements
+
+- **core**: Disco boxes kept per peer, our disco public computed once
+  ([`d3d9278`](https://github.com/arkitektio/arkitekt-mesh/commit/d3d92785c06d34cac001c0979421599cf9c39f2f))
+
+Every disco message made its NaCl box anew, and seal also recomputed our public key: a ping answered
+  with a pong took three X25519s, about 56 ms on an ESP32-S3. tailscale ping from the hub's node to
+  the board on the same campus: 56 ms before, 7-23 ms after (the rest is the Wi-Fi).
+
+Only peers get a box (on_disco looks the sender up first); past 64 the cache starts over.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.10.1 (2026-10-29)
 
 ### Bug Fixes
