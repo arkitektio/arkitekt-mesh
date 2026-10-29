@@ -1,6 +1,30 @@
 # CHANGELOG
 
 
+## v0.10.1 (2026-10-29)
+
+### Bug Fixes
+
+- The first DERP home waits for a netcheck; a dropped region's dial is given up
+  ([`e7a15a8`](https://github.com/arkitektio/arkitekt-mesh/commit/e7a15a83c1433245732475e3bc3d6dcd5305d1cb))
+
+A node connected its default home (the lowest region) at start and rehomed a moment later when the
+  first netcheck answered, so a board did a full TLS handshake (seconds of its CPU) for a region it
+  dropped at once, and the embassy driver did not even stop it: a slot's dial now gives up when the
+  slot moves on. With UDP the home waits for the first netcheck answer, at most HOME_WAIT (2 s);
+  without UDP (a browser) it connects right away. First contact on the ESP32-S3 after a reset: 12 s
+  -> 9 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Chores
+
+- The checks' lockfiles at 0.10.0, with the smoltcp fork
+  ([`eb54c24`](https://github.com/arkitektio/arkitekt-mesh/commit/eb54c24269b046eb67984dc5764c0e8d771386f9))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.10.0 (2026-10-28)
 
 ### Bug Fixes
