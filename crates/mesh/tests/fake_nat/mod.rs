@@ -1,6 +1,8 @@
-//! A fake NAT gateway for the port-mapping tests: it answers PCP or NAT-PMP
-//! on 127.0.0.1, and for each mapping binds a real "external" socket on
-//! 127.0.0.2 that forwards datagrams both ways to the node's internal port.
+//! A fake NAT gateway for the port-mapping tests: it answers PCP, NAT-PMP
+//! or UPnP IGD (SSDP on its UDP socket, the description and SOAP control
+//! over HTTP) on 127.0.0.1, and for each mapping binds a real "external"
+//! socket on 127.0.0.2 that forwards datagrams both ways to the node's
+//! internal port.
 
 #![allow(dead_code)]
 
@@ -9,13 +11,15 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::net::UdpSocket;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinHandle;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Speaks {
     Pcp,
     NatPmp,
+    Upnp,
 }
 
 pub const EXTERNAL_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 2);
@@ -44,11 +48,15 @@ pub struct Gateway {
     lifetime: Arc<AtomicU32>,
     state: Arc<Mutex<State>>,
     task: JoinHandle<()>,
+    http: Option<JoinHandle<()>>,
 }
 
 impl Drop for Gateway {
     fn drop(&mut self) {
         self.task.abort();
+        if let Some(http) = &self.http {
+            http.abort();
+        }
         for m in self.state.lock().unwrap().mappings.values() {
             m.task.abort();
         }
@@ -65,9 +73,23 @@ impl Gateway {
             epoch_base: std::time::Instant::now(),
             mappings: HashMap::new(),
         }));
+        let (http, location) = if speaks == Speaks::Upnp {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let location = format!("http://{}/rootDesc.xml", listener.local_addr().unwrap());
+            let task = tokio::spawn(serve_http(
+                listener,
+                counters.clone(),
+                lifetime.clone(),
+                state.clone(),
+            ));
+            (Some(task), location)
+        } else {
+            (None, String::new())
+        };
         let task = tokio::spawn(serve(
             socket,
             speaks,
+            location,
             counters.clone(),
             lifetime.clone(),
             state.clone(),
@@ -78,6 +100,7 @@ impl Gateway {
             lifetime,
             state,
             task,
+            http,
         }
     }
 
@@ -114,6 +137,7 @@ impl Gateway {
 async fn serve(
     socket: Arc<UdpSocket>,
     speaks: Speaks,
+    location: String,
     counters: Arc<Counters>,
     lifetime: Arc<AtomicU32>,
     state: Arc<Mutex<State>>,
@@ -129,8 +153,9 @@ async fn serve(
             (Speaks::Pcp, Some(2)) if req.len() >= 60 && req[1] == 1 => {
                 let internal = u16::from_be_bytes([req[40], req[41]]);
                 let asked = u32::from_be_bytes(req[4..8].try_into().unwrap());
-                let (external, granted) =
-                    handle(&state, &counters, internal, asked, &lifetime).await;
+                let (external, granted) = handle(&state, &counters, internal, 0, asked, &lifetime)
+                    .await
+                    .unwrap();
                 let mut resp = req.clone();
                 resp[1] = 0x81;
                 resp[3] = 0;
@@ -150,8 +175,9 @@ async fn serve(
             (Speaks::NatPmp, Some(0)) if req.len() >= 12 && req[1] == 1 => {
                 let internal = u16::from_be_bytes([req[4], req[5]]);
                 let asked = u32::from_be_bytes(req[8..12].try_into().unwrap());
-                let (external, granted) =
-                    handle(&state, &counters, internal, asked, &lifetime).await;
+                let (external, granted) = handle(&state, &counters, internal, 0, asked, &lifetime)
+                    .await
+                    .unwrap();
                 let mut resp = vec![0, 129, 0, 0];
                 resp.extend_from_slice(&epoch.to_be_bytes());
                 resp.extend_from_slice(&internal.to_be_bytes());
@@ -159,6 +185,14 @@ async fn serve(
                 resp.extend_from_slice(&granted.to_be_bytes());
                 Some(resp)
             }
+            (Speaks::Upnp, Some(b'M')) if req.starts_with(b"M-SEARCH") => Some(
+                format!(
+                    "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=120\r\n\
+                     ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\
+                     LOCATION: {location}\r\n\r\n"
+                )
+                .into_bytes(),
+            ),
             // Not the protocol this gateway speaks: silence.
             _ => None,
         };
@@ -168,15 +202,129 @@ async fn serve(
     }
 }
 
-/// Map (or delete, lifetime 0) `internal`; returns its external address and
-/// the lifetime granted.
+const DESCRIPTION: &str = r#"<?xml version="1.0"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0"><device>
+<deviceType>urn:schemas-upnp-org:device:InternetGatewayDevice:1</deviceType>
+<deviceList><device><deviceList><device><serviceList><service>
+<serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+<controlURL>/ctl/IPConn</controlURL>
+</service></serviceList></device></deviceList></device></deviceList>
+</device></root>"#;
+
+/// The UPnP gateway's HTTP side: its description, and SOAP control.
+async fn serve_http(
+    listener: TcpListener,
+    counters: Arc<Counters>,
+    lifetime: Arc<AtomicU32>,
+    state: Arc<Mutex<State>>,
+) {
+    while let Ok((stream, _)) = listener.accept().await {
+        let (counters, lifetime, state) = (counters.clone(), lifetime.clone(), state.clone());
+        tokio::spawn(async move {
+            let _ = answer(stream, &counters, &lifetime, &state).await;
+        });
+    }
+}
+
+async fn answer(
+    mut stream: TcpStream,
+    counters: &Arc<Counters>,
+    lifetime: &AtomicU32,
+    state: &Arc<Mutex<State>>,
+) -> std::io::Result<()> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    let request = loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        raw.extend_from_slice(&buf[..n]);
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let Some(end) = text.find("\r\n\r\n") else {
+            continue;
+        };
+        let length = text[..end]
+            .lines()
+            .find_map(|l| l.strip_prefix("Content-Length: "))
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(0);
+        if raw.len() >= end + 4 + length {
+            break text;
+        }
+    };
+    let field = |name: &str| -> Option<String> {
+        let open = format!("<{name}>");
+        let start = request.find(&open)? + open.len();
+        let len = request[start..].find('<')?;
+        Some(request[start..start + len].to_owned())
+    };
+    let ok = |action: &str, fields: String| {
+        format!(
+            "<s:Envelope><s:Body><u:{action}Response xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">{fields}</u:{action}Response></s:Body></s:Envelope>"
+        )
+    };
+    let fault = |code: u16| {
+        format!(
+            "<s:Envelope><s:Body><s:Fault><detail><UPnPError><errorCode>{code}</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>"
+        )
+    };
+    let (status, body) = if request.starts_with("GET /rootDesc.xml") {
+        (200, DESCRIPTION.to_owned())
+    } else if request.contains("#GetExternalIPAddress") {
+        let ip = format!("<NewExternalIPAddress>{EXTERNAL_IP}</NewExternalIPAddress>");
+        (200, ok("GetExternalIPAddress", ip))
+    } else if request.contains("#AddPortMapping") {
+        let port = |name| field(name).and_then(|v| v.parse::<u16>().ok()).unwrap_or(0);
+        let (external, internal) = (port("NewExternalPort"), port("NewInternalPort"));
+        // UPnP's lease 0 is "until deleted", not a delete.
+        let lease = field("NewLeaseDuration")
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|l| *l != 0)
+            .unwrap_or(u32::MAX);
+        match handle(state, counters, internal, external, lease, lifetime).await {
+            Some(_) => (200, ok("AddPortMapping", String::new())),
+            None => (500, fault(718)),
+        }
+    } else if request.contains("#DeletePortMapping") {
+        let external = field("NewExternalPort").and_then(|v| v.parse::<u16>().ok());
+        let internal = state
+            .lock()
+            .unwrap()
+            .mappings
+            .iter()
+            .find(|(_, m)| Some(m.external.port()) == external)
+            .map(|(internal, _)| *internal);
+        match internal {
+            Some(internal) => {
+                handle(state, counters, internal, 0, 0, lifetime).await;
+                (200, ok("DeletePortMapping", String::new()))
+            }
+            None => (500, fault(714)),
+        }
+    } else {
+        (404, String::new())
+    };
+    let reason = if status == 200 { "OK" } else { "Error" };
+    let response = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+/// Map (or delete, lifetime 0) `internal`, at external port `want` if not
+/// 0; returns its external address and the lifetime granted, or `None` if
+/// `want` is taken.
 async fn handle(
     state: &Arc<Mutex<State>>,
     counters: &Arc<Counters>,
     internal: u16,
+    want: u16,
     asked: u32,
     lifetime: &AtomicU32,
-) -> (SocketAddr, u32) {
+) -> Option<(SocketAddr, u32)> {
     if asked == 0 {
         counters.deletes.fetch_add(1, Ordering::Relaxed);
         let removed = state.lock().unwrap().mappings.remove(&internal);
@@ -184,13 +332,13 @@ async fn handle(
             m.task.abort();
             m.external
         });
-        return (external.unwrap_or(SocketAddr::from((EXTERNAL_IP, 0))), 0);
+        return Some((external.unwrap_or(SocketAddr::from((EXTERNAL_IP, 0))), 0));
     }
     counters.maps.fetch_add(1, Ordering::Relaxed);
     if let Some(m) = state.lock().unwrap().mappings.get(&internal) {
-        return (m.external, lifetime.load(Ordering::Relaxed).min(asked));
+        return Some((m.external, lifetime.load(Ordering::Relaxed).min(asked)));
     }
-    let outside = UdpSocket::bind((EXTERNAL_IP, 0)).await.unwrap();
+    let outside = UdpSocket::bind((EXTERNAL_IP, want)).await.ok()?;
     let external = outside.local_addr().unwrap();
     let inside = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let target = SocketAddr::from((Ipv4Addr::LOCALHOST, internal));
@@ -218,5 +366,5 @@ async fn handle(
         .unwrap()
         .mappings
         .insert(internal, Mapping { external, task });
-    (external, lifetime.load(Ordering::Relaxed).min(asked))
+    Some((external, lifetime.load(Ordering::Relaxed).min(asked)))
 }

@@ -7,7 +7,8 @@
 //!   arkitekt-embassy's `conn::open`, on a board), for control and DERP.
 //!
 //! [`Mesh::run`] is the node: one future, for the app to run beside its
-//! own (no `Send`, one executor). [`Mesh`] then connects TCP over the
+//! own (no `Send`, one executor); [`Mesh::portmap`], beside it, keeps a
+//! port mapping on a home router (PCP, NAT-PMP or UPnP). [`Mesh`] then connects TCP over the
 //! tunnel ([`Mesh::connect`], and `embedded_nal_async::TcpConnect` and
 //! `Dns` with the netmap's names), so anything on embedded-nal-async
 //! reaches mesh services unchanged.
@@ -28,6 +29,7 @@ extern crate alloc;
 mod control;
 mod derp;
 mod node;
+mod portmap;
 mod tcp;
 
 use alloc::collections::VecDeque;
@@ -50,6 +52,7 @@ use mesh_core::node::{NodeCore, Settings};
 use mesh_core::paths::Paths;
 use mesh_core::time::{Duration, Instant};
 
+pub use portmap::Lan;
 pub use tcp::{TcpError, TcpStream};
 
 /// The DERP connections at once: the home region's and one more.

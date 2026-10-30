@@ -4,7 +4,12 @@
 //! - **PCP** (RFC 6887), `MAP` requests;
 //! - **NAT-PMP** (RFC 6886), its predecessor, which many gateways still speak.
 //!
-//! Sans-IO: requests to send, responses parsed. UPnP IGD is not done.
+//! - **UPnP IGD** ([`upnp`]): SSDP and SOAP over HTTP, what many home
+//!   routers speak only.
+//!
+//! Sans-IO: requests to send, responses parsed.
+
+pub mod upnp;
 
 #[allow(unused_imports)]
 use crate::prelude::*;

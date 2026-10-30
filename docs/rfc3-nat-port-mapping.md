@@ -1,7 +1,7 @@
 # RFC-3: NAT port mapping (UPnP IGD, NAT-PMP, PCP)
 
-**Status:** Implemented for PCP and NAT-PMP (September 2026). UPnP IGD is
-not done.
+**Status:** Implemented for PCP and NAT-PMP (September 2026), and for UPnP
+IGD, also on embassy (October 2026).
 
 ## Problem
 
@@ -16,7 +16,7 @@ DERP than tsnet's would, adding latency and loading the DERP server.
 ## Proposal
 
 A `portmap` module in the tokio driver, behind a cargo feature (default on
-for desktops and servers, off for the ESP32):
+for desktops and servers; on embassy, a future the app runs):
 1. **Discover the gateway:** the default route on Linux, macOS and Windows.
 2. **Try PCP, then NAT-PMP** (both small UDP protocols, RFC 6887/6886),
    **then UPnP IGD** (SSDP discovery plus SOAP `AddPortMapping`). The UPnP
@@ -76,11 +76,43 @@ for desktops and servers, off for the ESP32):
   - after a gateway reboot, a new port is mapped and reported;
   - a delete arrives when A stops.
   - Test-only override: `ARKITEKT_MESH_PORTMAP_GATEWAY=ip:port`.
+- **UPnP IGD** (`src/portmap/upnp.rs`, sans-IO, no XML or HTTP crate):
+  - The SSDP `M-SEARCH` for InternetGatewayDevice:2 and :1, and its
+    answer's `LOCATION`.
+  - The description's WAN connection service, preferring WANIPConnection:2
+    and then :1 over WANPPPConnection:1. Its control URL can be absolute or
+    relative, with or without `URLBase`.
+  - SOAP `GetExternalIPAddress`, `AddPortMapping` and `DeletePortMapping`,
+    with their faults read.
+  - HTTP/1.1 requests with `Connection: close`. Responses are framed by
+    `Content-Length`, by chunks, or by the server closing.
+  - Unit tests use miniupnpd's and a Fritz!Box's answers and descriptions.
+- **UPnP in the tokio driver:** the third protocol, after PCP and NAT-PMP
+  go unanswered.
+  - SSDP goes to the gateway's port 1900 and to the multicast group.
+  - It maps at the node's port. On fault 718 (taken) it tries two random
+    ports; on 725 (only permanent leases) it asks again with lease 0.
+  - A gateway whose external address is private or CGNAT (a second NAT
+    behind it) is skipped: its mapping would not be reachable.
+  - Renewals map again at the control URL that worked. The node stopping
+    sends `DeletePortMapping`.
+  - `tests/portmap_upnp.rs` runs the fake gateway in its UPnP mode (SSDP on
+    its UDP socket, the description and control over HTTP). The test-only
+    `ARKITEKT_MESH_PORTMAP_SSDP=ip:port` keeps the search off the multicast
+    group, where a real router may answer.
+- **Embassy** (`crates/embassy/src/portmap.rs`): `Mesh::portmap(udp, dial,
+  Lan)` runs beside `Mesh::run`, the same loop over the app's sockets.
+  - The app gives it a socket of its own and plain TCP (`Dial`, `Tls::None`)
+    for UPnP's HTTP.
+  - It deletes nothing when the board stops: the mapping runs out.
+  - On a network without a mapping gateway (eduroam), it logs one debug line
+    and backs off.
+  - The ESP32 demo also reports its DHCP address as a local endpoint, for
+    peers on the same LAN.
+  - It has not been tried behind a real home router yet.
 
 ## Not done
 
-- **UPnP IGD** (SSDP, SOAP). Many consumer routers speak only this. It needs
-  multicast and a real NAT to test, which the Docker lab does not have yet.
 - **Gateway discovery on macOS and Windows** (tracked in RFC-6). There,
   port mapping only runs with the override.
 - **IPv6** (PCP can map it, but IPv6 rarely needs NAT traversal).
