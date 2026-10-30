@@ -1,6 +1,37 @@
 # CHANGELOG
 
 
+## v0.11.0 (2026-10-30)
+
+### Chores
+
+- The embassy check's lockfile at 0.10.2
+  ([`63a3cc0`](https://github.com/arkitektio/arkitekt-mesh/commit/63a3cc0344817af94d1e8503fd53b76fbd2bb0ee))
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+### Features
+
+- Upnp IGD port mapping, and port mapping on embassy
+  ([`baa726f`](https://github.com/arkitektio/arkitekt-mesh/commit/baa726fa08e48af053c4cc09bf7722624d52aa0b))
+
+core (portmap/upnp.rs, sans-IO): the SSDP search and its LOCATION, the description's WAN connection
+  service (WANIPConnection:2/:1, else WANPPPConnection:1), SOAP GetExternalIPAddress /
+  AddPortMapping / DeletePortMapping with faults, and just enough HTTP/1.1 (Content-Length, chunked,
+  until closed). Tested on miniupnpd's and a Fritz!Box's answers.
+
+tokio driver: UPnP after PCP and NAT-PMP go unanswered; SSDP to the gateway's port 1900 and the
+  multicast group; same port, else random ones on 718, lease 0 on 725; a gateway behind a second NAT
+  is skipped; deleted when the node stops. tests/portmap_upnp.rs against the fake gateway's new UPnP
+  mode, which really forwards.
+
+embassy: Mesh::portmap(udp, dial, Lan) beside Mesh::run: PCP, NAT-PMP, then UPnP over the app's own
+  socket and plain TCP; renewed at half the lease; nothing to delete on a board. On eduroam (no
+  gateway that maps) it logs one debug line and backs off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.10.2 (2026-10-29)
 
 ### Performance Improvements

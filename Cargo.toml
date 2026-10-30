@@ -14,19 +14,19 @@ members = [
 exclude = ["crates/smoltcp-patch"]
 
 [workspace.package]
-version = "0.10.2"
+version = "0.11.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/arkitektio/arkitekt-mesh"
 homepage = "https://github.com/arkitektio/arkitekt-mesh"
 
 [workspace.dependencies]
-mesh = { path = "crates/mesh", version = "0.10.2", package = "arkitekt-mesh" }
+mesh = { path = "crates/mesh", version = "0.11.0", package = "arkitekt-mesh" }
 # Without std by default: the std crates ask for it.
-mesh-core = { path = "crates/core", version = "0.10.2", package = "arkitekt-mesh-core", default-features = false }
-mesh-embassy = { path = "crates/embassy", version = "0.10.2", package = "arkitekt-mesh-embassy" }
+mesh-core = { path = "crates/core", version = "0.11.0", package = "arkitekt-mesh-core", default-features = false }
+mesh-embassy = { path = "crates/embassy", version = "0.11.0", package = "arkitekt-mesh-embassy" }
 # Our smoltcp fork, for mesh-core's `fast-tcp`.
-mesh-smoltcp = { path = "crates/smoltcp", version = "0.10.2", package = "arkitekt-mesh-smoltcp", default-features = false }
+mesh-smoltcp = { path = "crates/smoltcp", version = "0.11.0", package = "arkitekt-mesh-smoltcp", default-features = false }
 
 async-trait = "0.1"
 base64 = "0.22"
