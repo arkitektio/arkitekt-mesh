@@ -118,8 +118,11 @@ jobs:
       matrix:
         include:
           # `smoke`: the runner can execute the binary (not a cross build).
-          - { runner: ubuntu-latest, target: x86_64-unknown-linux-musl, os: linux, arch: amd64, zig: true, smoke: true }
-          - { runner: ubuntu-latest, target: aarch64-unknown-linux-musl, os: linux, arch: arm64, zig: true }
+          # Linux: static musl, built on its own architecture with musl-gcc.
+          # Not zig (clang): a cross-built aarch64 ring rejected valid
+          # signatures (BadSignature) on Neoverse V2.
+          - { runner: ubuntu-latest, target: x86_64-unknown-linux-musl, os: linux, arch: amd64, musl: true, smoke: true }
+          - { runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, os: linux, arch: arm64, musl: true, smoke: true }
           - { runner: macos-14, target: x86_64-apple-darwin, os: darwin, arch: amd64 }
           - { runner: macos-14, target: aarch64-apple-darwin, os: darwin, arch: arm64, smoke: true }
           - { runner: windows-latest, target: x86_64-pc-windows-msvc, os: windows, arch: amd64, smoke: true }
@@ -130,13 +133,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Build (zig, static musl)
-        if: matrix.zig
+      - name: Build (static musl)
+        if: matrix.musl
         run: |
-          pip install ziglang cargo-zigbuild
-          cargo zigbuild --release -p arkitekt-meshd --target ${{ matrix.target }}
+          sudo apt-get update -q && sudo apt-get install -yq musl-tools
+          cargo build --release -p arkitekt-meshd --target ${{ matrix.target }}
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
       - name: Build
-        if: ${{ !matrix.zig }}
+        if: ${{ !matrix.musl }}
         run: cargo build --release -p arkitekt-meshd --target ${{ matrix.target }}
       - name: Name the binary
         shell: bash
