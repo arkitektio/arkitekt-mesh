@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arkitekt-mesh-core",
  "async-trait",
@@ -119,7 +119,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-core"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "argon2",
  "arkitekt-mesh-smoltcp",
@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-embassy"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arkitekt-mesh-core",
  "embassy-futures",
@@ -162,7 +162,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-py"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arkitekt-mesh",
  "log",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-smoltcp"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "bitflags 1.3.2",
  "byteorder",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-mesh-web"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arkitekt-mesh-core",
  "arkitekt-mesh-embassy",
@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "arkitekt-meshd"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "arkitekt-mesh",
  "reqwest",

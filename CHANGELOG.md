@@ -1,6 +1,31 @@
 # CHANGELOG
 
 
+## v0.12.0 (2026-11-06)
+
+### Features
+
+- Report how a peer is reached, and say what failed and where
+  ([`20a4f43`](https://github.com/arkitektio/arkitekt-mesh/commit/20a4f438749cb785965053f17944bf642f6a1e54))
+
+Connection path (Node::path / PeerPath in Python): - core `Paths::via(peer, now)` mirrors `route`:
+  trusted UDP is Direct, else the peer's DERP region; Idle once nothing was sent for a while. -
+  driver `Node::path(host) -> PeerPath {Idle, Direct(addr), Relay{region, code}}`; Python
+  `Node.path(host) -> PeerPath(kind, via)`, holding the node weakly.
+
+Error messages: - every dial names its server: `connecting to host:port`, `TLS with <name> at
+  <resolved ip:port>[ (unverified)]`. - control errors name the control URL once (was `control:
+  control: control:`); a failing `GET /key` says so, and a non-200 asks whether the URL is a mesh
+  control server. - a start timeout says which control server and what it waited for (connection,
+  registration, network map), via `ControlSession::waiting_for`. - an expired node key is its own
+  error (`KeyExpired`, Python `KeyExpired`, a `NeedsLogin`), not "not on the mesh". - a peer dial
+  timeout names host:port; DERP reports every node's failure, warning once per outage and retrying
+  quietly. - the node's log reaches Python's `logging` under `arkitekt_mesh.*` (pyo3-log);
+  `Node.path`/`close`/drop release the GIL around the node's lock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.11.0 (2026-10-30)
 
 ### Chores
