@@ -101,7 +101,7 @@ impl ControlLink {
                     Event::Map(resp) => return Out::Map(resp),
                     Event::Ended(e) => {
                         self.drop_connection();
-                        return Out::Ended(mesh_error(e));
+                        return Out::Ended(mesh_error(e, &self.url));
                     }
                 }
             }
@@ -203,14 +203,19 @@ impl Drop for ControlLink {
     }
 }
 
-fn mesh_error(e: SessionError) -> MeshError {
+/// The session's end as the node reports it; failures name the control
+/// server `url` (the errors underneath do not).
+fn mesh_error(e: SessionError, url: &str) -> MeshError {
+    let at = |reason: String| {
+        MeshError::Control(super::control::ControlError::Protocol(format!(
+            "control at {url}: {reason}"
+        )))
+    };
     match e {
         SessionError::Refused(Refusal::Refused(reason)) => MeshError::Refused(reason),
         SessionError::Refused(Refusal::KeyExpired) => MeshError::KeyExpired,
         SessionError::Refused(Refusal::NeedsLogin(url)) => MeshError::NeedsLogin(url),
-        SessionError::Unreachable(reason) => {
-            MeshError::Control(super::control::ControlError::Protocol(reason))
-        }
-        SessionError::Api(e) => MeshError::Control(e.into()),
+        SessionError::Unreachable(reason) => at(reason),
+        SessionError::Api(e) => at(e.0),
     }
 }

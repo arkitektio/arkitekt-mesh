@@ -1,8 +1,11 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 class MeshError(Exception): ...
 class NeedsLogin(MeshError):
     """The node is not on the mesh and no auth key was given."""
+class KeyExpired(NeedsLogin):
+    """The node's key expired; a new one is ready, and the next start with
+    an auth key registers it."""
 class Locked(MeshError):
     """Another node is already running in the state directory."""
 class Refused(MeshError):
@@ -18,6 +21,15 @@ class TurnInfo:
     urls: List[str]
     username: str
     credential: str
+
+class PeerPath:
+    """How packets to a peer travel right now (see ``Node.path``)."""
+    kind: Literal["direct", "relay", "idle"]
+    """``idle``: nothing was sent to the peer lately (the next packet probes
+    again)."""
+    via: Optional[str]
+    """The peer's UDP address when direct, the DERP region code (e.g. ``waw``)
+    when relayed, else ``None``."""
 
 class Node:
     """A mesh node with its state directory; stop it with ``close``."""
@@ -50,4 +62,8 @@ class Node:
         """Start the TURN relay (once): its relayed traffic goes over the mesh."""
     async def forward(self, host: str, port: int) -> str:
         """A local ``127.0.0.1:P`` forwarding TCP to ``host:port`` on the mesh."""
+    def path(self, host: str) -> PeerPath:
+        """How packets to the peer ``host`` (a mesh name or address) travel
+        right now. A path starts out relayed and turns direct once one is
+        found, usually seconds after the first packet."""
     def close(self) -> None: ...

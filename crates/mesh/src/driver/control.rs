@@ -17,15 +17,17 @@ use crate::control::types::{
 };
 use crate::keys::{MachinePublic, NodePublic, PrivateKey};
 
+/// What went wrong talking to control. Unprefixed: whoever reports it says
+/// which control server (see `ControlLink`), once.
 #[derive(Debug, thiserror::Error)]
 pub enum ControlError {
-    #[error("control: {0}")]
+    #[error("{0}")]
     Io(#[from] io::Error),
-    #[error("control: {0}")]
+    #[error("noise handshake: {0}")]
     Noise(#[from] crate::control::noise::NoiseError),
-    #[error("control: http/2: {0}")]
+    #[error("http/2: {0}")]
     H2(#[from] h2::Error),
-    #[error("control: {0}")]
+    #[error("{0}")]
     Protocol(String),
 }
 
@@ -233,9 +235,21 @@ async fn read_all(stream: &mut h2::RecvStream) -> Result<Vec<u8>, ControlError> 
     Ok(body)
 }
 
+/// The server's machine key: the first request, so what fails here is
+/// usually the address (unreachable, TLS) or a URL that is no control server.
 async fn server_key(base: &BaseUrl) -> Result<MachinePublic, ControlError> {
-    let (status, body) = net::get(base, &api::key_path()).await?;
-    Ok(api::parse_server_key(status, &body)?)
+    let path = api::key_path();
+    let (status, body) = net::get(base, &path)
+        .await
+        .map_err(|e| io::Error::new(e.kind(), format!("fetching its key: {e}")))?;
+    api::parse_server_key(status, &body).map_err(|e| {
+        protocol(format!(
+            "{} (is {}://{} a mesh control server?)",
+            e.0,
+            if base.https { "https" } else { "http" },
+            base.authority()
+        ))
+    })
 }
 
 async fn read_more(io: &mut BoxIo, buf: &mut Vec<u8>) -> io::Result<()> {

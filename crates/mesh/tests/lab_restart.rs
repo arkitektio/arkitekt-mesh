@@ -62,7 +62,7 @@ async fn an_expired_node_asks_for_a_login_then_rejoins_with_a_key() {
     lab.admin(&["expire", &name]);
 
     let err = Session::start(options(None)).await.unwrap_err();
-    assert!(matches!(err, SessionError::NeedsLogin), "{err}");
+    assert!(matches!(err, SessionError::KeyExpired), "{err}");
     // The dead node key was replaced; a key registers the new one.
     let session = Session::start(options(Some(&lab.key))).await.unwrap();
     eventually(30, "HTTP after rejoining", || {

@@ -69,14 +69,19 @@ impl SessionOptions {
 pub enum SessionError {
     #[error("this node is not on the mesh and no auth key was given")]
     NeedsLogin,
+    /// Like [`NeedsLogin`](Self::NeedsLogin) (same code): the next start
+    /// registers the replacement key, given an auth key.
+    #[error("this node's key expired (a new one is ready); join again with an auth key")]
+    KeyExpired,
     #[error("another mesh node is already running in {}", .0.display())]
     Locked(PathBuf),
     #[error("no coordination url is known for the mesh (none given, none saved in {})", .0.display())]
     NoControlUrl(PathBuf),
     #[error("the mesh refused this node: {0}")]
     Refused(String),
-    #[error("the mesh did not connect in time")]
-    Timeout,
+    /// What it was waiting for, and on which control server.
+    #[error("the mesh did not connect in time: {0}")]
+    Timeout(String),
     #[error(
         "the tailnet is locked and this node's key is not signed; sign it with a \
          trusted key (`tailscale lock sign {0}`) and start again"
@@ -94,11 +99,11 @@ impl SessionError {
     /// The code meshd reports this as (`{"event":"error","code":…}`).
     pub fn code(&self) -> &'static str {
         match self {
-            Self::NeedsLogin => "needs_login",
+            Self::NeedsLogin | Self::KeyExpired => "needs_login",
             Self::Locked(_) => "locked",
             Self::NoControlUrl(_) => "usage",
             Self::Refused(_) => "login",
-            Self::Timeout => "timeout",
+            Self::Timeout(_) => "timeout",
             Self::LockedOut(_) => "locked_out",
             Self::LockUnverified(_) => "lock_unverified",
             Self::Join(_) => "start",
@@ -185,10 +190,16 @@ impl Session {
                 // Keep the machine, replace the dead node key: the next
                 // authorization (with an auth key) registers the new one.
                 rotate_node_key(&statedir.join(IDENTITY)).await?;
-                return Err(SessionError::NeedsLogin);
+                return Err(SessionError::KeyExpired);
             }
             Ok(Err(MeshError::Refused(reason))) => return Err(SessionError::Refused(reason)),
-            Ok(Err(MeshError::Timeout)) | Err(_) => return Err(SessionError::Timeout),
+            Ok(Err(MeshError::Timeout(why))) => return Err(SessionError::Timeout(why)),
+            Err(_) => {
+                return Err(SessionError::Timeout(format!(
+                    "the node did not start within {} s (control at {control_url})",
+                    options.timeout.as_secs()
+                )))
+            }
             Ok(Err(e)) => return Err(SessionError::Join(e)),
         };
         tokio::fs::write(&control_path, &control_url).await?;
@@ -352,7 +363,15 @@ impl Dial for Tailnet {
     async fn dial(&self, host: &str, port: u16) -> io::Result<TcpStream> {
         tokio::time::timeout(DIAL_TIMEOUT, self.0.dial(host, port))
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the peer did not answer"))?
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "{host}:{port} on the mesh did not answer within {} s",
+                        DIAL_TIMEOUT.as_secs()
+                    ),
+                )
+            })?
     }
 }
 

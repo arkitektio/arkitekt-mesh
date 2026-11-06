@@ -18,7 +18,7 @@ pub mod session;
 pub mod udp;
 
 pub use lock::{FileLockStore, LockStatus, LockStore};
-pub use node::{Config, Limits, MeshError, Node, TcpListener, TcpStream};
+pub use node::{Config, Limits, MeshError, Node, PeerPath, TcpListener, TcpStream};
 #[cfg(feature = "relay")]
 pub use relay::{Forward, TurnInfo, TurnRelay};
 #[cfg(feature = "session")]

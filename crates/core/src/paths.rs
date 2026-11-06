@@ -200,6 +200,24 @@ impl Paths {
         p.trusted(now).then(|| p.best.map(|b| b.0)).flatten()
     }
 
+    /// Where a datagram to `peer` goes now, as [`route`](Self::route) would
+    /// send it: its trusted direct address, else its DERP relay. `None` while
+    /// the peer is idle: nothing was sent to it within [`SESSION_ACTIVE`], so
+    /// no heartbeat keeps a direct path trusted and the next send probes
+    /// again. Also `None` with neither a direct address nor a known region.
+    pub fn via(&self, peer: &NodePublic, now: Instant) -> Option<Via> {
+        let p = self.peers.get(peer)?;
+        if p.last_send
+            .is_none_or(|t| now.duration_since(t) >= SESSION_ACTIVE)
+        {
+            return None;
+        }
+        if self.udp && p.trusted(now) {
+            return p.best.map(|b| Via::Udp(b.0));
+        }
+        p.derp()
+    }
+
     /// Route one datagram to `peer`: the transmits to make, plus any disco
     /// pings the send triggers.
     pub fn route(
@@ -539,9 +557,14 @@ mod tests {
         introduce(&mut a, &b, 1);
         introduce(&mut b, &a, 1);
         let t0 = crate::time::now();
+        assert_eq!(a.paths.via(&b.node, t0), None, "idle before the first send");
 
         // No path yet: the data goes via DERP, with a ping and a CallMeMaybe.
         let out = a.paths.route(&b.node, b"wg".to_vec(), t0, &a.dir);
+        assert!(matches!(
+            a.paths.via(&b.node, t0),
+            Some(Via::Derp { region: 1, .. })
+        ));
         assert!(out
             .iter()
             .any(|t| t.data == b"wg" && matches!(t.via, Via::Derp { region: 1, .. })));
@@ -556,6 +579,10 @@ mod tests {
         assert_eq!(
             a.paths.direct(&b.node, t0 + Duration::from_millis(3)),
             Some(b.addr)
+        );
+        assert_eq!(
+            a.paths.via(&b.node, t0 + Duration::from_millis(3)),
+            Some(Via::Udp(b.addr))
         );
 
         // Now data goes straight over UDP.
@@ -582,6 +609,9 @@ mod tests {
 
         // Trust lapses without heartbeats.
         assert_eq!(a.paths.direct(&b.node, t0 + Duration::from_secs(7)), None);
+        // And a peer nothing was sent to lately is idle, not relayed.
+        let last_send = t0 + Duration::from_millis(4);
+        assert_eq!(a.paths.via(&b.node, last_send + SESSION_ACTIVE), None);
     }
 
     #[test]

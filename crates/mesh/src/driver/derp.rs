@@ -48,25 +48,32 @@ pub async fn run(
     sending: Sending,
 ) {
     let mut backoff = Backoff::default();
+    // Whether this run of failures was reported: the first is a warning,
+    // the retries after it are not news.
+    let mut reported = false;
     loop {
         let ended = session(&region, &node_key, home, &events, &mut outgoing, &sending).await;
-        // A connection that came up starts the delays over.
+        // A connection that came up starts the delays (and the reports) over.
         if sending.up.swap(false, Ordering::Relaxed) {
             backoff.reset();
+            reported = false;
         }
-        match ended {
-            Ok(()) => return, // the node dropped us
-            Err(e) => {
-                tracing::debug!(
-                    "DERP region {} ({}): {e}",
-                    region.region_id,
-                    region.region_code
-                );
-            }
-        }
+        let Err(e) = ended else {
+            return; // the node dropped us
+        };
         // The node is gone, or replaced this connection (the region moved).
         if events.is_closed() || outgoing.is_closed() {
             return;
+        }
+        let (id, code) = (region.region_id, &region.region_code);
+        if reported {
+            tracing::debug!("DERP region {id} ({code}) still unreachable: {e}");
+        } else {
+            tracing::warn!(
+                "DERP region {id} ({code}) unreachable, retrying; peers relayed \
+                 through it cannot be reached meanwhile: {e}"
+            );
+            reported = true;
         }
         tokio::time::sleep(backoff.next_delay()).await;
     }
@@ -90,7 +97,8 @@ async fn session(
     outgoing: &mut mpsc::Receiver<Vec<u8>>,
     sending: &Sending,
 ) -> Result<(), SessionError> {
-    let mut last_err = SessionError::Other("the region has no DERP nodes".into());
+    // Every node's failure: one bad node of several is worth seeing.
+    let mut failures: Vec<String> = Vec::new();
     for node in region.nodes.iter().filter(|n| !n.stun_only) {
         // Dialed by IP, certified for the hostname.
         let host = node.derp_dial_host();
@@ -128,11 +136,16 @@ async fn session(
         let io = match connect.await {
             Ok(Ok(io)) => io,
             Ok(Err(e)) => {
-                last_err = e;
+                failures.push(format!("{}: {e}", node.name));
                 continue;
             }
             Err(_) => {
-                last_err = SessionError::Other(format!("connecting to {host} timed out"));
+                failures.push(format!(
+                    "{}: no DERP handshake with {} at {host}:{} within 10 s",
+                    node.name,
+                    node.host_name,
+                    node.derp_port()
+                ));
                 continue;
             }
         };
@@ -213,5 +226,9 @@ async fn session(
             r = writer => r,
         };
     }
-    Err(last_err)
+    Err(SessionError::Other(if failures.is_empty() {
+        "the region has no DERP nodes".into()
+    } else {
+        failures.join("; ")
+    }))
 }

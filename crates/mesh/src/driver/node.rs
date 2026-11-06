@@ -37,6 +37,8 @@ use mesh_core::node::{canonical, Event, HomeReport, NodeCore, Settings};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the node may take to register and get its first netmap.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
+/// What the rest of a start (binding its sockets) may take beyond it.
+const START_SLACK: Duration = Duration::from_secs(10);
 
 /// How to join the mesh.
 #[derive(Debug, Clone)]
@@ -52,6 +54,19 @@ pub struct Config {
     pub direct: bool,
     /// Buffer and queue sizes.
     pub limits: Limits,
+}
+
+/// How packets to a peer travel right now (see [`Node::path`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerPath {
+    /// Nothing was sent to the peer lately, so no path is kept up; the next
+    /// packet probes again.
+    Idle,
+    /// Straight to the peer over UDP, at this address.
+    Direct(SocketAddr),
+    /// Through a DERP relay: its region id and code (e.g. `"waw"`; empty
+    /// when the DERP map gives none).
+    Relay { region: i32, code: String },
 }
 
 /// Buffer and queue sizes: memory against throughput.
@@ -172,8 +187,10 @@ pub enum MeshError {
     Refused(String),
     #[error("the node key expired; register again with a new key and an auth key")]
     KeyExpired,
-    #[error("the mesh did not come up in time")]
-    Timeout,
+    /// What it was waiting for, e.g. "control at … did not answer the
+    /// registration within 60 s".
+    #[error("{0}")]
+    Timeout(String),
     #[error("{0}")]
     Io(#[from] io::Error),
 }
@@ -242,9 +259,20 @@ impl Node {
         config: Config,
         store: Option<Arc<dyn super::lock::LockStore>>,
     ) -> Result<Self, MeshError> {
-        tokio::time::timeout(START_TIMEOUT, Self::start_inner(config, store))
-            .await
-            .map_err(|_| MeshError::Timeout)?
+        // A backstop: the wait for control, the long one, times out inside
+        // with a message saying what it waited for.
+        let url = config.control_url.clone();
+        tokio::time::timeout(
+            START_TIMEOUT + START_SLACK,
+            Self::start_inner(config, store),
+        )
+        .await
+        .map_err(|_| {
+            MeshError::Timeout(format!(
+                "the node did not start within {} s (control at {url})",
+                (START_TIMEOUT + START_SLACK).as_secs()
+            ))
+        })?
     }
 
     async fn start_inner(
@@ -265,8 +293,17 @@ impl Node {
         let mut link = ControlLink::new(&config, disco_public, lock.head_text());
         let mut netmap = NetMap::default();
         let mut filter_sets = BTreeMap::new();
+        let deadline = tokio::time::Instant::now() + START_TIMEOUT;
         loop {
-            match link.next().await {
+            let Ok(out) = tokio::time::timeout_at(deadline, link.next()).await else {
+                return Err(MeshError::Timeout(format!(
+                    "control at {} did not {} within {} s",
+                    config.control_url,
+                    link.session.waiting_for(),
+                    START_TIMEOUT.as_secs()
+                )));
+            };
+            match out {
                 Out::Map(mut resp) => {
                     if let Some(info) = resp.tka_info.take() {
                         if let Some(client) = link.client().cloned() {
@@ -498,6 +535,31 @@ impl Node {
         state.paths().direct(&key, clock::now())
     }
 
+    /// How packets to the peer `host` (as for [`resolve`](Self::resolve))
+    /// travel right now. A path starts out relayed and turns direct once
+    /// disco finds one, usually seconds after the first packet.
+    pub fn path(&self, host: &str) -> io::Result<PeerPath> {
+        let ip = self.resolve(host)?;
+        let state = self.shared.lock();
+        let netmap = state.netmap();
+        let key = netmap
+            .peer_by_ip(ip)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer has {ip}")))?
+            .key;
+        Ok(match state.paths().via(&key, clock::now()) {
+            None => PeerPath::Idle,
+            Some(Via::Udp(addr)) => PeerPath::Direct(addr),
+            Some(Via::Derp { region, .. }) => PeerPath::Relay {
+                region,
+                code: netmap
+                    .derp_regions
+                    .get(&region)
+                    .map(|r| r.region_code.clone())
+                    .unwrap_or_default(),
+            },
+        })
+    }
+
     /// A peer's tailnet address: an IP literal, or a name in the netmap
     /// (bare hostname or FQDN).
     pub fn resolve(&self, host: &str) -> io::Result<IpAddr> {
@@ -619,7 +681,8 @@ async fn control_loop(
                 }
                 // Only before the first registration, which the start did.
                 Out::Ended(e) => {
-                    tracing::warn!("control: {e}");
+                    // `e` names control (and its URL) itself.
+                    tracing::warn!("{e}");
                     return;
                 }
             },

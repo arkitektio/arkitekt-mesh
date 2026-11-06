@@ -95,11 +95,19 @@ pub async fn connect(host: &str, port: u16, tls: Tls) -> io::Result<BoxIo> {
 /// Connect to `dial:port`, checking the certificate against `name` (DERP
 /// nodes are dialed by IP but certified for their hostname).
 pub async fn connect_named(dial: &str, port: u16, tls: Tls, name: &str) -> io::Result<BoxIo> {
+    // Every error names the server: a node dials control, its key and any of
+    // dozens of DERP nodes, and a bare "BadSignature" says none of which.
+    let addr = if dial.contains(':') {
+        format!("[{dial}]:{port}")
+    } else {
+        format!("{dial}:{port}")
+    };
     // An IP literal needs no resolver (tokio's would start a thread pool).
     let tcp = match dial.parse::<IpAddr>() {
-        Ok(ip) => TcpStream::connect((ip, port)).await?,
-        Err(_) => TcpStream::connect((dial, port)).await?,
-    };
+        Ok(ip) => TcpStream::connect((ip, port)).await,
+        Err(_) => TcpStream::connect((dial, port)).await,
+    }
+    .map_err(|e| context(e, format!("connecting to {addr}")))?;
     tcp.set_nodelay(true)?;
     if tls == Tls::None {
         return Ok(Box::new(tcp));
@@ -110,8 +118,24 @@ pub async fn connect_named(dial: &str, port: u16, tls: Tls, name: &str) -> io::R
         Err(_) => ServerName::try_from(host.to_owned())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
     };
+    let verified = if tls == Tls::Verify {
+        ""
+    } else {
+        " (unverified)"
+    };
+    // The address actually reached: a name may resolve to several.
+    let at = tcp.peer_addr().map_or(addr, |a| a.to_string());
     let connector = tokio_rustls::TlsConnector::from(tls_config(tls == Tls::Verify));
-    Ok(Box::new(connector.connect(name, tcp).await?))
+    let stream = connector
+        .connect(name, tcp)
+        .await
+        .map_err(|e| context(e, format!("TLS with {host} at {at}{verified}")))?;
+    Ok(Box::new(stream))
+}
+
+/// `e` with what was being done prefixed, keeping its kind.
+fn context(e: io::Error, what: String) -> io::Error {
+    io::Error::new(e.kind(), format!("{what}: {e}"))
 }
 
 /// The process's TLS provider, else ring (feature `ring`).
@@ -358,6 +382,25 @@ mod tests {
         assert_eq!(head.status, 101);
         assert_eq!(head.header("upgrade"), Some("DERP"));
         assert_eq!(head.rest, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn tls_errors_name_the_server() {
+        // A server that answers the ClientHello with plain HTTP.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let _ = tcp.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
+        });
+        let err = match connect_named("127.0.0.1", port, Tls::Verify, "derp1.example.com").await {
+            Ok(_) => panic!("plain HTTP passed for TLS"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.starts_with(&format!("TLS with derp1.example.com at 127.0.0.1:{port}: ")),
+            "{err}"
+        );
     }
 }
 

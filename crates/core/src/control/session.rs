@@ -286,6 +286,18 @@ impl ControlSession {
         self.events.pop_front()
     }
 
+    /// What the session is waiting on from control, for a timeout's message
+    /// ("control did not … in time").
+    pub fn waiting_for(&self) -> &'static str {
+        match self.phase {
+            Phase::Waiting(_) => "come back after a failure",
+            Phase::Connecting => "accept the connection",
+            Phase::Registering(_) => "answer the registration",
+            Phase::Streaming(_) => "send the network map",
+            Phase::Ended => "keep the session",
+        }
+    }
+
     /// When [`handle_timeout`](Self::handle_timeout) is due, if ever.
     pub fn poll_timeout(&self) -> Option<Instant> {
         match self.phase {

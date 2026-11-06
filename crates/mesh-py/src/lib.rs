@@ -3,10 +3,12 @@
 //! the Python process, driven by a tokio runtime of its own.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use mesh::driver::{Session, SessionError, SessionOptions};
+use mesh::driver::{
+    Node as DriverNode, PeerPath as DriverPath, Session, SessionError, SessionOptions,
+};
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
@@ -14,6 +16,8 @@ use tokio::sync::Mutex;
 
 create_exception!(arkitekt_mesh, MeshError, PyException);
 create_exception!(arkitekt_mesh, NeedsLogin, MeshError);
+// A NeedsLogin whose cause is the node key's expiry (a new key is ready).
+create_exception!(arkitekt_mesh, KeyExpired, NeedsLogin);
 create_exception!(arkitekt_mesh, Locked, MeshError);
 create_exception!(arkitekt_mesh, Refused, MeshError);
 create_exception!(arkitekt_mesh, Timeout, MeshError);
@@ -23,9 +27,10 @@ fn to_py(e: SessionError) -> PyErr {
     let message = e.to_string();
     match e {
         SessionError::NeedsLogin => NeedsLogin::new_err(message),
+        SessionError::KeyExpired => KeyExpired::new_err(message),
         SessionError::Locked(_) => Locked::new_err(message),
         SessionError::Refused(_) => Refused::new_err(message),
-        SessionError::Timeout => Timeout::new_err(message),
+        SessionError::Timeout(_) => Timeout::new_err(message),
         SessionError::LockedOut(_) => LockedOut::new_err(message),
         _ => MeshError::new_err(message),
     }
@@ -53,12 +58,32 @@ impl TurnInfo {
     }
 }
 
+/// How packets to a peer travel right now (see `Node.path`).
+#[pyclass(frozen, get_all, module = "arkitekt_mesh")]
+struct PeerPath {
+    /// `"direct"`, `"relay"`, or `"idle"` (nothing sent to the peer lately).
+    kind: &'static str,
+    /// The peer's UDP address when direct, the DERP region code (e.g.
+    /// `"waw"`, or the region id) when relayed, else `None`.
+    via: Option<String>,
+}
+
+#[pymethods]
+impl PeerPath {
+    fn __repr__(&self) -> String {
+        format!("PeerPath(kind={:?}, via={:?})", self.kind, self.via)
+    }
+}
+
 type Shared = Arc<Mutex<Option<Session>>>;
 
 /// A mesh node with its state directory; stop it with `close()`.
 #[pyclass(frozen, module = "arkitekt_mesh")]
 struct Node {
     session: Shared,
+    /// For the synchronous lookups: weak, so it never keeps a closed node
+    /// running (the node stops with its last strong handle).
+    node: Weak<DriverNode>,
     #[pyo3(get)]
     proxy_url: String,
     #[pyo3(get)]
@@ -120,8 +145,10 @@ impl Node {
                 .iter()
                 .map(ToString::to_string)
                 .collect();
+            let node = Arc::downgrade(session.node());
             Ok(Node {
                 session: Arc::new(Mutex::new(Some(session))),
+                node,
                 proxy_url,
                 addresses,
                 statedir: statedir.display().to_string(),
@@ -173,8 +200,40 @@ impl Node {
         })
     }
 
-    fn close(&self) {
-        stop(&self.session);
+    /// How packets to the peer `host` (a mesh name or address) travel right
+    /// now. A path starts out relayed and turns direct once one is found,
+    /// usually seconds after the first packet.
+    fn path(&self, py: Python<'_>, host: &str) -> PyResult<PeerPath> {
+        // Without the GIL: the node's lock is taken here, and a tokio thread
+        // holding it may be logging, which waits for the GIL (pyo3-log).
+        let found = py.detach(|| {
+            let node = self.node.upgrade().ok_or(())?;
+            Ok::<_, ()>(node.path(host))
+        });
+        let found = found.map_err(|()| closed())?;
+        Ok(match found.map_err(io_err)? {
+            DriverPath::Idle => PeerPath {
+                kind: "idle",
+                via: None,
+            },
+            DriverPath::Direct(addr) => PeerPath {
+                kind: "direct",
+                via: Some(addr.to_string()),
+            },
+            DriverPath::Relay { region, code } => PeerPath {
+                kind: "relay",
+                via: Some(if code.is_empty() {
+                    region.to_string()
+                } else {
+                    code
+                }),
+            },
+        })
+    }
+
+    fn close(&self, py: Python<'_>) {
+        // Without the GIL, like `path`: stopping takes the node's locks.
+        py.detach(|| stop(&self.session));
     }
 
     fn __repr__(&self) -> String {
@@ -187,17 +246,32 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        stop(&self.session);
+        // Dropped by Python (the GIL held): released while stopping, as in
+        // `close`. While the interpreter shuts down, stopped as it is.
+        let session = &self.session;
+        if Python::try_attach(|py| py.detach(|| stop(session))).is_none() {
+            stop(session);
+        }
     }
 }
 
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     let py = m.py();
+    // The node's log (DERP outages, control reconnects, rustls' alerts) into
+    // Python's `logging`, under `arkitekt_mesh.*`. Levels are cached per
+    // logger: configure logging before the first node starts. Trace is left
+    // out (per-packet).
+    let _ = pyo3_log::Logger::new(py, pyo3_log::Caching::LoggersAndLevels)?
+        .set_prefix("arkitekt_mesh")
+        .filter(log::LevelFilter::Debug)
+        .install();
     m.add_class::<Node>()?;
     m.add_class::<TurnInfo>()?;
+    m.add_class::<PeerPath>()?;
     m.add("MeshError", py.get_type::<MeshError>())?;
     m.add("NeedsLogin", py.get_type::<NeedsLogin>())?;
+    m.add("KeyExpired", py.get_type::<KeyExpired>())?;
     m.add("Locked", py.get_type::<Locked>())?;
     m.add("Refused", py.get_type::<Refused>())?;
     m.add("Timeout", py.get_type::<Timeout>())?;
