@@ -1,6 +1,21 @@
 # CHANGELOG
 
 
+## v0.12.2 (2026-11-06)
+
+### Bug Fixes
+
+- Publish from macos-15, GitHub retired the macos-14 image
+  ([`d2018a4`](https://github.com/arkitektio/arkitekt-mesh/commit/d2018a45b6937e2ca4ad037b235405937f84c940))
+
+0.12.1's wheel and meshd runs never started their macOS jobs ("The configuration
+  'macos-14-arm64-us-default' is not supported"), so nothing of it reached PyPI or the GitHub
+  release. Every macos-14 runner (tests, the universal2 wheel, its smoke test, both darwin meshd
+  builds) is macos-15.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.12.1 (2026-11-06)
 
 ### Bug Fixes
