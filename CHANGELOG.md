@@ -1,6 +1,24 @@
 # CHANGELOG
 
 
+## v0.12.1 (2026-11-06)
+
+### Bug Fixes
+
+- Build aarch64 wheels and meshd natively, not with cross compilers
+  ([`2f0d6d0`](https://github.com/arkitektio/arkitekt-mesh/commit/2f0d6d05deeb0216a7388e65f31fb0ef3751de3b))
+
+The aarch64 wheels were cross-built on x86 (maturin's manylinux2014 cross GCC, with a -D__ARM_ARCH=8
+  workaround) and meshd with zig (clang). ring's C and assembly built that way rejected valid
+  certificate signatures (`invalid peer certificate: BadSignature`) on Neoverse V2.
+
+- wheels: aarch64 manylinux and musllinux on ubuntu-24.04-arm, so maturin uses the native PyPA
+  images and their compiler; the __ARM_ARCH flag goes. - meshd: static musl with musl-gcc on each
+  architecture's own runner (no zig); the aarch64 binary is now smoke-tested too.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+
 ## v0.12.0 (2026-11-06)
 
 ### Features
