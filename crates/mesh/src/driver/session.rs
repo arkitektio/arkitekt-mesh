@@ -247,11 +247,31 @@ impl Session {
     /// Serve the local HTTP proxy into the mesh on `listen` (e.g.
     /// `127.0.0.1:0`), once; returns its url.
     pub async fn serve_proxy(&mut self, listen: &str) -> io::Result<String> {
+        self.serve_proxy_with(listen, false).await
+    }
+
+    /// Like [`serve_proxy`](Self::serve_proxy); `authenticated` makes up
+    /// credentials the proxy then asks of every request, and puts them in
+    /// the url (`http://mesh:<token>@127.0.0.1:P`). Without them any user of
+    /// this machine reaches the mesh as this node, so a shared machine (a
+    /// cluster's login node) wants them. The url is then a secret: not for
+    /// logs.
+    pub async fn serve_proxy_with(
+        &mut self,
+        listen: &str,
+        authenticated: bool,
+    ) -> io::Result<String> {
         if let Some((url, _)) = &self.proxy {
             return Ok(url.clone());
         }
         let listener = TcpListener::bind(listen).await?;
-        let (url, task) = proxy::serve_on(Tailnet(self.node.clone()), listener)?;
+        let token = authenticated.then(|| {
+            let mut token = [0u8; 16];
+            mesh_core::random::fill(&mut token);
+            hex::encode(token)
+        });
+        let credentials = token.as_deref().map(|token| ("mesh", token));
+        let (url, task) = proxy::serve_with(Tailnet(self.node.clone()), listener, credentials)?;
         self.proxy = Some((url.clone(), task));
         Ok(url)
     }

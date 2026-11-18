@@ -37,6 +37,9 @@ pub struct Peer {
     pub key_signature: Box<[u8]>,
     /// Exempt from tailnet lock (Funnel ingress nodes).
     pub unsigned_peer_api_only: bool,
+    /// Its node key expired: control still lists it, and it is not talked
+    /// to until it has a new one.
+    pub expired: bool,
 }
 
 impl From<Node> for Peer {
@@ -66,6 +69,7 @@ impl From<Node> for Peer {
             online: n.online,
             key_signature: n.key_signature,
             unsigned_peer_api_only: n.unsigned_peer_api_only,
+            expired: n.expired,
         }
     }
 }

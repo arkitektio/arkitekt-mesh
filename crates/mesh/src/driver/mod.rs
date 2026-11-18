@@ -3,6 +3,7 @@
 pub mod control;
 mod control_link;
 pub mod derp;
+pub mod egress;
 pub mod lock;
 pub mod net;
 pub mod node;
@@ -17,6 +18,7 @@ pub mod session;
 #[cfg(feature = "udp")]
 pub mod udp;
 
+pub use crate::control::session::{ControlState, Refusal};
 pub use lock::{FileLockStore, LockStatus, LockStore};
 pub use node::{Config, Limits, MeshError, Node, PeerPath, TcpListener, TcpStream};
 #[cfg(feature = "relay")]

@@ -26,6 +26,7 @@ use super::control::ControlError;
 use super::control_link::{ControlLink, Out};
 use super::derp::{self as derp_conn, Received};
 use crate::control::netmap::NetMap;
+use crate::control::session::ControlState;
 use crate::control::types::{EndpointType, MapResponse};
 use crate::derp;
 use crate::keys::{NodeIdentity, PrivateKey};
@@ -39,6 +40,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// What the rest of a start (binding its sockets) may take beyond it.
 const START_SLACK: Duration = Duration::from_secs(10);
+/// How long a tailnet-lock sync may take once the node runs: control's
+/// stream is not read meanwhile.
+const LOCK_SYNC_LIMIT: Duration = Duration::from_secs(30);
 
 /// How to join the mesh.
 #[derive(Debug, Clone)]
@@ -215,6 +219,8 @@ pub(super) struct Shared {
     rebind: std::sync::atomic::AtomicBool,
     /// Tells the map stream to reconnect (after a rebind).
     control_rebind: Notify,
+    /// How the node stands with control, as the control loop publishes it.
+    control: watch::Receiver<ControlState>,
 }
 
 impl Shared {
@@ -324,6 +330,8 @@ impl Node {
                 Out::Ended(e) => return Err(e),
             }
         }
+        let (control_tx, control_rx) = watch::channel(link.session.state().clone());
+        link.status = Some(control_tx);
         let addresses = netmap.self_addresses().to_vec();
         let home_region = mesh_core::node::pick_home(&netmap);
         tracing::info!(
@@ -368,6 +376,7 @@ impl Node {
             wake: Notify::new(),
             rebind: std::sync::atomic::AtomicBool::new(false),
             control_rebind: Notify::new(),
+            control: control_rx,
         });
 
         let wanted = config.limits.udp_port;
@@ -462,6 +471,19 @@ impl Node {
     /// take them fast enough ([`Limits::derp_queue`]).
     pub fn derp_dropped(&self) -> u64 {
         self.shared.lock().derp_dropped()
+    }
+
+    /// How the node stands with control right now. A running node tries
+    /// again by itself whatever happens; [`ControlState::Refused`] (its key
+    /// expired, the node was removed) is the one that takes a new login,
+    /// and until then the netmap goes stale: peers that change are lost.
+    pub fn control_state(&self) -> ControlState {
+        self.shared.control.borrow().clone()
+    }
+
+    /// [`control_state`](Self::control_state) as it changes, to wait on.
+    pub fn watch_control(&self) -> watch::Receiver<ControlState> {
+        self.shared.control.clone()
     }
 
     /// A snapshot of the netmap.
@@ -624,6 +646,8 @@ impl Node {
             shared: self.shared.clone(),
             handle,
             established: false,
+            fin_seen: false,
+            shut: false,
         };
         let connected =
             tokio::time::timeout(CONNECT_TIMEOUT, poll_fn(|cx| stream.poll_connected(cx))).await;
@@ -668,11 +692,20 @@ async fn control_loop(
                         .is_some_and(|i| shared.lock().lock().needs_sync(i));
                     if let (Some(info), Some(client)) = (info.filter(|_| stale), link.client().cloned()) {
                         let mut lock = shared.lock().lock().clone();
-                        super::lock::sync(&client, &node_public, &info, &mut lock).await;
-                        let head = lock.head_text();
-                        shared.lock().set_lock(lock);
-                        shared.wake.notify_one();
-                        link.session.set_tka_head(head);
+                        let sync = super::lock::sync(&client, &node_public, &info, &mut lock);
+                        // Unanswered, the lock stays as it was; the next
+                        // response that names it asks again.
+                        if tokio::time::timeout(LOCK_SYNC_LIMIT, sync).await.is_ok() {
+                            let head = lock.head_text();
+                            shared.lock().set_lock(lock);
+                            shared.wake.notify_one();
+                            link.session.set_tka_head(head);
+                        } else {
+                            tracing::warn!(
+                                "control did not answer the tailnet-lock sync within {} s",
+                                LOCK_SYNC_LIMIT.as_secs()
+                            );
+                        }
                     }
                     // The loop owns the netmap; hand it the change.
                     if map_tx.send(*resp).await.is_err() {
@@ -1037,13 +1070,19 @@ pub struct TcpStream {
     shared: Arc<Shared>,
     handle: SocketHandle,
     established: bool,
+    /// The peer was seen to close its side: the end of what it sends is an
+    /// end, not a loss.
+    fin_seen: bool,
+    /// We closed our side.
+    shut: bool,
 }
 
 /// Accepts TCP connections from peers on one port of this node.
 ///
 /// Connections are accepted one at a time (a new listening socket is armed
 /// after each), so a burst of simultaneous connects may see resets. Which
-/// peers may connect is not filtered beyond the tunnel's own check that a
+/// peers may connect is the tailnet's packet filter's to say (its ACLs,
+/// docs/rfc8-packet-filter.md), after the tunnel's own check that a
 /// packet's source belongs to the peer that sent it.
 pub struct TcpListener {
     shared: Arc<Shared>,
@@ -1082,6 +1121,8 @@ impl TcpListener {
                         shared: self.shared.clone(),
                         handle: accepted,
                         established: true,
+                        fin_seen: false,
+                        shut: false,
                     },
                     remote,
                 )))
@@ -1144,8 +1185,9 @@ impl AsyncRead for TcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut state = self.shared.lock();
-        let socket = state.netstack_mut().socket(self.handle);
+        let this = self.get_mut();
+        let mut state = this.shared.lock();
+        let socket = state.netstack_mut().socket(this.handle);
         if socket.can_recv() {
             let n = socket
                 .recv_slice(buf.initialize_unfilled())
@@ -1153,10 +1195,26 @@ impl AsyncRead for TcpStream {
             buf.advance(n);
             drop(state);
             // Receive-window space freed: let the loop tell the peer.
-            self.shared.wake.notify_one();
+            this.shared.wake.notify_one();
             return Poll::Ready(Ok(()));
         }
+        // The states only the peer's FIN leads to.
+        if matches!(
+            socket.state(),
+            TcpState::CloseWait | TcpState::LastAck | TcpState::Closing | TcpState::TimeWait
+        ) {
+            this.fin_seen = true;
+        }
         if !socket.may_recv() {
+            // Closed without the peer's FIN, and not by us: it reset the
+            // connection, or went silent until the stack gave up. Not an
+            // end of file: what was read may be part of what was sent.
+            if socket.state() == TcpState::Closed && !this.fin_seen && !this.shut {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "the connection was reset by the peer, or timed out",
+                )));
+            }
             return Poll::Ready(Ok(())); // EOF
         }
         socket.register_recv_waker(cx.waker());
@@ -1191,7 +1249,8 @@ impl AsyncWrite for TcpStream {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.shut = true;
         self.shared
             .lock()
             .netstack_mut()

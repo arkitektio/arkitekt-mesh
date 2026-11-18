@@ -114,7 +114,8 @@ async fn session(
         let mut conn = DerpConn::new(&authority, node_key.clone(), home, clock::now());
         // Connect, upgrade and shake hands.
         let connect = tokio::time::timeout(Duration::from_secs(10), async {
-            let mut io = net::connect_named(&host, node.derp_port(), tls, &name).await?;
+            let mut io =
+                net::connect_at(&host, &node.host_name, node.derp_port(), tls, &name).await?;
             let mut buf = vec![0u8; 4096];
             while !conn.is_up() {
                 if let Some(out) = conn.poll_transmit() {

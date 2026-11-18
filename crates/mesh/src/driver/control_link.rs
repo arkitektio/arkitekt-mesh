@@ -10,7 +10,7 @@ use super::control::ControlClient;
 use super::node::{Config, MeshError};
 use crate::control::api::{ApiError, Call};
 use crate::control::session::{
-    Answer, CallId, ControlSession, Event, Refusal, SessionConfig, SessionError,
+    Answer, CallId, ControlSession, ControlState, Event, Refusal, SessionConfig, SessionError,
 };
 use crate::control::types::{Hostinfo, MapResponse};
 use crate::keys::{DiscoPublic, PrivateKey};
@@ -42,6 +42,8 @@ pub(super) struct ControlLink {
     tasks: Vec<JoinHandle<()>>,
     tx: mpsc::Sender<Input>,
     rx: mpsc::Receiver<Input>,
+    /// Where the session's standing with control is published as it changes.
+    pub(super) status: Option<tokio::sync::watch::Sender<ControlState>>,
 }
 
 /// What we tell control about this host (the session adds the home region).
@@ -80,6 +82,7 @@ impl ControlLink {
             tasks: Vec::new(),
             tx,
             rx,
+            status: None,
         }
     }
 
@@ -92,6 +95,16 @@ impl ControlLink {
     /// it waits only on its channel and a timer.
     pub(super) async fn next(&mut self) -> Out {
         loop {
+            if let Some(status) = &self.status {
+                let now = self.session.state();
+                status.send_if_modified(|was| {
+                    let changed = was != now;
+                    if changed {
+                        was.clone_from(now);
+                    }
+                    changed
+                });
+            }
             while let Some(event) = self.session.poll_event() {
                 match event {
                     Event::Connect => self.connect(),

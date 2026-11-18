@@ -546,11 +546,21 @@ impl NodeCore {
 
     // ----------------------------------------------------------- inside --
 
-    /// Hide the peers tailnet lock does not trust, judge our own key, then
-    /// bring the stack and tunnel in line (hidden peers lose their sessions).
+    /// Hide the peers tailnet lock does not trust and those whose key
+    /// expired, judge our own key, then bring the stack and tunnel in line
+    /// (hidden peers lose their sessions).
     fn apply_lock(&mut self) {
         let lock = &mut self.lock;
-        lock.hidden = self.netmap.retain_trusted(|p| lock.trusts(p));
+        let mut expired = 0;
+        let hidden = self.netmap.retain_trusted(|p| {
+            if p.expired {
+                expired += 1;
+                return false;
+            }
+            lock.trusts(p)
+        });
+        // Tailnet lock's count is of its own.
+        lock.hidden = hidden - expired;
         lock.judge_self(self.netmap.self_node.as_ref());
         let ids: Vec<i64> = self
             .netmap
@@ -928,5 +938,25 @@ mod tests {
         ));
         assert!(!accept_inbound(&netmap, &a, &packet([8, 8, 8, 8], me)));
         assert!(!accept_inbound(&netmap, &a, &[0x45, 0]));
+    }
+
+    /// A peer control lists as expired is not a peer to talk to.
+    #[test]
+    fn expired_peers_are_hidden() {
+        let now = Instant::ZERO;
+        let mut node = two_regions(now);
+        let peers = |expired: bool| -> MapResponse {
+            serde_json::from_str(&format!(
+                r#"{{"PeersChanged": [{{"ID": 2, "Name": "old", "Addresses": ["100.64.0.2/32"],
+                    "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000002",
+                    "Expired": {expired}}}]}}"#
+            ))
+            .unwrap()
+        };
+        node.apply_map(peers(false));
+        assert!(node.netmap().peer_by_name("old").is_some());
+        node.apply_map(peers(true));
+        assert!(node.netmap().peer_by_name("old").is_none());
+        assert_eq!(node.lock().hidden, 0);
     }
 }

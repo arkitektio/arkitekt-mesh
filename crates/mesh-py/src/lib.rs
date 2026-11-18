@@ -7,7 +7,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use mesh::driver::{
-    Node as DriverNode, PeerPath as DriverPath, Session, SessionError, SessionOptions,
+    ControlState, Node as DriverNode, PeerPath as DriverPath, Refusal, Session, SessionError,
+    SessionOptions,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -75,6 +76,45 @@ impl PeerPath {
     }
 }
 
+/// How the node stands with the coordination server (see `Node.control`).
+#[pyclass(frozen, get_all, module = "arkitekt_mesh")]
+struct ControlStatus {
+    /// `"connected"`, `"reconnecting"` (it tries again by itself), or what
+    /// takes a new login: `"key_expired"`, `"needs_login"`, `"refused"`.
+    state: &'static str,
+    /// Why, unless connected.
+    reason: Option<String>,
+}
+
+#[pymethods]
+impl ControlStatus {
+    fn __repr__(&self) -> String {
+        format!(
+            "ControlStatus(state={:?}, reason={:?})",
+            self.state, self.reason
+        )
+    }
+}
+
+impl From<ControlState> for ControlStatus {
+    fn from(state: ControlState) -> Self {
+        let (state, reason) = match state {
+            ControlState::Connected => ("connected", None),
+            ControlState::Reconnecting(why) => ("reconnecting", Some(why)),
+            ControlState::Refused(refusal) => {
+                let why = refusal.to_string();
+                let state = match refusal {
+                    Refusal::KeyExpired => "key_expired",
+                    Refusal::NeedsLogin(_) => "needs_login",
+                    Refusal::Refused(_) => "refused",
+                };
+                (state, Some(why))
+            }
+        };
+        Self { state, reason }
+    }
+}
+
 type Shared = Arc<Mutex<Option<Session>>>;
 
 /// A mesh node with its state directory; stop it with `close()`.
@@ -115,7 +155,7 @@ fn stop(session: &Shared) {
 #[pymethods]
 impl Node {
     #[staticmethod]
-    #[pyo3(signature = (statedir, hostname, control_url=None, auth_key=None, timeout=90.0, ephemeral=false, listen="127.0.0.1:0".to_owned(), *, tcp_buffer=None))]
+    #[pyo3(signature = (statedir, hostname, control_url=None, auth_key=None, timeout=90.0, ephemeral=false, listen="127.0.0.1:0".to_owned(), *, tcp_buffer=None, proxy_auth=false))]
     #[allow(clippy::too_many_arguments)]
     fn start<'py>(
         py: Python<'py>,
@@ -127,6 +167,7 @@ impl Node {
         ephemeral: bool,
         listen: String,
         tcp_buffer: Option<usize>,
+        proxy_auth: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut options = SessionOptions::new(statedir.clone(), hostname);
         options.control_url = control_url;
@@ -138,7 +179,10 @@ impl Node {
         }
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut session = Session::start(options).await.map_err(to_py)?;
-            let proxy_url = session.serve_proxy(&listen).await.map_err(io_err)?;
+            let proxy_url = session
+                .serve_proxy_with(&listen, proxy_auth)
+                .await
+                .map_err(io_err)?;
             let addresses = session
                 .node()
                 .addresses()
@@ -231,16 +275,42 @@ impl Node {
         })
     }
 
+    /// How the node stands with the coordination server right now.
+    fn control(&self, py: Python<'_>) -> PyResult<ControlStatus> {
+        // Without the GIL, like `path`.
+        let state = py.detach(|| self.node.upgrade().map(|node| node.control_state()));
+        Ok(state.ok_or_else(closed)?.into())
+    }
+
+    /// The next change of `control()`: resolves with the new status.
+    fn control_changed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let mut changes = self.node.upgrade().ok_or_else(closed)?.watch_control();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            changes.changed().await.map_err(|_| closed())?;
+            let state = changes.borrow_and_update().clone();
+            Ok(ControlStatus::from(state))
+        })
+    }
+
+    /// The network changed (another Wi-Fi, back from sleep): reconnect and
+    /// find paths again now, not on timeouts. Open connections carry on.
+    fn rebind(&self, py: Python<'_>) -> PyResult<()> {
+        py.detach(|| self.node.upgrade().map(|node| node.rebind()))
+            .ok_or_else(closed)
+    }
+
     fn close(&self, py: Python<'_>) {
         // Without the GIL, like `path`: stopping takes the node's locks.
         py.detach(|| stop(&self.session));
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "Node(proxy_url={:?}, addresses={:?})",
-            self.proxy_url, self.addresses
-        )
+        // Without the proxy's credentials, if it has any.
+        let proxy = match self.proxy_url.split_once('@') {
+            Some((_, address)) => format!("http://{address}"),
+            None => self.proxy_url.clone(),
+        };
+        format!("Node(proxy_url={proxy:?}, addresses={:?})", self.addresses)
     }
 }
 
@@ -269,6 +339,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Node>()?;
     m.add_class::<TurnInfo>()?;
     m.add_class::<PeerPath>()?;
+    m.add_class::<ControlStatus>()?;
     m.add("MeshError", py.get_type::<MeshError>())?;
     m.add("NeedsLogin", py.get_type::<NeedsLogin>())?;
     m.add("KeyExpired", py.get_type::<KeyExpired>())?;

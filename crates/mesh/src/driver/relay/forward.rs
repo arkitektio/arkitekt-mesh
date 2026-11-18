@@ -34,7 +34,9 @@ impl Drop for Forward {
 impl Node {
     /// Listen on a free 127.0.0.1 port and forward every connection to
     /// `host:port` on the mesh. For clients that cannot use the HTTP proxy
-    /// (e.g. LiveKit's signaling websocket).
+    /// (e.g. LiveKit's signaling websocket). Unlike the proxy it cannot ask
+    /// for credentials: whoever on this machine finds the port reaches that
+    /// one service as this node.
     pub async fn forward_tcp(self: &Arc<Self>, host: &str, port: u16) -> io::Result<Forward> {
         // Fail now rather than on the first connection.
         let ip = self.resolve(host)?;
@@ -48,7 +50,11 @@ impl Node {
             loop {
                 tokio::select! {
                     accepted = listener.accept() => {
-                        let Ok((mut local, _)) = accepted else { continue };
+                        let Ok((mut local, _)) = accepted else {
+                            // Out of descriptors, usually: not a loop to spin in.
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            continue;
+                        };
                         let Some(node) = node.upgrade() else { return };
                         let target = target.clone();
                         connections.spawn(async move {

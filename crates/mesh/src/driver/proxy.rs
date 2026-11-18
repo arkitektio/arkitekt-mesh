@@ -3,6 +3,11 @@
 //! with every upstream connection dialed through the node. Responses stream
 //! through as they arrive. HTTP only: there is deliberately no SOCKS.
 //!
+//! The proxy is this node to whoever reaches its port, and on a machine
+//! with other users that is all of them: [`serve_with`] takes credentials
+//! every request must then carry (`Proxy-Authorization`, as a client sends
+//! them for a proxy url with `user:password@` in it).
+//!
 //! Upstream connections of `http://` requests are kept and used again, per
 //! host: a connection over the mesh costs a round trip (and, to a peer not
 //! spoken to yet, a handshake) that a request for one chunk of an array
@@ -12,7 +17,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -53,14 +58,41 @@ pub async fn serve<D: Dial>(dialer: D) -> io::Result<(String, JoinHandle<()>)> {
 
 /// Serve the proxy on `listener` (see [`serve`]).
 pub fn serve_on<D: Dial>(dialer: D, listener: TcpListener) -> io::Result<(String, JoinHandle<()>)> {
-    let url = format!("http://{}", listener.local_addr()?);
+    serve_with(dialer, listener, None)
+}
+
+/// Serve the proxy on `listener` (see [`serve`]), open only to requests
+/// with `credentials` (a user and a password, neither with a `:` or `@`
+/// that a url would need escaped). The url returned carries them.
+pub fn serve_with<D: Dial>(
+    dialer: D,
+    listener: TcpListener,
+    credentials: Option<(&str, &str)>,
+) -> io::Result<(String, JoinHandle<()>)> {
+    use base64::Engine;
+    let addr = listener.local_addr()?;
+    let (url, authorization) = match credentials {
+        Some((user, password)) => (
+            format!("http://{user}:{password}@{addr}"),
+            Some(format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"))
+            )),
+        ),
+        None => (format!("http://{addr}"), None),
+    };
     let dialer = Arc::new(dialer);
     let upstream = Client::builder(TokioExecutor::new())
         .pool_idle_timeout(IDLE_UPSTREAM)
         .pool_max_idle_per_host(IDLE_PER_HOST)
         .http1_preserve_header_case(true)
         .build(Connector(dialer.clone()));
-    let proxy = Arc::new(Proxy { dialer, upstream });
+    let proxy = Arc::new(Proxy {
+        dialer,
+        upstream,
+        authorization,
+        tunnels: Mutex::new(JoinSet::new()),
+    });
     let task = tokio::spawn(async move {
         // Owned here, so aborting the proxy also aborts its connections.
         let mut connections = JoinSet::new();
@@ -86,6 +118,11 @@ struct Proxy<D: Dial> {
     dialer: Arc<D>,
     /// For `http://` requests: it keeps the connections it made, by host.
     upstream: Client<Connector<D>, Incoming>,
+    /// The `Proxy-Authorization` every request must carry, if any.
+    authorization: Option<String>,
+    /// The `CONNECT` tunnels: they outlive the request that opened them,
+    /// and end with the proxy (its last handle dropped aborts them).
+    tunnels: Mutex<JoinSet<()>>,
 }
 
 /// Dials the host of a request's url, for [`Client`].
@@ -168,8 +205,22 @@ async fn handle<D: Dial>(
     proxy: Arc<Proxy<D>>,
     req: Request<Incoming>,
 ) -> Result<Response<Body>, Infallible> {
+    if let Some(expected) = &proxy.authorization {
+        let given = req.headers().get(header::PROXY_AUTHORIZATION);
+        if !given.is_some_and(|given| same(given.as_bytes(), expected.as_bytes())) {
+            let mut response = error(
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                "the mesh proxy takes the credentials of its url".into(),
+            );
+            response.headers_mut().insert(
+                header::PROXY_AUTHENTICATE,
+                HeaderValue::from_static("Basic realm=\"arkitekt-mesh\""),
+            );
+            return Ok(response);
+        }
+    }
     let response = if req.method() == Method::CONNECT {
-        tunnel(&*proxy.dialer, req).await
+        tunnel(&proxy, req).await
     } else {
         forward(&proxy.upstream, req).await
     };
@@ -179,10 +230,16 @@ async fn handle<D: Dial>(
 type Failure = (StatusCode, String);
 
 /// `CONNECT host:port`: dial, answer 200, then splice the two connections.
-async fn tunnel<D: Dial>(dialer: &D, req: Request<Incoming>) -> Result<Response<Body>, Failure> {
+async fn tunnel<D: Dial>(
+    proxy: &Proxy<D>,
+    req: Request<Incoming>,
+) -> Result<Response<Body>, Failure> {
     let (host, port) = target(req.uri(), 443)?;
-    let mut upstream = dial(dialer, &host, port).await?;
-    tokio::spawn(async move {
+    let mut upstream = dial(&*proxy.dialer, &host, port).await?;
+    let mut tunnels = proxy.tunnels.lock().unwrap_or_else(|e| e.into_inner());
+    // Those that ended are let go of.
+    while tunnels.try_join_next().is_some() {}
+    tunnels.spawn(async move {
         match hyper::upgrade::on(req).await {
             Ok(client) => {
                 let mut client = TokioIo::new(client);
@@ -262,6 +319,11 @@ async fn dial<D: Dial>(dialer: &D, host: &str, port: u16) -> Result<D::Stream, F
         tracing::debug!("the mesh could not reach {host}:{port}: {e}");
         (StatusCode::BAD_GATEWAY, format!("{host}:{port}: {e}"))
     })
+}
+
+/// Equal, compared in time that does not tell where they differ.
+fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// Drop the headers that describe one connection, not the message.
@@ -470,6 +532,24 @@ mod tests {
         let mut pong = [0u8; 4];
         stream.read_exact(&mut pong).await.unwrap();
         assert_eq!(&pong, b"ping");
+    }
+
+    /// With credentials, a request without them gets a 407 and nothing is
+    /// dialed; the url the proxy hands out carries them.
+    #[tokio::test]
+    async fn credentials_are_asked_of_every_request() {
+        let alpha = server("alpha").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let open = format!("http://{}", listener.local_addr().unwrap());
+        let table = Table(HashMap::from([("alpha", alpha)]));
+        let (url, _task) = serve_with(table, listener, Some(("mesh", "s3cret"))).unwrap();
+        assert!(url.starts_with("http://mesh:s3cret@127.0.0.1:"), "{url}");
+
+        let refused = client(&open).get("http://alpha/").send().await.unwrap();
+        assert_eq!(refused.status().as_u16(), 407);
+        let (_, head) = connect(&open, "alpha:80").await;
+        assert!(head.starts_with("HTTP/1.1 407"), "{head}");
+        assert_eq!(get(&client(&url), "http://alpha/").await, "alpha / alpha");
     }
 
     #[tokio::test]

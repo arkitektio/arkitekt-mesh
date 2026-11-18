@@ -95,6 +95,26 @@ pub async fn connect(host: &str, port: u16, tls: Tls) -> io::Result<BoxIo> {
 /// Connect to `dial:port`, checking the certificate against `name` (DERP
 /// nodes are dialed by IP but certified for their hostname).
 pub async fn connect_named(dial: &str, port: u16, tls: Tls, name: &str) -> io::Result<BoxIo> {
+    // What a proxy would be asked for: a name where there is one.
+    let is_ip = |host: &str| host.parse::<IpAddr>().is_ok();
+    let host = if is_ip(dial) && !is_ip(name) {
+        name
+    } else {
+        dial
+    };
+    connect_at(dial, host, port, tls, name).await
+}
+
+/// Like [`connect_named`], for a server whose hostname is `host`: behind an
+/// HTTP proxy (see [`super::egress`]) the proxy is asked for `host:port` and
+/// does the dialing, since it is names a proxy lets through, and resolves.
+pub async fn connect_at(
+    dial: &str,
+    host: &str,
+    port: u16,
+    tls: Tls,
+    name: &str,
+) -> io::Result<BoxIo> {
     // Every error names the server: a node dials control, its key and any of
     // dozens of DERP nodes, and a bare "BadSignature" says none of which.
     let addr = if dial.contains(':') {
@@ -102,12 +122,29 @@ pub async fn connect_named(dial: &str, port: u16, tls: Tls, name: &str) -> io::R
     } else {
         format!("{dial}:{port}")
     };
-    // An IP literal needs no resolver (tokio's would start a thread pool).
-    let tcp = match dial.parse::<IpAddr>() {
-        Ok(ip) => TcpStream::connect((ip, port)).await,
-        Err(_) => TcpStream::connect((dial, port)).await,
-    }
-    .map_err(|e| context(e, format!("connecting to {addr}")))?;
+    // Only TLS goes through a proxy, and only if neither the name nor the
+    // address is exempt.
+    let egress = super::egress::egress();
+    let proxy = (tls != Tls::None)
+        .then(|| egress.proxy_for(host).and(egress.proxy_for(dial)))
+        .flatten();
+    let (tcp, at) = match proxy {
+        Some(proxy) => (
+            proxy.tunnel(host, port).await?,
+            format!("{host}:{port} through the proxy {}", proxy.address()),
+        ),
+        None => {
+            // An IP literal needs no resolver (tokio's would start a thread pool).
+            let tcp = match dial.parse::<IpAddr>() {
+                Ok(ip) => TcpStream::connect((ip, port)).await,
+                Err(_) => TcpStream::connect((dial, port)).await,
+            }
+            .map_err(|e| context(e, format!("connecting to {addr}")))?;
+            // The address actually reached: a name may resolve to several.
+            let at = tcp.peer_addr().map_or(addr, |a| a.to_string());
+            (tcp, at)
+        }
+    };
     tcp.set_nodelay(true)?;
     if tls == Tls::None {
         return Ok(Box::new(tcp));
@@ -123,9 +160,7 @@ pub async fn connect_named(dial: &str, port: u16, tls: Tls, name: &str) -> io::R
     } else {
         " (unverified)"
     };
-    // The address actually reached: a name may resolve to several.
-    let at = tcp.peer_addr().map_or(addr, |a| a.to_string());
-    let connector = tokio_rustls::TlsConnector::from(tls_config(tls == Tls::Verify));
+    let connector = tokio_rustls::TlsConnector::from(tls_config(tls == Tls::Verify).await);
     let stream = connector
         .connect(name, tcp)
         .await
@@ -153,14 +188,21 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 /// self-hosted control server whose DERP nodes carry its own certificates.
 static EXTRA_ROOTS: Mutex<Vec<CertificateDer<'static>>> = Mutex::new(Vec::new());
 
-/// Whether the public web PKI roots are trusted too (the default).
+/// Whether the public web PKI roots, and this system's own, are trusted
+/// too (the default).
 static PUBLIC_ROOTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// Counts changes to what is trusted: a TLS configuration made before one
+/// is made again.
+static TRUST_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Trust only the roots added with [`add_trust_roots_pem`], not the ~150
-/// public ones: for a private deployment on a small device, where every
-/// verified connection would otherwise hold its own copy of them.
+/// public ones nor the system's: for a private deployment on a small
+/// device, where every verified connection would otherwise hold its own
+/// copy of them.
 pub fn trust_public_roots(trust: bool) {
     PUBLIC_ROOTS.store(trust, std::sync::atomic::Ordering::Relaxed);
+    TRUST_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The environment variable naming a PEM file of extra CA certificates
@@ -185,6 +227,7 @@ pub fn add_trust_roots_pem(pem: &[u8]) -> io::Result<usize> {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .extend(certs);
+    TRUST_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(n)
 }
 
@@ -202,15 +245,58 @@ fn load_ca_file() {
     });
 }
 
-fn tls_config(verify: bool) -> Arc<rustls::ClientConfig> {
+/// The TLS configuration, verifying or not: made once and shared, so the
+/// roots are read once and a reconnect resumes its server's last session.
+/// Made again after a change to what is trusted.
+async fn tls_config(verify: bool) -> Arc<rustls::ClientConfig> {
+    type Made = Option<(u64, Arc<rustls::ClientConfig>)>;
+    static CONFIGS: Mutex<[Made; 2]> = Mutex::new([None, None]);
+    if verify {
+        // Before the count is read: the file's roots are a change too.
+        load_ca_file();
+    }
+    let changes = TRUST_CHANGES.load(std::sync::atomic::Ordering::Relaxed);
+    let made = CONFIGS.lock().unwrap_or_else(|e| e.into_inner())[usize::from(verify)].clone();
+    if let Some((at, config)) = made {
+        if at == changes {
+            return config;
+        }
+    }
+    // Off the reactor: the system's store is files, or a keychain to ask.
+    let config = match tokio::task::spawn_blocking(move || build_tls_config(verify)).await {
+        Ok(config) => config,
+        Err(_) => build_tls_config(verify),
+    };
+    CONFIGS.lock().unwrap_or_else(|e| e.into_inner())[usize::from(verify)] =
+        Some((changes, config.clone()));
+    config
+}
+
+/// The roots this system trusts (its certificate store, or what
+/// `SSL_CERT_FILE` and `SSL_CERT_DIR` name): where an institute's own CA is
+/// installed when its network re-signs TLS on the way out. The bundled
+/// public roots stay beside them, for a system that ships none (a slim
+/// container).
+#[cfg(feature = "os-roots")]
+fn add_system_roots(roots: &mut rustls::RootCertStore) {
+    let found = rustls_native_certs::load_native_certs();
+    for e in &found.errors {
+        tracing::debug!("reading the system's certificate store: {e}");
+    }
+    let (added, ignored) = roots.add_parsable_certificates(found.certs);
+    tracing::debug!("trusting {added} root(s) of the system's store ({ignored} unusable)");
+}
+
+fn build_tls_config(verify: bool) -> Arc<rustls::ClientConfig> {
     let builder = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .expect("the provider supports the default versions");
     let config = if verify {
-        load_ca_file();
         let mut roots = rustls::RootCertStore::empty();
         if PUBLIC_ROOTS.load(std::sync::atomic::Ordering::Relaxed) {
             roots.roots = webpki_roots::TLS_SERVER_ROOTS.to_vec();
+            #[cfg(feature = "os-roots")]
+            add_system_roots(&mut roots);
         }
         for cert in EXTRA_ROOTS.lock().unwrap_or_else(|e| e.into_inner()).iter() {
             if let Err(e) = roots.add(cert.clone()) {

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use mesh::driver::{Session, SessionError, SessionOptions, TurnInfo};
+use mesh::driver::{ControlState, Refusal, Session, SessionError, SessionOptions, TurnInfo};
 use serde::Serialize;
 use tokio::io::AsyncReadExt;
 
@@ -29,6 +29,29 @@ enum Event {
         code: &'static str,
         message: String,
     },
+    /// After `ready`, whenever the node's standing with control changes.
+    Control {
+        state: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+fn control_event(state: ControlState) -> Event {
+    let (state, reason) = match state {
+        ControlState::Connected => ("connected", None),
+        ControlState::Reconnecting(why) => ("reconnecting", Some(why)),
+        ControlState::Refused(refusal) => {
+            let why = refusal.to_string();
+            let state = match refusal {
+                Refusal::KeyExpired => "key_expired",
+                Refusal::NeedsLogin(_) => "needs_login",
+                Refusal::Refused(_) => "refused",
+            };
+            (state, Some(why))
+        }
+    };
+    Event::Control { state, reason }
 }
 
 fn emit(event: &Event) {
@@ -66,6 +89,8 @@ struct Args {
     /// Bytes of TCP buffer per connection, each way.
     tcp_buffer: Option<usize>,
     ephemeral: bool,
+    /// The proxy asks every request for credentials (in its url).
+    proxy_auth: bool,
     turn: bool,
     forwards: Vec<(String, String, u16)>,
     no_stdin: bool,
@@ -117,6 +142,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, Failure> {
                 })?);
             }
             "ephemeral" => args.ephemeral = true,
+            "proxy-auth" => args.proxy_auth = true,
             "turn" => args.turn = true,
             "no-stdin" => args.no_stdin = true,
             "version" => args.version = true,
@@ -165,8 +191,18 @@ async fn run(args: Args) -> Result<(), Failure> {
     }
     let mut session = Session::start(options).await?;
 
+    let listen = args.listen.as_deref().unwrap_or("127.0.0.1:0");
+    let loopback = listen
+        .parse::<SocketAddr>()
+        .is_ok_and(|addr| addr.ip().is_loopback());
+    if !loopback && !args.proxy_auth {
+        tracing::warn!(
+            "the proxy on {listen} is open to whoever reaches it, as this node: \
+             pass --proxy-auth"
+        );
+    }
     let proxy = session
-        .serve_proxy(args.listen.as_deref().unwrap_or("127.0.0.1:0"))
+        .serve_proxy_with(listen, args.proxy_auth)
         .await
         .map_err(|e| fail("listen", format!("the proxy could not listen: {e}")))?;
     let turn = if args.turn {
@@ -183,7 +219,8 @@ async fn run(args: Args) -> Result<(), Failure> {
         forwards.insert(name, addr);
     }
 
-    tracing::info!("connected to the mesh as {hostname}; proxy at {proxy}");
+    // Not the url: with --proxy-auth it carries the credentials.
+    tracing::info!("connected to the mesh as {hostname}; the proxy is up");
     emit(&Event::Ready {
         proxy,
         hostname,
@@ -196,7 +233,14 @@ async fn run(args: Args) -> Result<(), Failure> {
         turn,
         forwards,
     });
-    // Serve until stopped; the session stops when dropped.
+    // Serve until stopped (the session stops when dropped), saying how
+    // the node stands with control whenever that changes.
+    let mut control = session.node().watch_control();
+    control.mark_unchanged();
+    while control.changed().await.is_ok() {
+        let state = control.borrow_and_update().clone();
+        emit(&control_event(state));
+    }
     std::future::pending::<()>().await;
     Ok(())
 }

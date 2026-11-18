@@ -32,6 +32,10 @@ const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// After a rebind: the network changed, not control.
 const BACKOFF_REBIND: Duration = Duration::from_millis(100);
+/// How long a reconnect may take to connect, and then to register: a
+/// control server (or something on the way) that takes the connection and
+/// says nothing would otherwise hold the session for good.
+pub const ANSWER_LIMIT: Duration = Duration::from_secs(30);
 
 /// A call, by the session's count.
 pub type CallId = u64;
@@ -67,6 +71,20 @@ pub enum SessionError {
     Refused(#[from] Refusal),
     #[error("control: {0}")]
     Api(#[from] ApiError),
+}
+
+/// How the node stands with control, once it has registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlState {
+    /// Registered, the map stream open: the netmap is current.
+    Connected,
+    /// Not connected, and trying again: why. The node runs on with the
+    /// netmap it has.
+    Reconnecting(String),
+    /// Control answers and will not have this node (its key expired, the
+    /// node was removed, it needs a login). Still tried again, but it takes
+    /// someone's doing: a new login, usually.
+    Refused(Refusal),
 }
 
 /// The answer to a call, as the driver's transport gives it.
@@ -130,6 +148,9 @@ pub struct ControlSession {
     next_id: CallId,
     /// When the stream was last heard.
     heard: Instant,
+    /// When the connection in the making was asked for, then its register.
+    since: Instant,
+    state: ControlState,
     /// What updates tell control, and whether one is due or in flight.
     endpoints: Vec<(SocketAddr, EndpointType)>,
     home: HomeReport,
@@ -149,6 +170,8 @@ impl ControlSession {
             backoff: BACKOFF_FIRST,
             next_id: 0,
             heard: now,
+            since: now,
+            state: ControlState::Reconnecting("not registered yet".into()),
             endpoints: Vec::new(),
             home: (None, Default::default()),
             tka_head,
@@ -163,10 +186,11 @@ impl ControlSession {
     // ------------------------------------------------------------ inputs --
 
     /// The connection asked for is up.
-    pub fn connected(&mut self, _now: Instant) {
+    pub fn connected(&mut self, now: Instant) {
         if self.phase != Phase::Connecting {
             return;
         }
+        self.since = now;
         let call = Call::register(&RegisterRequest {
             version: CAPABILITY_VERSION,
             node_key: self.config.node_key,
@@ -192,6 +216,7 @@ impl ControlSession {
             return self.end(SessionError::Unreachable(reason.to_owned()));
         }
         tracing::warn!("reconnecting to control: {reason}");
+        self.state = ControlState::Reconnecting(reason.to_owned());
         self.retry(now);
     }
 
@@ -202,7 +227,10 @@ impl ControlSession {
             _ if !self.started => {
                 self.end(SessionError::Unreachable("the connection dropped".into()))
             }
-            _ => self.retry(now),
+            _ => {
+                self.state = ControlState::Reconnecting("the connection dropped".into());
+                self.retry(now)
+            }
         }
     }
 
@@ -235,6 +263,7 @@ impl ControlSession {
             return;
         }
         tracing::debug!("rebind: reconnecting to control");
+        self.state = ControlState::Reconnecting("the network changed".into());
         self.backoff = BACKOFF_REBIND;
         self.events.push_back(Event::Disconnect);
         self.retry(now);
@@ -269,10 +298,26 @@ impl ControlSession {
         match self.phase {
             Phase::Waiting(at) if now >= at => {
                 self.phase = Phase::Connecting;
+                self.since = now;
                 self.events.push_back(Event::Connect);
             }
             Phase::Streaming(_) if now >= self.heard + QUIET_LIMIT => {
                 tracing::debug!("the map stream went quiet; reconnecting");
+                self.state = ControlState::Reconnecting("the map stream went quiet".into());
+                self.events.push_back(Event::Disconnect);
+                self.retry(now);
+            }
+            // A reconnect only: the first connection is the start's to time.
+            Phase::Connecting | Phase::Registering(_)
+                if self.started && now >= self.since + ANSWER_LIMIT =>
+            {
+                let reason = format!(
+                    "control did not {} within {} s",
+                    self.waiting_for(),
+                    ANSWER_LIMIT.as_secs()
+                );
+                tracing::warn!("reconnecting to control: {reason}");
+                self.state = ControlState::Reconnecting(reason);
                 self.events.push_back(Event::Disconnect);
                 self.retry(now);
             }
@@ -303,8 +348,16 @@ impl ControlSession {
         match self.phase {
             Phase::Waiting(at) => Some(at),
             Phase::Streaming(_) => Some(self.heard + QUIET_LIMIT),
+            Phase::Connecting | Phase::Registering(_) if self.started => {
+                Some(self.since + ANSWER_LIMIT)
+            }
             _ => None,
         }
+    }
+
+    /// How the node stands with control right now.
+    pub fn state(&self) -> &ControlState {
+        &self.state
     }
 
     pub fn is_ended(&self) -> bool {
@@ -335,10 +388,15 @@ impl ControlSession {
                 return self.end(error);
             }
             tracing::warn!("reconnecting to control: {error}");
+            self.state = match error {
+                SessionError::Refused(refusal) => ControlState::Refused(refusal),
+                other => ControlState::Reconnecting(other.to_string()),
+            };
             self.events.push_back(Event::Disconnect);
             return self.retry(now);
         }
         self.started = true;
+        self.state = ControlState::Connected;
         self.events.push_back(Event::Registered);
         let call = Call::map(&self.map_request(true));
         let id = self.send(call, true);
@@ -360,11 +418,13 @@ impl ControlSession {
             }
             Answer::MapEnded | Answer::Whole { .. } => {
                 tracing::debug!("the map stream ended; reconnecting");
+                self.state = ControlState::Reconnecting("the map stream ended".into());
                 self.events.push_back(Event::Disconnect);
                 self.retry(now);
             }
             Answer::Failed(e) => {
                 tracing::debug!("map stream: {e}");
+                self.state = ControlState::Reconnecting(format!("map stream: {e}"));
                 self.events.push_back(Event::Disconnect);
                 self.retry(now);
             }

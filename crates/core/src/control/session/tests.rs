@@ -277,3 +277,39 @@ fn answers_of_a_dropped_connection_are_ignored() {
     s.answer(at(121), stream, map(r#"{"Domain":"late"}"#));
     assert!(events(&mut s).is_empty());
 }
+
+/// After the start, a key control no longer takes is said, not only
+/// retried; and a reconnect that gets no answer does not wait for good.
+#[test]
+fn a_refusal_after_the_start_shows_and_a_silent_reconnect_is_given_up() {
+    let (mut s, stream, _) = streaming(at(0));
+    assert_eq!(*s.state(), ControlState::Connected);
+    s.answer(at(1), stream, Answer::MapEnded);
+    assert!(matches!(s.state(), ControlState::Reconnecting(_)));
+    events(&mut s);
+
+    // Connected again, and the register never answered.
+    let wait = s.poll_timeout().unwrap();
+    s.handle_timeout(wait);
+    s.connected(wait);
+    let asked = events(&mut s);
+    let register = sends(&asked)[0].0;
+    assert_eq!(s.poll_timeout(), Some(wait + ANSWER_LIMIT));
+    s.handle_timeout(wait + ANSWER_LIMIT);
+    assert!(matches!(events(&mut s)[..], [Event::Disconnect]));
+    s.answer(wait + ANSWER_LIMIT, register, registered()); // of the connection gone
+    assert!(matches!(s.state(), ControlState::Reconnecting(_)));
+
+    // The next one is refused: the key expired meanwhile.
+    let wait = s.poll_timeout().unwrap();
+    s.handle_timeout(wait);
+    s.connected(wait);
+    let asked = events(&mut s);
+    let expired = Answer::Whole {
+        status: 200,
+        body: br#"{"NodeKeyExpired":true}"#.to_vec(),
+    };
+    s.answer(wait, sends(&asked)[0].0, expired);
+    assert_eq!(*s.state(), ControlState::Refused(Refusal::KeyExpired));
+    assert!(!s.is_ended(), "tried again all the same");
+}

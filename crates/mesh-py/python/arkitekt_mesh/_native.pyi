@@ -31,11 +31,22 @@ class PeerPath:
     """The peer's UDP address when direct, the DERP region code (e.g. ``waw``)
     when relayed, else ``None``."""
 
+class ControlStatus:
+    """How the node stands with the coordination server (see ``Node.control``)."""
+    state: Literal["connected", "reconnecting", "key_expired", "needs_login", "refused"]
+    """``reconnecting``: it tries again by itself, and runs on with the peers
+    it knows. The last three take a new login (the node still retries, but
+    its view of the mesh goes stale meanwhile)."""
+    reason: Optional[str]
+    """Why, unless connected."""
+
 class Node:
     """A mesh node with its state directory; stop it with ``close``."""
 
     proxy_url: str
-    """The local HTTP proxy into the mesh, e.g. ``http://127.0.0.1:41234``."""
+    """The local HTTP proxy into the mesh, e.g. ``http://127.0.0.1:41234``;
+    with ``proxy_auth``, ``http://mesh:<token>@127.0.0.1:41234`` (a secret:
+    keep it out of logs)."""
     addresses: List[str]
     """This node's addresses on the mesh."""
     statedir: str
@@ -51,10 +62,14 @@ class Node:
         listen: str = "127.0.0.1:0",
         *,
         tcp_buffer: Optional[int] = None,
+        proxy_auth: bool = False,
     ) -> "Node":
         """Start (or join) the node. ``tcp_buffer`` is the bytes of buffer per
         connection, each way: what a connection can have in flight, so its
-        throughput is at most this per round trip (default: 1 MiB)."""
+        throughput is at most this per round trip (default: 1 MiB).
+        ``proxy_auth`` has the proxy ask every request for credentials that
+        ``proxy_url`` then carries: without them any user of this machine
+        reaches the mesh as this node."""
     @staticmethod
     def has_state(statedir: str) -> bool:
         """Whether a node was already joined in ``statedir``."""
@@ -66,4 +81,11 @@ class Node:
         """How packets to the peer ``host`` (a mesh name or address) travel
         right now. A path starts out relayed and turns direct once one is
         found, usually seconds after the first packet."""
+    def control(self) -> ControlStatus:
+        """How the node stands with the coordination server right now."""
+    async def control_changed(self) -> ControlStatus:
+        """Wait for the next change of ``control()``."""
+    def rebind(self) -> None:
+        """The network changed (another Wi-Fi, back from sleep): reconnect and
+        find paths again now. Open connections carry on."""
     def close(self) -> None: ...
