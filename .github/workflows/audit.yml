@@ -1,8 +1,8 @@
 name: Audit
 
 # Known vulnerabilities in what Cargo.lock pins (RustSec). Apart from CI, so
-# an advisory published overnight does not hold a release back: it opens an
-# issue instead.
+# an advisory published overnight does not hold a release back: this run goes red
+# instead.
 on:
   schedule:
     - cron: "0 6 * * 1"
@@ -14,12 +14,12 @@ on:
 jobs:
   audit:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
-      checks: write
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      # Red while an advisory stands. Most of the lockfile is the tests'
+      # (reqwest, rustls-rustcrypto): `cargo tree -e normal,build -i <crate>`
+      # says whether one is in what ships.
+      - run: cargo audit
