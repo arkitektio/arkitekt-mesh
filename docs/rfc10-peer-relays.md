@@ -1,8 +1,8 @@
 # RFC-10: Paths through peer relays
 
-**Status:** The client is implemented (November 2026) and tested against
-tailscale's own relay server and peer. Our node is no relay server itself
-(see "Not done"). A tailscaled peer takes part with an ionskale that tells
+**Status:** Implemented (November 2026), both sides: our node uses peer
+relays and can be one, each tested against tailscale's own code on the
+other side. A tailscaled peer takes part with an ionskale that tells
 capability versions (its commit 11d808c, November 2026).
 
 ## Problem
@@ -61,6 +61,16 @@ node) is how that node knows it may.
   replaces it as soon as one is proven.
 - `Limits::peer_relay` (on; off for `Limits::small`), `PeerPath::PeerRelay`
   (`kind == "relay"`, `via == "peer relay <address>"` in Python).
+- **The relay itself.** `core/src/relay_server.rs`, without I/O: endpoints
+  per pair of disco keys, the bind handshake, forwarding by VNI, expiry
+  (unbound after 30 s, silent after five minutes), 4096 endpoints at most.
+  Its challenge is a MAC over the bind and the address it came from, under a
+  secret that changes every two minutes: nothing is kept for a bind, so one
+  from a forged address costs a reply and no state. `Node::serve_peer_relay`
+  (`driver/peer_relay.rs`) puts it on a UDP port (IPv4 and IPv6) and hands
+  endpoints to the peers that ask over DERP and hold
+  `tailscale.com/cap/relay` towards us. `Session::serve_peer_relay`,
+  `meshd --peer-relay-port`, `Node.relay()` in Python.
 
 Where we do not follow tailscale:
 
@@ -89,11 +99,20 @@ Where we do not follow tailscale:
   through the relay; two of our own nodes through it; peer relays off.
 - `fuzz/fuzz_targets/datagrams.rs`: Geneve and the relay messages among
   what a stranger can send.
+- `core/src/relay_server/tests.rs`: the relay as a client meets it, sealed
+  and under Geneve: who is bound and who is not, the secret's rotation,
+  expiry, the table's bound, five thousand datagrams of noise. The
+  path-selection tests above run against it too.
+- `mesh/tests/peer_relay.rs`, the relay's side: two tsnet nodes that take no
+  direct path reach each other through our node's port (`tailscale ping`
+  says so); three of our own nodes, one relaying, two carrying a megabyte
+  each way through it.
 
 ## Setting it up
 
-A node with a UDP port both sides reach runs tailscaled with
-`tailscale set --relay-server-port=<port>`, and the tailnet's policy grants
+A node with a UDP port both sides reach is the relay: ours
+(`Node::serve_peer_relay`, `meshd --peer-relay-port <port>`), or a tailscaled
+with `tailscale set --relay-server-port=<port>`. The tailnet's policy grants
 its use. With ionskale, whose app grants are passed on as written, both
 directions are spelled out:
 
@@ -118,11 +137,13 @@ direct paths away, to see a relay work where the nodes reach each other.
   relay. From that commit on it keeps the version a machine polls with and
   sends it (its `tests/peer_relay_test.go`: two tailscaled through a third).
   A machine is told of once it has polled again after the upgrade.
-- **No relay server of our own.** A relay is a tailscaled. Ours would be
-  `net/udprelay` again (allocation, the bind handshake's MACs, forwarding,
-  garbage collection), for meshd.
-- **No relay on a board or in the browser** (`Limits::small`, the web
-  node): off, unmeasured.
+- **The relay forwards a datagram at a time, on one task per socket.** No
+  batching (`recvmmsg`, GSO) as tailscale's has: its ceiling is unmeasured,
+  and lower.
+- **A relay does not relay for itself.** Tailscale's node allocates on its
+  own relay without the trip through DERP; ours asks only other nodes.
+- **No relay, and no use of one, on a board or in the browser**
+  (`Limits::small`, the web node): off, unmeasured.
 - **The path's MTU is not probed.** The Geneve header adds eight bytes to a
   tunnel packet of at most 1280 + 32: within any Ethernet, not within every
   tunnel under us.

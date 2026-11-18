@@ -116,6 +116,46 @@ impl From<ControlState> for ControlStatus {
     }
 }
 
+/// The peer relay this node runs (see `Node.relay`).
+#[pyclass(frozen, get_all, module = "arkitekt_mesh")]
+struct RelayStatus {
+    /// The UDP port it forwards on.
+    port: u16,
+    /// Where peers are told to reach it.
+    addresses: Vec<String>,
+    /// Pairs of peers it has endpoints for, and those both have bound to.
+    sessions: usize,
+    bound: usize,
+    /// Datagrams and bytes forwarded for the pairs it has now.
+    packets: u64,
+    bytes: u64,
+}
+
+#[pymethods]
+impl RelayStatus {
+    fn __repr__(&self) -> String {
+        format!(
+            "RelayStatus(port={}, addresses={:?}, sessions={}, bound={}, packets={}, bytes={})",
+            self.port, self.addresses, self.sessions, self.bound, self.packets, self.bytes
+        )
+    }
+}
+
+fn relay_status(relay: &mesh::driver::PeerRelay) -> RelayStatus {
+    let sessions = relay.sessions();
+    RelayStatus {
+        port: relay.port(),
+        addresses: relay.addrs().iter().map(ToString::to_string).collect(),
+        sessions: sessions.len(),
+        bound: sessions
+            .iter()
+            .filter(|s| s.bound.iter().all(Option::is_some))
+            .count(),
+        packets: sessions.iter().flat_map(|s| s.packets).sum(),
+        bytes: sessions.iter().flat_map(|s| s.bytes).sum(),
+    }
+}
+
 /// A ping's answer (see `Node.ping`).
 #[pyclass(frozen, get_all, module = "arkitekt_mesh")]
 struct Pinged {
@@ -284,6 +324,52 @@ impl Node {
         })
     }
 
+    /// Relay UDP on `port` for the peers the mesh lets ask: a peer relay,
+    /// where pairs that find no direct path to each other meet. `endpoints`
+    /// (`"ip:port"`) are where peers are told to reach the port, for a relay
+    /// behind a port forward. Started once; asked again, its status.
+    #[pyo3(signature = (port, endpoints=None))]
+    fn relay<'py>(
+        &self,
+        py: Python<'py>,
+        port: u16,
+        endpoints: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let endpoints = endpoints
+            .unwrap_or_default()
+            .iter()
+            .map(|e| {
+                e.parse::<std::net::SocketAddr>().map_err(|_| {
+                    MeshError::new_err(format!("not an ip:port to reach the relay at: {e:?}"))
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let session = self.session.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut slot = session.lock().await;
+            let relay = slot
+                .as_mut()
+                .ok_or_else(closed)?
+                .serve_peer_relay(port, endpoints)
+                .await
+                .map_err(io_err)?;
+            Ok(relay_status(relay))
+        })
+    }
+
+    /// The peer relay's status, or `None` if this node runs none.
+    fn relay_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let session = self.session.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let slot = session.lock().await;
+            Ok(slot
+                .as_ref()
+                .ok_or_else(closed)?
+                .peer_relay()
+                .map(relay_status))
+        })
+    }
+
     /// How packets to the peer `host` (a mesh name or address) travel right
     /// now. A path starts out relayed and turns direct once one is found,
     /// usually seconds after the first packet.
@@ -381,6 +467,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PeerPath>()?;
     m.add_class::<ControlStatus>()?;
     m.add_class::<Pinged>()?;
+    m.add_class::<RelayStatus>()?;
     m.add("MeshError", py.get_type::<MeshError>())?;
     m.add("NeedsLogin", py.get_type::<NeedsLogin>())?;
     m.add("KeyExpired", py.get_type::<KeyExpired>())?;

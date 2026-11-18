@@ -24,6 +24,9 @@ enum Event {
         turn: Option<TurnInfo>,
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
         forwards: BTreeMap<String, SocketAddr>,
+        /// The peer relay's port and where peers are told to reach it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        peer_relay: Option<PeerRelayInfo>,
     },
     Error {
         code: &'static str,
@@ -35,6 +38,12 @@ enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct PeerRelayInfo {
+    port: u16,
+    addresses: Vec<SocketAddr>,
 }
 
 fn control_event(state: ControlState) -> Event {
@@ -92,6 +101,10 @@ struct Args {
     /// The proxy asks every request for credentials (in its url).
     proxy_auth: bool,
     turn: bool,
+    /// Relay UDP for peers on this port (0: any), and where they are told
+    /// to reach it.
+    peer_relay_port: Option<u16>,
+    peer_relay_endpoints: Vec<SocketAddr>,
     forwards: Vec<(String, String, u16)>,
     no_stdin: bool,
     version: bool,
@@ -138,6 +151,24 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, Failure> {
                     fail(
                         "usage",
                         format!("--forward takes NAME=host:port, not {spec:?}"),
+                    )
+                })?);
+            }
+            "peer-relay-port" => {
+                let raw = value()?;
+                args.peer_relay_port = Some(raw.parse().map_err(|_| {
+                    fail(
+                        "usage",
+                        format!("--peer-relay-port takes a UDP port, not {raw:?}"),
+                    )
+                })?);
+            }
+            "peer-relay-endpoint" => {
+                let raw = value()?;
+                args.peer_relay_endpoints.push(raw.parse().map_err(|_| {
+                    fail(
+                        "usage",
+                        format!("--peer-relay-endpoint takes ip:port, not {raw:?}"),
                     )
                 })?);
             }
@@ -210,6 +241,19 @@ async fn run(args: Args) -> Result<(), Failure> {
     } else {
         None
     };
+    let peer_relay = match args.peer_relay_port {
+        Some(port) => {
+            let relay = session
+                .serve_peer_relay(port, args.peer_relay_endpoints)
+                .await
+                .map_err(|e| fail("peer_relay", e))?;
+            Some(PeerRelayInfo {
+                port: relay.port(),
+                addresses: relay.addrs(),
+            })
+        }
+        None => None,
+    };
     let mut forwards = BTreeMap::new();
     for (name, host, port) in args.forwards {
         let addr = session
@@ -232,6 +276,7 @@ async fn run(args: Args) -> Result<(), Failure> {
             .collect(),
         turn,
         forwards,
+        peer_relay,
     });
     // Serve until stopped (the session stops when dropped), saying how
     // the node stands with control whenever that changes.
@@ -375,6 +420,7 @@ mod tests {
             ips: vec!["100.64.0.1".into()],
             turn: None,
             forwards: BTreeMap::new(),
+            peer_relay: None,
         };
         assert_eq!(
             serde_json::to_string(&ready).unwrap(),

@@ -40,6 +40,20 @@ class Pinged:
     via: Optional[str]
     """As ``PeerPath.via``: the way the ping and its pong went."""
 
+class RelayStatus:
+    """The peer relay this node runs (see ``Node.relay``)."""
+    port: int
+    """The UDP port it forwards on."""
+    addresses: List[str]
+    """Where peers are told to reach it."""
+    sessions: int
+    """Pairs of peers it has endpoints for."""
+    bound: int
+    """Of those, the pairs both of which have bound: the ones it forwards for."""
+    packets: int
+    bytes: int
+    """Datagrams and bytes forwarded for the pairs it has now."""
+
 class ControlStatus:
     """How the node stands with the coordination server (see ``Node.control``)."""
     state: Literal["connected", "reconnecting", "key_expired", "needs_login", "refused"]
@@ -86,6 +100,15 @@ class Node:
         """Start the TURN relay (once): its relayed traffic goes over the mesh."""
     async def forward(self, host: str, port: int) -> str:
         """A local ``127.0.0.1:P`` forwarding TCP to ``host:port`` on the mesh."""
+    async def relay(self, port: int, endpoints: Optional[List[str]] = None) -> RelayStatus:
+        """Relay UDP on ``port`` for the peers the mesh lets ask: a peer relay,
+        where pairs of peers that find no direct path to each other meet (it
+        forwards, and cannot read, what they send). The port has to be reachable
+        by both. ``endpoints`` (``"ip:port"``) are where peers are told to reach
+        it, for a relay behind a port forward; without them it tells its own
+        address and what a STUN server sees of the port."""
+    async def relay_status(self) -> Optional[RelayStatus]:
+        """The peer relay's status, or ``None`` if this node runs none."""
     def path(self, host: str) -> PeerPath:
         """How packets to the peer ``host`` (a mesh name or address) travel
         right now. A path starts out relayed and turns direct once one is

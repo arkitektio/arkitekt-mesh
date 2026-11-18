@@ -117,6 +117,8 @@ pub struct Session {
     node: Arc<Node>,
     statedir: PathBuf,
     proxy: Option<(String, JoinHandle<()>)>,
+    /// The peer relay this node runs for others, if it does.
+    peer_relay: Option<super::peer_relay::PeerRelay>,
     #[cfg(feature = "relay")]
     relay: Option<super::relay::TurnRelay>,
     #[cfg(feature = "relay")]
@@ -228,6 +230,7 @@ impl Session {
             node: Arc::new(node),
             statedir,
             proxy: None,
+            peer_relay: None,
             #[cfg(feature = "relay")]
             relay: None,
             #[cfg(feature = "relay")]
@@ -274,6 +277,26 @@ impl Session {
         let (url, task) = proxy::serve_with(Tailnet(self.node.clone()), listener, credentials)?;
         self.proxy = Some((url.clone(), task));
         Ok(url)
+    }
+
+    /// Relay UDP on `port` for the peers the mesh lets ask (once; see
+    /// [`Node::serve_peer_relay`]): a peer relay, where pairs of peers that
+    /// find no direct path meet. `endpoints`: where peers are told to reach
+    /// the port, for a relay behind a port forward.
+    pub async fn serve_peer_relay(
+        &mut self,
+        port: u16,
+        endpoints: Vec<std::net::SocketAddr>,
+    ) -> io::Result<&super::peer_relay::PeerRelay> {
+        if self.peer_relay.is_none() {
+            self.peer_relay = Some(self.node.serve_peer_relay(port, endpoints).await?);
+        }
+        Ok(self.peer_relay.as_ref().expect("started"))
+    }
+
+    /// The peer relay, once it is served.
+    pub fn peer_relay(&self) -> Option<&super::peer_relay::PeerRelay> {
+        self.peer_relay.as_ref()
     }
 
     /// The proxy's url, once it is served.
