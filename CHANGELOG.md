@@ -1,6 +1,54 @@
 # CHANGELOG
 
 
+## v0.13.0 (2026-11-18)
+
+### Continuous Integration
+
+- Fuzz targets for unauthenticated input, clippy warnings denied, a weekly audit
+  ([`6e2403c`](https://github.com/arkitektio/arkitekt-mesh/commit/6e2403c4318b71ced0a554398bb4d93b3a6775aa))
+
+Two cargo-fuzz targets (fuzz/, not a workspace member) over what the node parses from senders it has
+  not authenticated: datagrams (STUN, disco, WireGuard, NAT-PMP, UPnP) and streams (HTTP/1.1, DERP
+  frames, map frames). CI checks that they build. RustSec runs apart from CI, so an advisory does
+  not hold a release back.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+### Documentation
+
+- Restricted networks, the control state, proxy credentials; the crates and RFCs as they are
+  ([`77f6899`](https://github.com/arkitektio/arkitekt-mesh/commit/77f68992f0bbb120c57b564686d224d54581fa38))
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+### Features
+
+- Restricted networks, a node that says how it stands with control, proxy credentials
+  ([`134f60e`](https://github.com/arkitektio/arkitekt-mesh/commit/134f60e9362dd5b74a87d87318ef484c7276a103))
+
+Getting out of a restricted network: - control and DERP are dialed through HTTPS_PROXY / ALL_PROXY
+  (CONNECT, Basic credentials), with NO_PROXY's exemptions; loopback is always direct - the system's
+  certificate store is trusted beside the bundled roots (feature os-roots, on by default), for
+  networks that re-sign outbound TLS - the TLS configuration is made once and shared, so reconnects
+  resume
+
+A running node: - says how it stands with control: connected, reconnecting, or refused (its key
+  expired, it was removed). Node::control_state / watch_control, control() and control_changed() in
+  Python, control events from meshd. It retries all the same - gives a reconnect 30 s to connect and
+  to register, and a tailnet-lock sync 30 s, where a silent control server held the session for good
+  - reports a connection the peer reset, or that timed out, as ConnectionReset, not as an end of
+  file - hides peers control lists as expired
+
+The local proxy: - can ask every request for credentials, which its url then carries
+  (Session::serve_proxy_with, proxy_auth= in Python, --proxy-auth for meshd) - owns its CONNECT
+  tunnels: they end with it
+
+Python also gets Node.rebind().
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+
 ## v0.12.2 (2026-11-06)
 
 ### Bug Fixes
