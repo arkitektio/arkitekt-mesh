@@ -41,7 +41,29 @@ pub struct FilterRule {
     /// IP protocol numbers; empty means TCP, UDP and ICMP.
     #[serde(rename = "IPProto")]
     pub ip_proto: Vec<i64>,
+    /// Capabilities the sources hold towards destinations (a rule has these
+    /// or `DstPorts`).
+    #[serde(rename = "CapGrant")]
+    pub cap_grant: Vec<CapGrant>,
 }
+
+/// Capabilities granted to a rule's sources towards `dsts`
+/// (`tailcfg.CapGrant`). Of a capability only its name is kept: none we act
+/// on carries values.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CapGrant {
+    #[serde(rename = "Dsts")]
+    pub dsts: Vec<String>,
+    #[serde(rename = "CapMap")]
+    pub cap_map: alloc::collections::BTreeMap<String, serde::de::IgnoredAny>,
+}
+
+/// A source may ask the destination, a peer relay, for a relay endpoint.
+pub const CAP_RELAY: &str = "tailscale.com/cap/relay";
+/// The destination may have the source, a peer relay, allocate endpoints
+/// towards it: from the destination's side, the source is a relay it may use.
+pub const CAP_RELAY_TARGET: &str = "tailscale.com/cap/relay-target";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -132,15 +154,36 @@ struct Rule {
     protos: Vec<u8>,
 }
 
+/// A grant of the capabilities this client acts on (the peer relay's).
+#[derive(Debug, Clone)]
+struct Grant {
+    sources: Vec<Addrs>,
+    dests: Vec<Addrs>,
+    relay: bool,
+    relay_target: bool,
+}
+
 /// The rules control sent, compiled for matching.
 #[derive(Debug, Clone, Default)]
 pub struct Filter {
     rules: Vec<Rule>,
+    grants: Vec<Grant>,
 }
 
 impl Filter {
     /// Compile control's rules; entries that do not parse are skipped.
     pub fn new(rules: &[FilterRule]) -> Self {
+        let grants = rules
+            .iter()
+            .flat_map(|r| r.cap_grant.iter().map(move |g| (r, g)))
+            .map(|(r, g)| Grant {
+                sources: r.src_ips.iter().filter_map(|s| Addrs::parse(s)).collect(),
+                dests: g.dsts.iter().filter_map(|s| Addrs::parse(s)).collect(),
+                relay: g.cap_map.contains_key(CAP_RELAY),
+                relay_target: g.cap_map.contains_key(CAP_RELAY_TARGET),
+            })
+            .filter(|g| (g.relay || g.relay_target) && !g.sources.is_empty() && !g.dests.is_empty())
+            .collect();
         let rules = rules
             .iter()
             .map(|r| Rule {
@@ -161,7 +204,21 @@ impl Filter {
             })
             .filter(|r| !r.sources.is_empty() && !r.dests.is_empty())
             .collect();
-        Self { rules }
+        Self { rules, grants }
+    }
+
+    /// Whether `src` holds `capability` ([`CAP_RELAY`] or
+    /// [`CAP_RELAY_TARGET`]; any other is not kept) towards `dst`.
+    pub fn grants(&self, src: IpAddr, dst: IpAddr, capability: &str) -> bool {
+        self.grants.iter().any(|grant| {
+            let held = match capability {
+                CAP_RELAY => grant.relay,
+                CAP_RELAY_TARGET => grant.relay_target,
+                _ => false,
+            };
+            held && grant.sources.iter().any(|s| s.contains(src))
+                && grant.dests.iter().any(|d| d.contains(dst))
+        })
     }
 
     /// Whether a packet opening a flow from `src` to `dst:port` over `proto`
@@ -523,6 +580,32 @@ mod tests {
         );
     }
 
+    /// The peer relay's capabilities, as tailscale's control grants them:
+    /// held by the rule's sources towards the grant's destinations.
+    #[test]
+    fn capability_grants_are_read() {
+        let filter = rules(
+            r#"[
+            {"SrcIPs": ["100.64.0.7"], "CapGrant": [{"Dsts": ["100.64.0.0/24"],
+                "CapMap": {"tailscale.com/cap/relay-target": null}}]},
+            {"SrcIPs": ["100.64.0.0/24"], "CapGrant": [{"Dsts": ["100.64.0.7/32"],
+                "CapMap": {"tailscale.com/cap/relay": [{"x": 1}], "example.com/cap/other": []}}]},
+            {"SrcIPs": ["*"], "DstPorts": [{"IP": "*", "Ports": {"First": 80, "Last": 80}}]}
+        ]"#,
+        );
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let (relay, me, far) = (ip("100.64.0.7"), ip("100.64.0.9"), ip("100.64.1.9"));
+        assert!(filter.grants(relay, me, CAP_RELAY_TARGET));
+        assert!(!filter.grants(me, relay, CAP_RELAY_TARGET));
+        assert!(!filter.grants(relay, far, CAP_RELAY_TARGET));
+        assert!(filter.grants(me, relay, CAP_RELAY));
+        assert!(!filter.grants(far, relay, CAP_RELAY));
+        // A capability we do not act on is not kept, and a grant opens no port.
+        assert!(!filter.grants(me, relay, "example.com/cap/other"));
+        assert!(!filter.allows(relay, me, TCP, Some(22)));
+        assert!(filter.allows(relay, me, TCP, Some(80)));
+    }
+
     #[test]
     fn named_sets_update_and_clear() {
         use alloc::collections::BTreeMap;
@@ -533,6 +616,7 @@ mod tests {
                 ports: PortRange::default(),
             }],
             ip_proto: vec![],
+            cap_grant: vec![],
         };
         let mut sets = BTreeMap::new();
         assert!(

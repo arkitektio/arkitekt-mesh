@@ -40,6 +40,8 @@ pub struct Peer {
     /// Its node key expired: control still lists it, and it is not talked
     /// to until it has a new one.
     pub expired: bool,
+    /// The capability version of its client (0: control does not say).
+    pub cap: u16,
 }
 
 impl From<Node> for Peer {
@@ -70,6 +72,7 @@ impl From<Node> for Peer {
             key_signature: n.key_signature,
             unsigned_peer_api_only: n.unsigned_peer_api_only,
             expired: n.expired,
+            cap: u16::try_from(n.cap).unwrap_or(u16::MAX),
         }
     }
 }

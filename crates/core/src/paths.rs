@@ -354,6 +354,13 @@ impl Paths {
                 }
                 self.ping_all(&node, now, false, &mut out);
             }
+            // The peer relay's messages: not acted on yet.
+            Message::RelayBind(_)
+            | Message::RelayChallenge(_)
+            | Message::RelayAnswer(_)
+            | Message::CallMeMaybeVia(_)
+            | Message::AllocateRelay { .. }
+            | Message::RelayAllocated { .. } => {}
         }
         out
     }

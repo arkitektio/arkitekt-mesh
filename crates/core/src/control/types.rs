@@ -206,6 +206,9 @@ pub struct Node {
     pub online: Option<bool>,
     #[serde(rename = "Expired")]
     pub expired: bool,
+    /// The capability version of its client (0: control does not say).
+    #[serde(rename = "Cap")]
+    pub cap: u32,
 }
 
 impl Node {
