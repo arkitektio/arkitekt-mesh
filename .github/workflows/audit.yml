@@ -1,0 +1,25 @@
+name: Audit
+
+# Known vulnerabilities in what Cargo.lock pins (RustSec). Apart from CI, so
+# an advisory published overnight does not hold a release back: it opens an
+# issue instead.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  push:
+    branches: [main]
+    paths: ["**/Cargo.toml", "Cargo.lock"]
+  workflow_dispatch:
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

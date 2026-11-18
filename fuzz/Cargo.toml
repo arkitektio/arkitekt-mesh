@@ -1,0 +1,35 @@
+# Fuzz targets for what the node parses from senders it has not
+# authenticated: `cargo +nightly fuzz run <target>` (cargo-fuzz), from the
+# repository's root. Not a workspace member: it needs nightly and libFuzzer.
+[package]
+name = "arkitekt-mesh-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mesh-core = { path = "../crates/core", package = "arkitekt-mesh-core" }
+
+# What any host on the local network, or the internet, can send our UDP
+# sockets and our gateway discovery: STUN, WireGuard, disco, NAT-PMP, UPnP.
+[[bin]]
+name = "datagrams"
+path = "fuzz_targets/datagrams.rs"
+test = false
+doc = false
+bench = false
+
+# What a server on the way sends before it has proven anything: HTTP/1.1
+# heads and chunked bodies, DERP frames, map-response frames.
+[[bin]]
+name = "streams"
+path = "fuzz_targets/streams.rs"
+test = false
+doc = false
+bench = false

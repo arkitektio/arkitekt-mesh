@@ -22,7 +22,7 @@ jobs:
           cache-dependency-path: crates/mesh/tests/harness/go.sum
       - run: cargo fmt --all --check
       # The smoltcp fork's `*-count-N` features exclude each other.
-      - run: cargo clippy --workspace --exclude arkitekt-mesh-smoltcp --all-targets --all-features
+      - run: cargo clippy --workspace --exclude arkitekt-mesh-smoltcp --all-targets --all-features -- -D warnings
       - run: cargo clippy -p arkitekt-mesh-smoltcp --all-targets
       # The fork's simulator: upstream's snapshot, and SACK recovery's gain.
       - run: cargo test -p arkitekt-mesh-smoltcp --release --features _netsim,socket-tcp-cubic,socket-tcp-reno --test netsim
@@ -30,6 +30,9 @@ jobs:
       # what embassy-net asks of smoltcp.
       - run: cargo check --manifest-path crates/smoltcp-patch/Cargo.toml --no-default-features --features medium-ethernet,medium-ip,proto-ipv4,proto-ipv6,socket-tcp,socket-udp,socket-dns,socket-dhcpv4,async
       - run: cargo test --workspace
+      # The fuzz targets (fuzz/, not a workspace member) still build; running
+      # them takes nightly and cargo-fuzz.
+      - run: cargo check --manifest-path fuzz/Cargo.toml
       # mesh-core alone: on upstream smoltcp (the workspace has `fast-tcp`).
       - run: cargo test -p arkitekt-mesh-core
 
