@@ -18,6 +18,9 @@ pub struct Ready {
     pub peer_name: String,
     pub peer_ip: String,
     pub domain: String,
+    /// The relay's UDP port, in a tailnet with a peer relay.
+    #[serde(default)]
+    pub relay_port: u16,
 }
 
 pub struct Harness {
@@ -94,6 +97,12 @@ pub async fn start_locked() -> Option<Harness> {
 /// Everything (control, DERP, STUN, the peer) on `::1` only.
 pub async fn start_ipv6() -> Option<Harness> {
     start_env(false, 0, None, &[("MESH_HARNESS_ADDR", "::1")]).await
+}
+
+/// A tailnet with a peer relay: a second tsnet node relays UDP, control
+/// grants everyone its use, and the peer takes no direct path.
+pub async fn start_with_relay() -> Option<Harness> {
+    start_env(false, 0, None, &[("MESH_HARNESS_RELAY", "1")]).await
 }
 
 /// Two DERP regions; region 1's STUN answers nothing.

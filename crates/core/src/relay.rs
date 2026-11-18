@@ -235,6 +235,11 @@ impl RelayClient {
                 started: now,
                 resent: false,
             };
+            tracing::debug!(
+                "asking the peer relay {:?} for an endpoint to {:?}",
+                server.node,
+                remote.node
+            );
             out.push(self.request(&allocation, region));
             self.allocations.push(allocation);
         }
@@ -272,6 +277,11 @@ impl RelayClient {
             return;
         };
         let allocation = self.allocations.swap_remove(at);
+        tracing::debug!(
+            "the peer relay {from:?} allocated an endpoint to {:?} (vni {})",
+            allocation.remote.node,
+            endpoint.vni
+        );
         let current = current(&allocation.remote.node);
         self.endpoint(allocation.remote, endpoint, true, current, now, out);
     }
@@ -346,6 +356,13 @@ impl RelayClient {
             return;
         }
         self.handshake_generation = self.handshake_generation.wrapping_add(1).max(1);
+        tracing::debug!(
+            "binding to a peer relay endpoint to {:?} (vni {}, {} address(es), {})",
+            remote.node,
+            endpoint.vni,
+            endpoint.addrs.len(),
+            if ours { "ours" } else { "the peer's" }
+        );
         let handshake = Handshake {
             remote,
             deadline: now + endpoint.bind_lifetime.min(HANDSHAKE_TIMEOUT),
@@ -403,6 +420,7 @@ impl RelayClient {
         if h.state != Bound::Asked {
             return;
         }
+        tracing::debug!("the peer relay at {src} challenged us (vni {vni}); answering");
         h.state = Bound::Answered(src);
         h.challenge = challenge.challenge;
         answer(h, node, src, now, out);

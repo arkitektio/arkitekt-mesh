@@ -57,6 +57,15 @@ pub struct CapGrant {
     pub dsts: Vec<String>,
     #[serde(rename = "CapMap")]
     pub cap_map: alloc::collections::BTreeMap<String, serde::de::IgnoredAny>,
+    /// The older form of the same: names only. Control servers send either.
+    #[serde(rename = "Caps")]
+    pub caps: Vec<String>,
+}
+
+impl CapGrant {
+    fn has(&self, capability: &str) -> bool {
+        self.cap_map.contains_key(capability) || self.caps.iter().any(|c| c == capability)
+    }
 }
 
 /// A source may ask the destination, a peer relay, for a relay endpoint.
@@ -179,8 +188,8 @@ impl Filter {
             .map(|(r, g)| Grant {
                 sources: r.src_ips.iter().filter_map(|s| Addrs::parse(s)).collect(),
                 dests: g.dsts.iter().filter_map(|s| Addrs::parse(s)).collect(),
-                relay: g.cap_map.contains_key(CAP_RELAY),
-                relay_target: g.cap_map.contains_key(CAP_RELAY_TARGET),
+                relay: g.has(CAP_RELAY),
+                relay_target: g.has(CAP_RELAY_TARGET),
             })
             .filter(|g| (g.relay || g.relay_target) && !g.sources.is_empty() && !g.dests.is_empty())
             .collect();
@@ -605,6 +614,15 @@ mod tests {
         assert!(!filter.grants(relay, far, CAP_RELAY_TARGET));
         assert!(filter.grants(me, relay, CAP_RELAY));
         assert!(!filter.grants(far, relay, CAP_RELAY));
+        // The older form, names in a list (tailscale's test control).
+        let listed = rules(
+            r#"[{"SrcIPs": ["*"], "CapGrant": [{"Dsts": ["0.0.0.0/0", "::/0"],
+                "Caps": ["https://tailscale.com/cap/ingress", "tailscale.com/cap/relay",
+                         "tailscale.com/cap/relay-target"]}]}]"#,
+        );
+        assert!(listed.grants(relay, me, CAP_RELAY_TARGET));
+        assert!(listed.grants(me, relay, CAP_RELAY));
+        assert!(!listed.grants(ip("fd7a::1"), me, "https://tailscale.com/cap/ingress"));
         // A capability we do not act on is not kept, and a grant opens no port.
         assert!(!filter.grants(me, relay, "example.com/cap/other"));
         assert!(!filter.allows(relay, me, TCP, Some(22)));

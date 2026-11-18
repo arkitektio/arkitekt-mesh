@@ -192,6 +192,9 @@ pub struct Paths {
     endpoints: Vec<SocketAddr>,
     /// Whether direct UDP is used at all.
     udp: bool,
+    /// No direct paths: peer relays and DERP only (see
+    /// [`set_never_direct`](Self::set_never_direct)).
+    never_direct: bool,
     /// Paths through peer relays: the servers we may use, and what is under
     /// way with them.
     relay: RelayClient,
@@ -206,7 +209,15 @@ impl Paths {
             peers: HashMap::new(),
             endpoints: Vec::new(),
             udp: true,
+            never_direct: false,
         }
+    }
+
+    /// Neither look for direct paths nor answer a peer looking for one: what
+    /// is left is the peer relays and DERP. For testing relays where the
+    /// peers reach each other, as tailscale's `TS_DEBUG_NEVER_DIRECT_UDP`.
+    pub fn set_never_direct(&mut self, never: bool) {
+        self.never_direct = never;
     }
 
     /// The peers we may use as relays (none: peer relays are off).
@@ -371,6 +382,9 @@ impl Paths {
             self.activate(info, now);
         }
         let their_disco = sender;
+        if self.never_direct && matches!(via, Via::Udp(_)) {
+            return out;
+        }
         match msg {
             Message::Ping { tx, .. } => {
                 let src = match via {
@@ -759,7 +773,7 @@ impl Paths {
         call_me_maybe: bool,
         out: &mut Vec<Transmit>,
     ) {
-        if !self.udp {
+        if !self.udp || self.never_direct {
             return;
         }
         let Some(p) = self.peers.get_mut(key) else {

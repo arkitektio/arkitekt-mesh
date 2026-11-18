@@ -19,6 +19,10 @@
 // signs that node's key (it must have registered first).
 // MESH_HARNESS_ADDR binds everything to that address instead of 127.0.0.1,
 // so devices on the network (an ESP32 on Wi-Fi or PPP) can join.
+// MESH_HARNESS_RELAY=1 adds a peer relay: a second tsnet node ("relay") that
+// relays UDP on a port of its own, and control grants every node its use.
+// The tsnet nodes then take no direct path (TS_DEBUG_NEVER_DIRECT_UDP), so
+// the peer is reached through the relay or through DERP.
 package harness
 
 import (
@@ -39,6 +43,9 @@ import (
 	"time"
 
 	"tailscale.com/client/local"
+	"tailscale.com/envknob"
+	_ "tailscale.com/feature/relayserver"
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/netns"
 	"tailscale.com/net/stun"
@@ -84,6 +91,7 @@ type Ready struct {
 	PeerName   string `json:"peer_name"`
 	PeerIP     string `json:"peer_ip"`
 	Domain     string `json:"domain"`
+	RelayPort  uint16 `json:"relay_port,omitempty"`
 }
 
 func TestHarness(t *testing.T) {
@@ -142,6 +150,12 @@ func TestHarness(t *testing.T) {
 	}
 	if os.Getenv("MESH_HARNESS_OPEN") == "" {
 		control.RequireAuthKey = authKey
+	}
+	relayed := os.Getenv("MESH_HARNESS_RELAY") != ""
+	if relayed {
+		// The relay and relay-target capabilities, for everyone.
+		control.PeerRelayGrants = true
+		envknob.Setenv("TS_DEBUG_NEVER_DIRECT_UDP", "true")
 	}
 	if n, _ := strconv.Atoi(os.Getenv("MESH_HARNESS_FAKE_PEERS")); n > 0 {
 		addFakePeers(control, n)
@@ -254,12 +268,18 @@ func TestHarness(t *testing.T) {
 		}
 	}
 
+	var relayPort uint16
+	if relayed {
+		relayPort = startRelay(t, ctx, controlURL, addr, logf)
+	}
+
 	line, _ := json.Marshal(Ready{
 		ControlURL: controlURL,
 		AuthKey:    authKey,
 		PeerName:   "peer",
 		PeerIP:     status.TailscaleIPs[0].String(),
 		Domain:     domain,
+		RelayPort:  relayPort,
 	})
 	fmt.Fprintf(os.Stdout, "%s\n", line)
 
@@ -281,6 +301,48 @@ func TestHarness(t *testing.T) {
 		}
 		fmt.Fprintf(os.Stdout, "{\"event\":\"signed\",\"key\":%q}\n", arg)
 	}
+}
+
+// startRelay joins a tsnet node that relays UDP for its peers on a free port
+// of addr, and returns the port.
+func startRelay(t *testing.T, ctx context.Context, controlURL, addr string, logf logger.Logf) uint16 {
+	free, err := net.ListenPacket("udp", net.JoinHostPort(addr, "0"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint16(free.LocalAddr().(*net.UDPAddr).Port)
+	free.Close()
+
+	relay := &tsnet.Server{
+		Dir:        t.TempDir(),
+		Hostname:   "relay",
+		ControlURL: controlURL,
+		AuthKey:    authKey,
+		Store:      new(mem.Store),
+		Ephemeral:  true,
+		Logf:       logf,
+	}
+	t.Cleanup(func() { relay.Close() })
+	if _, err := relay.Up(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lc, err := relay.LocalClient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Where it says it can be reached: here, whatever its interfaces are.
+	static := netip.AddrPortFrom(netip.MustParseAddr(addr), port)
+	if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+		Prefs: ipn.Prefs{
+			RelayServerPort:            &port,
+			RelayServerStaticEndpoints: []netip.AddrPort{static},
+		},
+		RelayServerPortSet:            true,
+		RelayServerStaticEndpointsSet: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return port
 }
 
 // addFakePeers adds n peers carrying what real peers carry in a netmap:

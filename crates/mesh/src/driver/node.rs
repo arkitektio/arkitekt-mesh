@@ -138,6 +138,9 @@ pub struct Limits {
     /// is found (docs/rfc10-peer-relays.md): UDP through a node the admin
     /// set up for it, in place of DERP.
     pub peer_relay: bool,
+    /// No direct paths, whatever the network allows: peer relays and DERP
+    /// only. For testing relays, as tailscale's `TS_DEBUG_NEVER_DIRECT_UDP`.
+    pub never_direct: bool,
 }
 
 impl Default for Limits {
@@ -161,6 +164,7 @@ impl Default for Limits {
             ipv6: true,
             portmap: true,
             peer_relay: true,
+            never_direct: false,
         }
     }
 }
@@ -186,6 +190,7 @@ impl Limits {
             ipv6: false,
             portmap: false,
             peer_relay: false,
+            never_direct: false,
         }
     }
 }
@@ -300,6 +305,7 @@ impl Node {
 
         let mut paths = Paths::new(disco_key, node_public);
         paths.set_udp(config.direct);
+        paths.set_never_direct(config.limits.never_direct);
         let disco_public = paths.disco_public();
 
         // Register, then the netmap stream up to its first full response
