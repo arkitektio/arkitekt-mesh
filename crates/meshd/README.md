@@ -14,8 +14,8 @@ deployment's mesh (ionscale) and exposes:
 
 ```
 arkitekt-meshd --statedir DIR --hostname NAME [--control-url URL] [--listen 127.0.0.1:0]
-               [--timeout 90s] [--tcp-buffer BYTES] [--ephemeral] [--turn]
-               [--forward NAME=host:port]... [--no-stdin]
+               [--timeout 90s] [--tcp-buffer BYTES] [--ephemeral] [--proxy-auth]
+               [--turn] [--forward NAME=host:port]... [--no-stdin]
 ```
 
 - **Auth key:** read from `$ARKITEKT_MESH_AUTHKEY`, never from argv. It is
@@ -23,7 +23,13 @@ arkitekt-meshd --statedir DIR --hostname NAME [--control-url URL] [--listen 127.
 - **Control URL:** saved in `DIR`, so restarts may omit `--control-url`.
 - **TCP buffer:** per connection, each way (default 1 MiB). A connection's
   throughput is at most this per round trip.
-- **stdout** gets exactly one JSON line:
+- **Proxy credentials:** with `--proxy-auth` the proxy asks every request
+  for credentials, and `proxy` in `ready` carries them
+  (`http://mesh:TOKEN@127.0.0.1:PORT`). Without it any user of the machine
+  reaches the mesh as this node; a shared machine wants it. Forwards cannot
+  ask for credentials.
+- **stdout** gets one JSON line when the start is over, and after `ready`
+  one more whenever the node's standing with control changes:
   - `{"event":"ready","proxy":"http://127.0.0.1:PORT","hostname":…,"ips":[…],"turn":{"urls":[…],"username":…,"credential":…},"forwards":{"NAME":"127.0.0.1:PORT"}}`
     (`turn` and `forwards` appear only when asked for);
   - or `{"event":"error","code":…,"message":…}` with exit code 1. Codes:
@@ -31,6 +37,10 @@ arkitekt-meshd --statedir DIR --hostname NAME [--control-url URL] [--listen 127.
     `statedir`, `listen`, `turn`, `forward`, and for tailnet lock
     `locked_out` (this node's key is not signed; the message names the
     `nodekey:` to sign) and `lock_unverified`.
+  - after `ready`: `{"event":"control","state":…,"reason":…}`. States:
+    `connected`; `reconnecting` (it tries again by itself, and runs on with
+    the peers it knows); and `key_expired`, `needs_login`, `refused`, which
+    take a new login: stop it and join again with an auth key.
 - **stderr** gets the logs.
 - **Shutdown:** it exits when **stdin closes**, so it never outlives its
   parent. Pass `--no-stdin` to run it interactively.
