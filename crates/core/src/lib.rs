@@ -47,6 +47,7 @@ pub mod paths;
 pub mod portmap;
 pub mod random;
 pub mod relay;
+pub mod relay_server;
 pub mod stun;
 pub mod time;
 pub mod tka;

@@ -328,14 +328,14 @@ pub fn open(ours: &PrivateKey, packet: &[u8]) -> Option<(DiscoPublic, Message)> 
     Some((from, message))
 }
 
-fn sealed(ours: &DiscoPublic, shared: &SharedBox, msg: &Message) -> Vec<u8> {
+pub(crate) fn sealed(ours: &DiscoPublic, shared: &SharedBox, msg: &Message) -> Vec<u8> {
     let mut out = MAGIC.to_vec();
     out.extend_from_slice(&ours.0 .0);
     out.extend_from_slice(&shared.seal(&msg.encode()));
     out
 }
 
-fn opened(shared: &SharedBox, packet: &[u8]) -> Option<Message> {
+pub(crate) fn opened(shared: &SharedBox, packet: &[u8]) -> Option<Message> {
     Message::decode(&shared.open(&packet[HEADER_LEN..]).ok()?)
 }
 

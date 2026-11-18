@@ -1,6 +1,6 @@
 //! Path selection with a peer relay, in bytes: two nodes that cannot reach
 //! each other directly, a DERP region that carries anything slowly, and a
-//! relay server as tailscale's `net/udprelay` behaves, all in memory. What
+//! relay server (our own, `crate::relay_server`), all in memory. What
 //! the nodes put on the wire is what is carried, sealed and under its
 //! Geneve header.
 
@@ -46,36 +46,27 @@ fn side(addr: &str) -> Side {
     }
 }
 
-/// One endpoint of the relay.
-struct Endpoint {
-    vni: u32,
-    clients: [DiscoPublic; 2],
-    lamport_id: u64,
-    bound: [Option<SocketAddr>; 2],
-}
-
 /// The relay: a node of the tailnet (allocations come to its node's disco
-/// key over DERP) with a UDP port of its own and a disco key for binding.
+/// key over DERP) running our own relay server on a UDP port of its own.
 struct Relay {
     node: NodePublic,
     node_disco: PrivateKey,
-    bind_disco: PrivateKey,
+    server: crate::relay_server::RelayServer,
     addr: SocketAddr,
-    endpoints: Vec<Endpoint>,
-    lamport: u64,
     /// Packets forwarded, for the tests to count.
     forwarded: usize,
 }
 
 impl Relay {
     fn new() -> Self {
+        let addr: SocketAddr = RELAY_ADDR.parse().unwrap();
+        let mut server = crate::relay_server::RelayServer::new();
+        server.set_addrs(vec![addr]);
         Self {
             node: NodePublic(PrivateKey::generate().public()),
             node_disco: PrivateKey::generate(),
-            bind_disco: PrivateKey::generate(),
-            addr: RELAY_ADDR.parse().unwrap(),
-            endpoints: Vec::new(),
-            lamport: 0,
+            server,
+            addr,
             forwarded: 0,
         }
     }
@@ -98,14 +89,12 @@ impl Relay {
         }
     }
 
-    fn challenge(src: SocketAddr) -> [u8; 32] {
-        let mut out = [0xc3; 32];
-        out[..2].copy_from_slice(&src.port().to_be_bytes());
-        out
+    fn endpoints(&self) -> Vec<crate::relay_server::Session> {
+        self.server.sessions()
     }
 
     /// An allocation request over DERP: the answer, for its sender.
-    fn on_derp(&mut self, packet: &[u8]) -> Option<Vec<u8>> {
+    fn on_derp(&mut self, packet: &[u8], now: Instant) -> Option<Vec<u8>> {
         let (from, msg) = disco::open(&self.node_disco, packet)?;
         let Message::AllocateRelay {
             clients,
@@ -117,29 +106,7 @@ impl Relay {
         if !clients.contains(&from) {
             return None;
         }
-        let at = match self.endpoints.iter().position(|e| e.clients == clients) {
-            Some(at) => at,
-            None => {
-                self.lamport += 1;
-                self.endpoints.push(Endpoint {
-                    vni: 0x1000 + self.lamport as u32,
-                    clients,
-                    lamport_id: self.lamport,
-                    bound: [None, None],
-                });
-                self.endpoints.len() - 1
-            }
-        };
-        let e = &self.endpoints[at];
-        let endpoint = RelayEndpoint {
-            server: DiscoPublic(self.bind_disco.public()),
-            clients: e.clients,
-            lamport_id: e.lamport_id,
-            vni: e.vni,
-            bind_lifetime: Duration::from_secs(30),
-            steady_state_lifetime: Duration::from_secs(300),
-            addrs: vec![self.addr],
-        };
+        let endpoint = self.server.allocate(clients[0], clients[1], now).ok()?;
         Some(disco::seal(
             &self.node_disco,
             &from,
@@ -152,46 +119,17 @@ impl Relay {
 
     /// A datagram on its port: an answer for `src`, or the datagram
     /// forwarded as it is to the other client.
-    fn on_udp(&mut self, src: SocketAddr, datagram: &[u8]) -> Option<(SocketAddr, Vec<u8>)> {
-        let (header, payload) = geneve::unwrap(datagram)?;
-        let e = self.endpoints.iter_mut().find(|e| e.vni == header.vni)?;
-        if !header.control {
-            let from = e.bound.iter().position(|b| *b == Some(src))?;
-            let to = e.bound[1 - from]?;
+    fn on_udp(
+        &mut self,
+        src: SocketAddr,
+        datagram: &[u8],
+        now: Instant,
+    ) -> Option<(SocketAddr, Vec<u8>)> {
+        let out = self.server.handle_datagram(src, datagram, now)?;
+        if out.0 != src {
             self.forwarded += 1;
-            return Some((to, datagram.to_vec()));
         }
-        let (sender, msg) = disco::open(&self.bind_disco, payload)?;
-        let index = e.clients.iter().position(|c| *c == sender)?;
-        let other = e.clients[1 - index];
-        match msg {
-            Message::RelayBind(bind)
-                if bind.vni == e.vni && bind.remote == other && bind.generation != 0 =>
-            {
-                let challenge = Message::RelayChallenge(RelayBind {
-                    challenge: Self::challenge(src),
-                    ..bind
-                });
-                let sealed = disco::seal(&self.bind_disco, &sender, &challenge);
-                Some((
-                    src,
-                    geneve::Header {
-                        control: true,
-                        ..header
-                    }
-                    .wrap(&sealed),
-                ))
-            }
-            Message::RelayAnswer(answer)
-                if answer.vni == e.vni
-                    && answer.remote == other
-                    && answer.challenge == Self::challenge(src) =>
-            {
-                e.bound[index] = Some(src);
-                None
-            }
-            _ => None,
-        }
+        Some(out)
     }
 }
 
@@ -301,7 +239,7 @@ impl World {
             Via::Derp { region, peer } => {
                 assert_eq!(region, REGION);
                 if peer == self.relay.node {
-                    if let Some(answer) = self.relay.on_derp(&t.data) {
+                    if let Some(answer) = self.relay.on_derp(&t.data, now) {
                         let via = Via::Derp {
                             region,
                             peer: self.relay.node,
@@ -331,7 +269,7 @@ impl World {
                     return;
                 }
                 let src = self.nodes[from].addr;
-                if let Some((to, data)) = self.relay.on_udp(src, &t.data) {
+                if let Some((to, data)) = self.relay.on_udp(src, &t.data, now) {
                     // To where that client bound from: if it has moved
                     // since, nobody is there.
                     if let Some(to) = self.nodes.iter().position(|n| n.addr == to) {
@@ -426,7 +364,11 @@ fn without_a_direct_path_the_relay_carries_wireguard() {
     world.settle();
     assert_eq!(world.nodes[1].got, [("relay", wireguard(0xaa))]);
     assert_eq!(world.nodes[0].got, [("relay", wireguard(0xbb))]);
-    assert_eq!(world.relay.endpoints.len(), 1, "one endpoint for the pair");
+    assert_eq!(
+        world.relay.endpoints().len(),
+        1,
+        "one endpoint for the pair"
+    );
 }
 
 /// The relay path is held: its heartbeats keep it trusted for as long as
@@ -449,7 +391,7 @@ fn a_relay_path_holds_while_the_peers_talk() {
     }
     // Asked again now and then (which keeps the peer told), never a second
     // endpoint for the same two.
-    assert_eq!(world.relay.endpoints.len(), 1);
+    assert_eq!(world.relay.endpoints().len(), 1);
 }
 
 /// A direct path, once there is one, is taken over the relay whatever its
@@ -500,7 +442,7 @@ fn without_relay_servers_nothing_is_asked() {
     world.talk(120);
     assert_eq!((world.how(0), world.how(1)), ("derp", "derp"));
     assert_eq!(world.to_relay, 0);
-    assert!(world.relay.endpoints.is_empty());
+    assert!(world.relay.endpoints().is_empty());
 }
 
 /// A peer whose client is too old for relays is neither asked for nor
@@ -515,7 +457,7 @@ fn a_peer_that_does_not_speak_relay_is_left_on_derp() {
     assert_eq!((world.how(0), world.how(1)), ("derp", "derp"));
     assert!(world
         .relay
-        .endpoints
+        .endpoints()
         .iter()
         .all(|e| e.bound[0].is_none() || e.bound[1].is_none()));
 }
@@ -545,7 +487,7 @@ fn a_rebind_drops_the_relay_path_and_finds_it_again() {
     world.talk(10);
     assert_eq!((world.how(0), world.how(1)), ("relay", "relay"));
     // The relay takes node 0 from its new address now.
-    let endpoint = &world.relay.endpoints[0];
+    let endpoint = world.relay.endpoints()[0];
     assert!(endpoint.bound.contains(&Some(world.nodes[0].addr)));
 }
 
@@ -614,11 +556,11 @@ fn relay_messages_from_the_wrong_place_are_ignored() {
     // The peer's own call-me-maybe-via, but not over DERP.
     world.talk(5);
     assert_eq!(world.how(0), "relay");
-    let real = &world.relay.endpoints[0];
+    let real = world.relay.endpoints()[0];
     let description = RelayEndpoint {
-        server: DiscoPublic(world.relay.bind_disco.public()),
+        server: world.relay.server.disco(),
         clients: real.clients,
-        lamport_id: real.lamport_id + 9,
+        lamport_id: 99,
         vni: real.vni,
         ..endpoint
     };
