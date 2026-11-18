@@ -113,6 +113,26 @@ pub struct Transmit {
     pub data: Vec<u8>,
 }
 
+/// The answer to a ping asked for ([`Paths::probe`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pinged {
+    /// From the ping to its pong.
+    pub latency: Duration,
+    /// The way both went: the peer's address, a DERP region, or a peer
+    /// relay's address (`relayed`).
+    pub via: Via,
+    pub relayed: bool,
+}
+
+struct Probe {
+    peer: NodePublic,
+    sent: Instant,
+    answer: Option<Pinged>,
+}
+
+/// Pings asked for and not yet collected, at most.
+const MAX_PROBES: usize = 64;
+
 /// What we know about a peer, from the netmap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerInfo {
@@ -241,6 +261,8 @@ pub struct Paths {
     /// Paths through peer relays: the servers we may use, and what is under
     /// way with them.
     relay: RelayClient,
+    /// Pings asked for ([`probe`](Self::probe)).
+    probes: HashMap<TxId, Probe>,
 }
 
 impl Paths {
@@ -253,6 +275,80 @@ impl Paths {
             endpoints: Vec::new(),
             udp: true,
             never_direct: false,
+            probes: HashMap::new(),
+        }
+    }
+
+    /// Ping `peer` the way packets to it go right now: over its trusted UDP
+    /// path (its own address or a peer relay), else through its DERP region.
+    /// The answer is collected with [`probed`](Self::probed) under the id
+    /// returned. `None`: no such peer, no way to it, or too many pings out.
+    pub fn probe(
+        &mut self,
+        peer: &NodePublic,
+        now: Instant,
+        dir: &impl Directory,
+    ) -> Option<(TxId, Vec<Transmit>)> {
+        if self.probes.len() >= MAX_PROBES {
+            return None;
+        }
+        let (udp, node_key) = (self.udp, self.node_key);
+        let p = self.activate(dir.peer(peer)?, now);
+        let hop = p.best.filter(|_| udp && p.trusted(now)).map(|b| b.0);
+        let via = match hop {
+            Some(hop) => Via::Udp(hop.addr),
+            None => p.derp()?,
+        };
+        let mut tx = [0u8; 12];
+        crate::random::fill(&mut tx);
+        let to = p.info.disco_key;
+        let ping = self.disco.seal(
+            &to,
+            &Message::Ping {
+                tx,
+                node_key: Some(node_key),
+            },
+        );
+        let data = match hop {
+            Some(hop) => hop.wrap(geneve::Protocol::Disco, ping),
+            None => ping,
+        };
+        self.probes.insert(
+            tx,
+            Probe {
+                peer: *peer,
+                sent: now,
+                answer: None,
+            },
+        );
+        Some((tx, vec![Transmit { via, data }]))
+    }
+
+    /// The answer to the ping `tx`, taken: `Some(None)` while there is none
+    /// yet, `None` once it was taken or given up ([`PING_TIMEOUT`]).
+    pub fn probed(&mut self, tx: &TxId) -> Option<Option<Pinged>> {
+        let answer = self.probes.get(tx)?.answer;
+        if answer.is_some() {
+            self.probes.remove(tx);
+        }
+        Some(answer)
+    }
+
+    /// A pong for a ping asked for, if `tx` is one from `node`.
+    fn probe_answered(
+        &mut self,
+        tx: &TxId,
+        node: &NodePublic,
+        via: Via,
+        relayed: bool,
+        now: Instant,
+    ) {
+        if let Some(probe) = self.probes.get_mut(tx).filter(|p| p.peer == *node) {
+            probe.answer.get_or_insert(Pinged {
+                latency: now.saturating_duration_since(probe.sent),
+                via,
+                relayed,
+            });
         }
     }
 
@@ -426,11 +522,7 @@ impl Paths {
         let claimed = match (&via, &msg) {
             (Via::Derp { peer, .. }, _) => Some(*peer),
             (_, Message::Ping { node_key, .. }) => *node_key,
-            (_, Message::Pong { tx, .. }) => self
-                .peers
-                .iter()
-                .find(|(_, p)| p.info.disco_key == sender && p.in_flight.contains_key(tx))
-                .map(|(key, _)| *key),
+            (_, Message::Pong { tx, .. }) => self.pinged(&sender, tx),
             _ => None,
         };
         let Some(info) = claimed
@@ -441,6 +533,9 @@ impl Paths {
             return out;
         };
         let node = info.node_key;
+        if let Message::Pong { tx, .. } = &msg {
+            self.probe_answered(tx, &node, via, false, now);
+        }
         // Pings and CallMeMaybe start a conversation; pongs answer ours.
         if !matches!(msg, Message::Pong { .. }) {
             self.activate(info, now);
@@ -615,11 +710,7 @@ impl Paths {
         // Whose it is, as for a bare disco message.
         let claimed = match &msg {
             Some(Message::Ping { node_key, .. }) => *node_key,
-            Some(Message::Pong { tx, .. }) => self
-                .peers
-                .iter()
-                .find(|(_, p)| p.info.disco_key == sender && p.in_flight.contains_key(tx))
-                .map(|(key, _)| *key),
+            Some(Message::Pong { tx, .. }) => self.pinged(&sender, tx),
             _ => None,
         };
         let Some(info) = claimed
@@ -630,6 +721,9 @@ impl Paths {
             return out;
         };
         let node = info.node_key;
+        if let Some(Message::Pong { tx, .. }) = &msg {
+            self.probe_answered(tx, &node, Via::Udp(src), true, now);
+        }
         match msg {
             Some(Message::Ping { tx, .. }) => {
                 // Answered the way it came, as any ping; and if we are
@@ -674,6 +768,15 @@ impl Paths {
         }
         self.emit(sends, &mut out);
         out
+    }
+
+    /// The peer with disco key `sender` that a ping with id `tx` went to.
+    fn pinged(&self, sender: &DiscoPublic, tx: &TxId) -> Option<NodePublic> {
+        self.peers
+            .iter()
+            .find(|(_, p)| p.info.disco_key == *sender && p.in_flight.contains_key(tx))
+            .map(|(key, _)| *key)
+            .or_else(|| self.probes.get(tx).map(|probe| probe.peer))
     }
 
     /// A relay path came up: take it unless a path we trust is in the way.
@@ -752,6 +855,8 @@ impl Paths {
             }
             keep
         });
+        self.probes
+            .retain(|_, probe| now.saturating_duration_since(probe.sent) < PING_TIMEOUT);
         let mut sends = Vec::new();
         self.relay.tick(now, &mut sends);
         let keys: Vec<NodePublic> = self.peers.keys().copied().collect();
@@ -824,7 +929,9 @@ impl Paths {
                     || !p.in_flight.is_empty()
             })
             .then_some(now + HEARTBEAT_INTERVAL);
-        [heartbeat, self.relay.next_deadline()]
+        // A ping nobody answers is given up on time.
+        let probes = self.probes.values().map(|p| p.sent + PING_TIMEOUT).min();
+        [heartbeat, self.relay.next_deadline(), probes]
             .into_iter()
             .flatten()
             .min()
@@ -927,6 +1034,54 @@ mod tests {
             let first = with.next()?.clone();
             with.next().is_none().then_some(first)
         }
+    }
+
+    /// A ping asked for goes the way packets go: through DERP to a peer not
+    /// reached directly yet, to its address once it is; and is given up
+    /// after five seconds.
+    #[test]
+    fn a_ping_asked_for_goes_the_way_packets_go() {
+        let mut a = side("10.0.0.1:1000");
+        let mut b = side("10.0.0.2:2000");
+        introduce(&mut a, &b, 1);
+        introduce(&mut b, &a, 1);
+        let t0 = crate::time::now();
+        let (tx, out) = a.paths.probe(&b.node, t0, &a.dir).unwrap();
+        assert!(matches!(
+            out[..],
+            [Transmit {
+                via: Via::Derp { region: 1, .. },
+                ..
+            }]
+        ));
+        assert_eq!(a.paths.probed(&tx), Some(None), "awaited");
+        let t1 = t0 + Duration::from_millis(30);
+        let pong = deliver(out, &a, &mut b, t1);
+        deliver(pong, &b, &mut a, t1);
+        let answer = a.paths.probed(&tx).unwrap().unwrap();
+        assert_eq!(answer.latency, Duration::from_millis(30));
+        assert!(matches!(answer.via, Via::Derp { region: 1, .. }) && !answer.relayed);
+        assert_eq!(a.paths.probed(&tx), None, "taken once");
+
+        // Once a direct path is trusted, that way.
+        let sent = a.paths.route(&b.node, vec![4, 0, 0, 0], t1, &a.dir);
+        let pongs = deliver(sent, &a, &mut b, t1);
+        deliver(pongs, &b, &mut a, t1);
+        assert_eq!(a.paths.direct(&b.node, t1), Some(b.addr));
+        let (tx, out) = a.paths.probe(&b.node, t1, &a.dir).unwrap();
+        assert!(matches!(out[..], [Transmit { via: Via::Udp(addr), .. }] if addr == b.addr));
+        let pong = deliver(out, &a, &mut b, t1);
+        deliver(pong, &b, &mut a, t1);
+        assert_eq!(a.paths.probed(&tx).unwrap().unwrap().via, Via::Udp(b.addr));
+
+        // Unanswered: gone after the timeout, and the timers know when.
+        let (tx, _) = a.paths.probe(&b.node, t1, &a.dir).unwrap();
+        assert!(a.paths.next_deadline(t1).unwrap() <= t1 + PING_TIMEOUT);
+        a.paths.tick(t1 + PING_TIMEOUT, &a.dir);
+        assert_eq!(a.paths.probed(&tx), None);
+        // Someone who is no peer cannot be pinged.
+        let nobody = NodePublic(PrivateKey::generate().public());
+        assert!(a.paths.probe(&nobody, t1, &a.dir).is_none());
     }
 
     /// A LAN address is worth a little latency; a path alike is not worth a

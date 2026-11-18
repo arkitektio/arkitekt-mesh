@@ -116,6 +116,45 @@ impl From<ControlState> for ControlStatus {
     }
 }
 
+/// A ping's answer (see `Node.ping`).
+#[pyclass(frozen, get_all, module = "arkitekt_mesh")]
+struct Pinged {
+    /// Seconds from the ping to its pong.
+    latency: f64,
+    /// The way both went, as `PeerPath.kind` and `PeerPath.via`.
+    kind: &'static str,
+    via: Option<String>,
+}
+
+#[pymethods]
+impl Pinged {
+    fn __repr__(&self) -> String {
+        format!(
+            "Pinged(latency={:.4}, kind={:?}, via={:?})",
+            self.latency, self.kind, self.via
+        )
+    }
+}
+
+/// A path as Python sees it: its kind, and through what.
+fn path_parts(path: DriverPath) -> (&'static str, Option<String>) {
+    match path {
+        DriverPath::Idle => ("idle", None),
+        DriverPath::Direct(addr) => ("direct", Some(addr.to_string())),
+        // "relay" still, for those who know three kinds: `via` tells the
+        // two apart.
+        DriverPath::PeerRelay(addr) => ("relay", Some(format!("peer relay {addr}"))),
+        DriverPath::Relay { region, code } => (
+            "relay",
+            Some(if code.is_empty() {
+                region.to_string()
+            } else {
+                code
+            }),
+        ),
+    }
+}
+
 type Shared = Arc<Mutex<Option<Session>>>;
 
 /// A mesh node with its state directory; stop it with `close()`.
@@ -256,29 +295,23 @@ impl Node {
             Ok::<_, ()>(node.path(host))
         });
         let found = found.map_err(|()| closed())?;
-        Ok(match found.map_err(io_err)? {
-            DriverPath::Idle => PeerPath {
-                kind: "idle",
-                via: None,
-            },
-            DriverPath::Direct(addr) => PeerPath {
-                kind: "direct",
-                via: Some(addr.to_string()),
-            },
-            // "relay" still, for those who know three kinds: `via` tells
-            // the two apart.
-            DriverPath::PeerRelay(addr) => PeerPath {
-                kind: "relay",
-                via: Some(format!("peer relay {addr}")),
-            },
-            DriverPath::Relay { region, code } => PeerPath {
-                kind: "relay",
-                via: Some(if code.is_empty() {
-                    region.to_string()
-                } else {
-                    code
-                }),
-            },
+        let (kind, via) = path_parts(found.map_err(io_err)?);
+        Ok(PeerPath { kind, via })
+    }
+
+    /// Ping the peer `host` (a disco ping, as `tailscale ping`): how long it
+    /// took and the way it went, which is the way packets to the peer go
+    /// right now.
+    fn ping<'py>(&self, py: Python<'py>, host: String) -> PyResult<Bound<'py, PyAny>> {
+        let node = self.node.upgrade().ok_or_else(closed)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (latency, path) = node.ping(&host).await.map_err(io_err)?;
+            let (kind, via) = path_parts(path);
+            Ok(Pinged {
+                latency: latency.as_secs_f64(),
+                kind,
+                via,
+            })
         })
     }
 
@@ -347,6 +380,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TurnInfo>()?;
     m.add_class::<PeerPath>()?;
     m.add_class::<ControlStatus>()?;
+    m.add_class::<Pinged>()?;
     m.add("MeshError", py.get_type::<MeshError>())?;
     m.add("NeedsLogin", py.get_type::<NeedsLogin>())?;
     m.add("KeyExpired", py.get_type::<KeyExpired>())?;

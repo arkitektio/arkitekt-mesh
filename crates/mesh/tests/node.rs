@@ -4,7 +4,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use mesh::driver::{Config, Node};
+use mesh::driver::{Config, Node, PeerPath};
 use mesh::keys::NodeIdentity;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -109,6 +109,36 @@ async fn direct_path_comes_up() {
     echo(&node, &h.ready.peer_name, 4 << 20).await;
     tracing::info!("4 MiB echo took {:?}", t.elapsed());
     assert!(node.direct_path(peer_ip).is_some());
+}
+
+/// A ping says how the peer is reached at that moment: through DERP before
+/// anything was sent to it, directly once that path is up.
+#[tokio::test]
+async fn a_ping_tells_latency_and_path() {
+    common::init_tracing();
+    let Some(h) = common::start().await else {
+        return;
+    };
+    let node = Node::start(config(&h, "rusty-pings", true)).await.unwrap();
+    let (latency, path) = node.ping(&h.ready.peer_name).await.unwrap();
+    assert!(latency < Duration::from_secs(5));
+    assert!(
+        matches!(path, PeerPath::Relay { .. }),
+        "first through DERP: {path:?}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let _ = get(&node, &h.ready.peer_name).await;
+        let (latency, path) = node.ping(&h.ready.peer_name).await.unwrap();
+        if matches!(path, PeerPath::Direct(_)) {
+            assert!(latency < Duration::from_secs(1), "{latency:?} on loopback");
+            break;
+        }
+        assert!(Instant::now() < deadline, "the ping stayed on {path:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(node.ping("nobody-here").await.is_err());
 }
 
 #[tokio::test]

@@ -143,6 +143,8 @@ pub struct NodeCore {
     /// Whether control heard any latencies yet.
     latencies_reported: bool,
     events: VecDeque<Event>,
+    /// Datagrams asked for between passes (a ping), sent with the next.
+    pending: Vec<Transmit>,
 }
 
 impl NodeCore {
@@ -195,6 +197,7 @@ impl NodeCore {
             reported: BTreeSet::new(),
             latencies_reported: false,
             events: VecDeque::new(),
+            pending: Vec::new(),
         };
         node.apply_lock();
         node.sync_peers();
@@ -338,6 +341,22 @@ impl NodeCore {
         self.derp_dropped += 1;
     }
 
+    /// Ping the peer at `ip` the way packets to it go right now; the answer
+    /// is [`pinged`](Self::pinged)'s, under the id returned. Sent with the
+    /// next [`pump`](Self::pump). `None`: no such peer, or no way to it.
+    pub fn ping(&mut self, ip: IpAddr, now: Instant) -> Option<crate::disco::TxId> {
+        let key = self.netmap.peer_by_ip(ip)?.key;
+        let (tx, transmits) = self.paths.probe(&key, now, &self.netmap)?;
+        self.pending.extend(transmits);
+        Some(tx)
+    }
+
+    /// The answer to the ping `tx`: `Some(None)` while it is awaited, `None`
+    /// once taken or given up.
+    pub fn pinged(&mut self, tx: &crate::disco::TxId) -> Option<Option<crate::paths::Pinged>> {
+        self.paths.probed(tx)
+    }
+
     /// The app closed `socket`: it goes once its close completes.
     pub fn close_socket(&mut self, socket: SocketHandle) {
         self.closing.push(socket);
@@ -352,6 +371,7 @@ impl NodeCore {
     pub fn pump(&mut self, now: Instant, room: usize) -> Pumped {
         self.link_home_when_due(now);
         let mut out = Pumped::default();
+        out.transmits.append(&mut self.pending);
         let mut room = room;
         for _ in 0..64 {
             let packets = self.netstack.poll(now, room);

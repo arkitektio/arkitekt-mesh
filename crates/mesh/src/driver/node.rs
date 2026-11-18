@@ -602,6 +602,50 @@ impl Node {
         })
     }
 
+    /// Ping the peer `host` (a disco ping, as `tailscale ping`): how long it
+    /// and its pong took, and the way they went, which is the way packets
+    /// to the peer go right now. A peer not spoken to yet is pinged through
+    /// its DERP region; ask again to see a direct path come up.
+    pub async fn ping(&self, host: &str) -> io::Result<(Duration, PeerPath)> {
+        let ip = self.resolve(host)?;
+        let tx = self.shared.lock().ping(ip, clock::now()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{host} cannot be pinged: not a peer, or no way to it yet"),
+            )
+        })?;
+        self.shared.wake.notify_one();
+        loop {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let mut state = self.shared.lock();
+            match state.pinged(&tx) {
+                Some(None) => {}
+                Some(Some(pinged)) => {
+                    let path = match pinged.via {
+                        Via::Udp(addr) if pinged.relayed => PeerPath::PeerRelay(addr),
+                        Via::Udp(addr) => PeerPath::Direct(addr),
+                        Via::Derp { region, .. } => PeerPath::Relay {
+                            region,
+                            code: state
+                                .netmap()
+                                .derp_regions
+                                .get(&region)
+                                .map(|r| r.region_code.clone())
+                                .unwrap_or_default(),
+                        },
+                    };
+                    return Ok((pinged.latency, path));
+                }
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("{host} did not answer the ping"),
+                    ))
+                }
+            }
+        }
+    }
+
     /// A peer's tailnet address: an IP literal, or a name in the netmap
     /// (bare hostname or FQDN).
     pub fn resolve(&self, host: &str) -> io::Result<IpAddr> {

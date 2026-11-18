@@ -5,11 +5,18 @@ use libfuzzer_sys::fuzz_target;
 use mesh_core::keys::PrivateKey;
 use mesh_core::portmap::{self, upnp};
 use mesh_core::time::Instant;
-use mesh_core::{disco, stun, wg};
+use mesh_core::{disco, geneve, stun, wg};
 
 fuzz_target!(|data: &[u8]| {
     let _ = stun::is_stun(data);
     let _ = stun::parse_response(data);
+
+    // Through a peer relay: a Geneve header, disco or WireGuard behind it.
+    // (`disco::open` below decodes the relay's messages too.)
+    if let Some((_, payload)) = geneve::unwrap(data) {
+        let _ = disco::sender(payload);
+        let _ = disco::open(&PrivateKey::generate(), payload);
+    }
 
     let _ = disco::looks_like_disco(data);
     let _ = disco::sender(data);

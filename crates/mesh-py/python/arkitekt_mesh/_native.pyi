@@ -32,6 +32,14 @@ class PeerPath:
     (e.g. ``waw``), or ``peer relay <address>`` for a node of the tailnet that
     forwards UDP for the two; else ``None``."""
 
+class Pinged:
+    """A ping's answer (see ``Node.ping``)."""
+    latency: float
+    """Seconds from the ping to its pong."""
+    kind: Literal["direct", "relay"]
+    via: Optional[str]
+    """As ``PeerPath.via``: the way the ping and its pong went."""
+
 class ControlStatus:
     """How the node stands with the coordination server (see ``Node.control``)."""
     state: Literal["connected", "reconnecting", "key_expired", "needs_login", "refused"]
@@ -82,6 +90,11 @@ class Node:
         """How packets to the peer ``host`` (a mesh name or address) travel
         right now. A path starts out relayed and turns direct once one is
         found, usually seconds after the first packet."""
+    async def ping(self, host: str) -> Pinged:
+        """Ping the peer ``host`` (a disco ping, as ``tailscale ping``): how
+        long it took and the way it went, which is the way packets to the peer
+        go right now. A peer not spoken to yet answers through its DERP region;
+        ask again to see a direct path come up."""
     def control(self) -> ControlStatus:
         """How the node stands with the coordination server right now."""
     async def control_changed(self) -> ControlStatus:

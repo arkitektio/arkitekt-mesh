@@ -27,7 +27,10 @@ The node speaks:
 * WireGuard,
 * DERP relays,
 * disco path discovery with STUN, so peers get direct UDP paths when the
-  network allows and relay through DERP when it doesn't.
+  network allows and relay through DERP when it doesn't,
+* peer relays: where no direct path is found and the tailnet has a node
+  that relays UDP, the path goes through it, not through DERP
+  ([RFC-10](docs/rfc10-peer-relays.md)).
 
 The same limits apply to any new implementation:
 
@@ -86,6 +89,7 @@ is tracked as RFCs, each listing what is done and what is not:
 | [RFC-7](docs/rfc7-production-and-throughput.md) | Production and throughput | Benchmarked and tuned; the production canary is open |
 | [RFC-8](docs/rfc8-packet-filter.md) | Enforcing the tailnet's ACLs | Implemented |
 | [RFC-9](docs/rfc9-sans-io-runtimes.md) | The core without I/O, and its other runtimes | See the RFC |
+| [RFC-10](docs/rfc10-peer-relays.md) | Paths through peer relays | The client; no relay server of our own |
 
 ## Releasing
 
