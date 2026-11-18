@@ -1,9 +1,9 @@
 # RFC-10: Paths through peer relays
 
 **Status:** The client is implemented (November 2026) and tested against
-tailscale's own relay server and peer. Our node is no relay server itself,
-and ionskale needs a change before a tailscaled peer takes part (see "Not
-done").
+tailscale's own relay server and peer. Our node is no relay server itself
+(see "Not done"). A tailscaled peer takes part with an ionskale that tells
+capability versions (its commit 11d808c, November 2026).
 
 ## Problem
 
@@ -111,12 +111,13 @@ direct paths away, to see a relay work where the nodes reach each other.
 
 ## Not done
 
-- **ionskale does not tell a peer's capability version** (`Node.Cap`; it
-  keeps none per machine). Tailscale's own client therefore takes no peer
-  for relay-capable: a tailscaled peer (a hub's sidecar) neither allocates
-  nor answers our call-me-maybe-via. Between two of our own nodes relays
-  work with ionskale as it is; for our node and a tailscaled peer, ionskale
-  has to record the version a machine registers with and send it.
+- **An ionskale older than its commit 11d808c tells no peer's capability
+  version** (`Node.Cap`). Tailscale's own client then takes no peer for
+  relay-capable: a tailscaled peer (a hub's sidecar) neither allocates nor
+  answers our call-me-maybe-via, and only two of our own nodes meet on a
+  relay. From that commit on it keeps the version a machine polls with and
+  sends it (its `tests/peer_relay_test.go`: two tailscaled through a third).
+  A machine is told of once it has polled again after the upgrade.
 - **No relay server of our own.** A relay is a tailscaled. Ours would be
   `net/udprelay` again (allocation, the bind handshake's MACs, forwarding,
   garbage collection), for meshd.
