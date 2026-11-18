@@ -41,6 +41,14 @@ fn io_err(e: std::io::Error) -> PyErr {
     MeshError::new_err(e.to_string())
 }
 
+/// An optional string as Python writes it: `None`, or the string quoted.
+fn py_repr(value: &Option<String>) -> String {
+    match value {
+        Some(value) => format!("{value:?}"),
+        None => "None".into(),
+    }
+}
+
 /// One ICE server entry for a WebRTC client.
 #[pyclass(frozen, get_all, module = "arkitekt_mesh")]
 struct TurnInfo {
@@ -73,7 +81,7 @@ struct PeerPath {
 #[pymethods]
 impl PeerPath {
     fn __repr__(&self) -> String {
-        format!("PeerPath(kind={:?}, via={:?})", self.kind, self.via)
+        format!("PeerPath(kind={:?}, via={})", self.kind, py_repr(&self.via))
     }
 }
 
@@ -91,8 +99,9 @@ struct ControlStatus {
 impl ControlStatus {
     fn __repr__(&self) -> String {
         format!(
-            "ControlStatus(state={:?}, reason={:?})",
-            self.state, self.reason
+            "ControlStatus(state={:?}, reason={})",
+            self.state,
+            py_repr(&self.reason)
         )
     }
 }
@@ -170,8 +179,10 @@ struct Pinged {
 impl Pinged {
     fn __repr__(&self) -> String {
         format!(
-            "Pinged(latency={:.4}, kind={:?}, via={:?})",
-            self.latency, self.kind, self.via
+            "Pinged(latency={:.4}, kind={:?}, via={})",
+            self.latency,
+            self.kind,
+            py_repr(&self.via)
         )
     }
 }
