@@ -27,6 +27,8 @@ pub struct Harness {
     pub ready: Ready,
     _child: Child,
     _stdin: ChildStdin,
+    /// What the harness says after it is ready, a JSON line each.
+    events: tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
 }
 
 /// Build the harness binary once per test run.
@@ -99,6 +101,13 @@ pub async fn start_ipv6() -> Option<Harness> {
     start_env(false, 0, None, &[("MESH_HARNESS_ADDR", "::1")]).await
 }
 
+/// A tailnet that grants everyone the use of peer relays and has none: one
+/// of the test's nodes is to be it. The tsnet peer takes no direct path,
+/// and a second tsnet node pings it when asked ([`Harness::ping`]).
+pub async fn start_for_a_relay() -> Option<Harness> {
+    start_env(false, 0, None, &[("MESH_HARNESS_RELAY", "grants")]).await
+}
+
 /// A tailnet with a peer relay: a second tsnet node relays UDP, control
 /// grants everyone its use, and the peer takes no direct path.
 pub async fn start_with_relay() -> Option<Harness> {
@@ -153,11 +162,19 @@ async fn start_env(
     })
     .await
     .expect("the harness did not start in time");
-    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Ok(event) = serde_json::from_str(&line) {
+                let _ = events_tx.send(event);
+            }
+        }
+    });
     Some(Harness {
         ready,
         _child: child,
         _stdin: stdin,
+        events,
     })
 }
 
@@ -171,6 +188,25 @@ impl Harness {
             .await
             .unwrap();
         self._stdin.flush().await.unwrap();
+    }
+}
+
+impl Harness {
+    /// Have the second tsnet node ping the first (a disco ping), and say how
+    /// it went: `peer_relay` ("ip:port:vni:n", or empty), `derp`, `endpoint`.
+    pub async fn ping(&mut self) -> serde_json::Value {
+        use tokio::io::AsyncWriteExt;
+        self._stdin.write_all(b"ping\n").await.unwrap();
+        self._stdin.flush().await.unwrap();
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let event = self.events.recv().await.expect("the harness is gone");
+                if event["event"] == "ping" {
+                    return event;
+                }
+            }
+        });
+        answer.await.expect("the harness did not answer the ping")
     }
 }
 

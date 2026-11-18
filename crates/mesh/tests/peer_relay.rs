@@ -117,6 +117,102 @@ async fn a_tailscale_peer_is_reached_through_a_tailscale_relay() {
     ));
 }
 
+/// Our node as the relay, tailscale's own clients as its users: the second
+/// tsnet node reaches the first through the port our node relays on.
+#[tokio::test]
+async fn tailscale_clients_meet_on_our_relay() {
+    common::init_tracing();
+    let Some(mut h) = common::start_for_a_relay().await else {
+        return;
+    };
+    let node = Node::start(config(&h, "rusty-relay", true)).await.unwrap();
+    let relay = node.serve_peer_relay(0, vec![]).await.unwrap();
+    assert_ne!(relay.port(), 0);
+    assert!(!relay.addrs().is_empty(), "it knows where it is");
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let through = format!(":{}:vni:", relay.port());
+    loop {
+        let ping = h.ping().await;
+        let via = ping["peer_relay"].as_str().unwrap_or_default().to_owned();
+        if via.contains(&through) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tailscale's clients did not take our relay: {ping}"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // One endpoint, both of them bound to it, their pings forwarded.
+    let sessions = relay.sessions();
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
+    assert!(sessions[0].bound.iter().all(Option::is_some));
+    assert!(sessions[0].packets.iter().all(|n| *n > 0), "{sessions:?}");
+
+    // Gone with its handle: no more endpoints, and the port is free again.
+    let port = relay.port();
+    drop(relay);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(tokio::net::UdpSocket::bind(("0.0.0.0", port)).await.is_ok());
+}
+
+/// Three of our own nodes: one relays, the other two, with no direct path,
+/// meet on it and carry a megabyte each way.
+#[tokio::test]
+async fn our_nodes_meet_on_our_relay() {
+    common::init_tracing();
+    let Some(h) = common::start_for_a_relay().await else {
+        return;
+    };
+    let middle = Node::start(config(&h, "rusty-middle", true)).await.unwrap();
+    let relay = middle.serve_peer_relay(0, vec![]).await.unwrap();
+    let server = Node::start(config(&h, "rusty-listens", true))
+        .await
+        .unwrap();
+    let client = Node::start(config(&h, "rusty-dials", true)).await.unwrap();
+    let mut listener = server.listen(7).unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let (mut rd, mut wr) = tokio::io::split(stream);
+                let _ = tokio::io::copy(&mut rd, &mut wr).await;
+            });
+        }
+    });
+    let host = server.addresses()[0].to_string();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if client.netmap().peer_by_ip(server.addresses()[0]).is_some() {
+            echo(&client, &host, 7, 4096).await;
+            if let PeerPath::PeerRelay(at) = client.path(&host).unwrap() {
+                assert_eq!(at.port(), relay.port());
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no path through our relay: {:?}",
+            client.path(&host)
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let before: u64 = relay.sessions().iter().flat_map(|s| s.bytes).sum();
+    echo(&client, &host, 7, 1 << 20).await;
+    let after: u64 = relay.sessions().iter().flat_map(|s| s.bytes).sum();
+    assert!(
+        after - before > 2 << 20,
+        "the megabyte each way went through the relay: {} bytes",
+        after - before
+    );
+    // The relay's own ping says so too.
+    let (_, path) = client.ping(&host).await.unwrap();
+    assert!(matches!(path, PeerPath::PeerRelay(_)), "{path:?}");
+}
+
 /// With peer relays off the same node stays on DERP, and the tsnet peer's
 /// call-me-maybe-via is left unanswered.
 #[tokio::test]

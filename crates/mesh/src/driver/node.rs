@@ -235,17 +235,30 @@ pub(super) struct Shared {
     control_rebind: Notify,
     /// How the node stands with control, as the control loop publishes it.
     control: watch::Receiver<ControlState>,
+    /// The peer relay this node runs, if it runs one: where endpoints for
+    /// the peers that ask come from.
+    relay: Mutex<Option<super::peer_relay::SharedRelay>>,
 }
 
 impl Shared {
     pub(super) fn lock(&self) -> MutexGuard<'_, NodeCore> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// The peer relay requests for endpoints go to (`None`: we relay no more).
+    pub(super) fn set_relay(&self, relay: Option<super::peer_relay::SharedRelay>) {
+        self.lock().set_relaying(relay.is_some());
+        *self.relay.lock().unwrap_or_else(|e| e.into_inner()) = relay;
+    }
+
+    fn relay(&self) -> Option<super::peer_relay::SharedRelay> {
+        self.relay.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 /// A node on the mesh; stopped when dropped.
 pub struct Node {
-    shared: Arc<Shared>,
+    pub(super) shared: Arc<Shared>,
     tasks: Vec<JoinHandle<()>>,
     addresses: Vec<IpAddr>,
 }
@@ -393,6 +406,7 @@ impl Node {
             rebind: std::sync::atomic::AtomicBool::new(false),
             control_rebind: Notify::new(),
             control: control_rx,
+            relay: Mutex::new(None),
         });
 
         let wanted = config.limits.udp_port;
@@ -871,6 +885,24 @@ async fn run_loop(
                 Event::Home(report) => {
                     let _ = home_tx.send(report);
                 }
+                Event::RelayAsked(ask) => {
+                    // An endpoint from our relay, its answer with the next pass.
+                    let Some(relay) = shared.relay() else {
+                        continue;
+                    };
+                    let allocated = relay.lock().unwrap_or_else(|e| e.into_inner()).allocate(
+                        ask.clients[0],
+                        ask.clients[1],
+                        clock::now(),
+                    );
+                    match allocated {
+                        Ok(endpoint) => {
+                            state.relay_allocated(&ask, endpoint);
+                            shared.wake.notify_one();
+                        }
+                        Err(e) => tracing::debug!("no relay endpoint for {:?}: {e}", ask.node),
+                    }
+                }
             }
         }
     };
@@ -1106,7 +1138,7 @@ fn bind_udp6(port: u16, buffer: usize) -> Option<Arc<UdpSocket>> {
 /// This host's global IPv6 address on its default route, with our port.
 /// Link-local, unique-local (which includes tailnet addresses) and loopback
 /// addresses are not reachable from elsewhere, so none is reported.
-fn local_endpoint6(port: u16) -> Option<SocketAddr> {
+pub(super) fn local_endpoint6(port: u16) -> Option<SocketAddr> {
     let probe = std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).ok()?;
     probe.connect(("2001:db8::1", 9)).ok()?;
     let IpAddr::V6(ip) = probe.local_addr().ok()?.ip() else {
@@ -1121,7 +1153,7 @@ fn local_endpoint6(port: u16) -> Option<SocketAddr> {
 }
 
 /// This host's address on its default route, with our UDP port.
-fn local_endpoint(port: u16) -> Option<SocketAddr> {
+pub(super) fn local_endpoint(port: u16) -> Option<SocketAddr> {
     let probe = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
     // Connecting a UDP socket sends nothing; it only picks a route.
     probe.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;

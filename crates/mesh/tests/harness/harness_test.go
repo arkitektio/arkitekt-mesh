@@ -23,6 +23,11 @@
 // relays UDP on a port of its own, and control grants every node its use.
 // The tsnet nodes then take no direct path (TS_DEBUG_NEVER_DIRECT_UDP), so
 // the peer is reached through the relay or through DERP.
+// MESH_HARNESS_RELAY=grants grants the same and takes the direct paths away,
+// without a relay: one of the test's own nodes is to be it. A second tsnet
+// node ("peer2") joins, and each "ping" line on stdin has it ping the peer
+// and answers {"event":"ping","peer_relay":…,"derp":…,"endpoint":…}: the
+// way tailscale's own client reaches another through whatever relays.
 package harness
 
 import (
@@ -151,7 +156,8 @@ func TestHarness(t *testing.T) {
 	if os.Getenv("MESH_HARNESS_OPEN") == "" {
 		control.RequireAuthKey = authKey
 	}
-	relayed := os.Getenv("MESH_HARNESS_RELAY") != ""
+	relayMode := os.Getenv("MESH_HARNESS_RELAY")
+	relayed := relayMode != ""
 	if relayed {
 		// The relay and relay-target capabilities, for everyone.
 		control.PeerRelayGrants = true
@@ -269,7 +275,27 @@ func TestHarness(t *testing.T) {
 	}
 
 	var relayPort uint16
-	if relayed {
+	var pinger *local.Client
+	switch relayMode {
+	case "":
+	case "grants":
+		second := &tsnet.Server{
+			Dir:        t.TempDir(),
+			Hostname:   "peer2",
+			ControlURL: controlURL,
+			AuthKey:    authKey,
+			Store:      new(mem.Store),
+			Ephemeral:  true,
+			Logf:       logf,
+		}
+		defer second.Close()
+		if _, err := second.Up(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if pinger, err = second.LocalClient(); err != nil {
+			t.Fatal(err)
+		}
+	default:
 		relayPort = startRelay(t, ctx, controlURL, addr, logf)
 	}
 
@@ -287,6 +313,24 @@ func TestHarness(t *testing.T) {
 	scanner := bufio.NewScanner(os.Stdin)
 	for scanner.Scan() {
 		cmd, arg, _ := strings.Cut(strings.TrimSpace(scanner.Text()), " ")
+		if cmd == "ping" && pinger != nil {
+			// The second tsnet node pings the first: how its packets go.
+			pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			result, err := pinger.Ping(pingCtx, status.TailscaleIPs[0], tailcfg.PingDisco)
+			cancel()
+			answer := map[string]any{"event": "ping"}
+			if err != nil {
+				answer["error"] = err.Error()
+			} else {
+				answer["peer_relay"] = result.PeerRelay
+				answer["derp"] = result.DERPRegionCode
+				answer["endpoint"] = result.Endpoint
+				answer["error"] = result.Err
+			}
+			line, _ := json.Marshal(answer)
+			fmt.Fprintf(os.Stdout, "%s\n", line)
+			continue
+		}
 		if cmd != "sign" || lc == nil {
 			continue
 		}

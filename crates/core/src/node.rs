@@ -89,6 +89,11 @@ pub enum Event {
     Endpoints(Vec<(SocketAddr, EndpointType)>),
     /// The home region (or the first latencies) changed: tell control.
     Home(HomeReport),
+    /// A peer that may (the tailnet grants it `tailscale.com/cap/relay`
+    /// towards us) asks us, a relay, for an endpoint: allocate one and say
+    /// [`NodeCore::relay_allocated`]. Only while
+    /// [`NodeCore::set_relaying`] is on.
+    RelayAsked(crate::paths::RelayAsk),
 }
 
 /// What [`NodeCore::pump`] did.
@@ -145,6 +150,8 @@ pub struct NodeCore {
     events: VecDeque<Event>,
     /// Datagrams asked for between passes (a ping), sent with the next.
     pending: Vec<Transmit>,
+    /// Whether the driver runs a peer relay for us to hand endpoints out of.
+    relaying: bool,
 }
 
 impl NodeCore {
@@ -198,6 +205,7 @@ impl NodeCore {
             latencies_reported: false,
             events: VecDeque::new(),
             pending: Vec::new(),
+            relaying: false,
         };
         node.apply_lock();
         node.sync_peers();
@@ -267,7 +275,9 @@ impl NodeCore {
     ) -> Vec<Transmit> {
         if disco::looks_like_disco(data) {
             let via = Via::Derp { region, peer: from };
-            self.paths.on_disco(data, via, now, &self.netmap)
+            let out = self.paths.on_disco(data, via, now, &self.netmap);
+            self.relay_asked();
+            out
         } else if wg::is_wireguard(data) {
             self.on_wireguard(data, now)
         } else {
@@ -339,6 +349,51 @@ impl NodeCore {
     /// A packet for `region`'s DERP connection did not fit its queue.
     pub fn count_derp_dropped(&mut self) {
         self.derp_dropped += 1;
+    }
+
+    /// Whether the driver runs a peer relay: only then are requests for
+    /// endpoints passed on ([`Event::RelayAsked`]).
+    pub fn set_relaying(&mut self, relaying: bool) {
+        self.relaying = relaying;
+    }
+
+    /// The endpoint allocated for `ask`: its answer goes out with the next
+    /// [`pump`](Self::pump).
+    pub fn relay_allocated(
+        &mut self,
+        ask: &crate::paths::RelayAsk,
+        endpoint: disco::RelayEndpoint,
+    ) {
+        let answer = self.paths.relay_answer(ask, endpoint);
+        self.pending.push(answer);
+    }
+
+    /// Pass on the requests for relay endpoints of peers that may ask: the
+    /// tailnet grants them `tailscale.com/cap/relay` towards us.
+    fn relay_asked(&mut self) {
+        for ask in self.paths.take_relay_asks() {
+            if !self.relaying {
+                continue;
+            }
+            let (filter, ours) = (self.firewall.filter(), self.netmap.self_addresses());
+            let may = self.netmap.peer_by_key(&ask.node).is_some_and(|peer| {
+                !peer.unsigned_peer_api_only
+                    && peer.addresses.iter().any(|from| {
+                        ours.iter().any(|to| {
+                            from.is_ipv4() == to.is_ipv4()
+                                && filter.grants(*from, *to, crate::filter::CAP_RELAY)
+                        })
+                    })
+            });
+            if may {
+                self.events.push_back(Event::RelayAsked(ask));
+            } else {
+                tracing::debug!(
+                    "{:?} asked for a relay endpoint it is not granted",
+                    ask.node
+                );
+            }
+        }
     }
 
     /// Ping the peer at `ip` the way packets to it go right now; the answer

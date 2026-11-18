@@ -124,6 +124,23 @@ pub struct Pinged {
     pub relayed: bool,
 }
 
+/// A peer asking us, a relay, for an endpoint ([`Paths::take_relay_asks`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayAsk {
+    /// Who asks, and the DERP region the request came through.
+    pub node: NodePublic,
+    pub region: i32,
+    /// Its disco key: one of `clients`.
+    pub disco: DiscoPublic,
+    /// The two peers the endpoint is for.
+    pub clients: [DiscoPublic; 2],
+    /// Echoed in the answer.
+    pub generation: u32,
+}
+
+/// Requests for relay endpoints held for the node to answer, at most.
+const MAX_RELAY_ASKS: usize = 64;
+
 struct Probe {
     peer: NodePublic,
     sent: Instant,
@@ -263,6 +280,8 @@ pub struct Paths {
     relay: RelayClient,
     /// Pings asked for ([`probe`](Self::probe)).
     probes: HashMap<TxId, Probe>,
+    /// Peers asking us for relay endpoints, for the node to answer.
+    relay_asks: Vec<RelayAsk>,
 }
 
 impl Paths {
@@ -276,6 +295,30 @@ impl Paths {
             udp: true,
             never_direct: false,
             probes: HashMap::new(),
+            relay_asks: Vec::new(),
+        }
+    }
+
+    /// The requests for relay endpoints that arrived since the last call:
+    /// each over DERP from the node it names, which holds the disco key and
+    /// asks for itself and one other. Whether that node may ask, and whether
+    /// we relay at all, is the caller's to say.
+    pub fn take_relay_asks(&mut self) -> Vec<RelayAsk> {
+        core::mem::take(&mut self.relay_asks)
+    }
+
+    /// The answer to `ask`: the endpoint allocated, back the way it came.
+    pub fn relay_answer(&mut self, ask: &RelayAsk, endpoint: disco::RelayEndpoint) -> Transmit {
+        let msg = Message::RelayAllocated {
+            generation: ask.generation,
+            endpoint,
+        };
+        Transmit {
+            via: Via::Derp {
+                region: ask.region,
+                peer: ask.node,
+            },
+            data: self.disco.seal(&ask.disco, &msg),
         }
     }
 
@@ -661,12 +704,30 @@ impl Paths {
                     .on_allocated(&node, generation, endpoint, current, now, &mut sends);
                 self.emit(sends, &mut out);
             }
-            // What a relay server takes: we are none. And a challenge comes
-            // under a Geneve header (`on_relayed_disco`), never bare.
-            Message::RelayBind(_)
-            | Message::RelayChallenge(_)
-            | Message::RelayAnswer(_)
-            | Message::AllocateRelay { .. } => {}
+            Message::AllocateRelay {
+                clients,
+                generation,
+            } => {
+                // A peer asks us for an endpoint: over DERP, for itself and
+                // one other. Answered by the node, if it relays.
+                if let Via::Derp { region, peer } = via {
+                    if peer == node
+                        && clients.contains(&their_disco)
+                        && self.relay_asks.len() < MAX_RELAY_ASKS
+                    {
+                        self.relay_asks.push(RelayAsk {
+                            node,
+                            region,
+                            disco: their_disco,
+                            clients,
+                            generation,
+                        });
+                    }
+                }
+            }
+            // The bind handshake goes to a relay's own socket, under Geneve
+            // (and a challenge comes back there: `on_relayed_disco`).
+            Message::RelayBind(_) | Message::RelayChallenge(_) | Message::RelayAnswer(_) => {}
         }
         out
     }

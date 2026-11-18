@@ -173,6 +173,8 @@ impl Mesh {
                     inner.session.set_endpoints(endpoints);
                     self.control_wake.signal(());
                 }
+                // No relay on a board.
+                Event::RelayAsked(_) => {}
                 Event::Home(report) => {
                     inner.session.set_home(report);
                     self.control_wake.signal(());
