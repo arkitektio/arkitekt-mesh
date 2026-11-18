@@ -137,6 +137,12 @@ impl Directory for NetMap {
             .find(|p| p.disco_key == *disco)
             .map(Peer::path_info)
     }
+
+    fn only_peer_by_disco(&self, disco: &DiscoPublic) -> Option<PeerInfo> {
+        let mut with = self.peers.iter().filter(|p| p.disco_key == *disco);
+        let first = with.next()?;
+        with.next().is_none().then(|| first.path_info())
+    }
 }
 
 #[derive(Debug, Default, Clone)]

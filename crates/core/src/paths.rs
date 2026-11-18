@@ -45,11 +45,54 @@ pub const RELAY_UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 /// Pongs answered per peer per second, at most: a flood of (validly sealed)
 /// pings must not make us send unbounded traffic.
 pub const PONGS_PER_SECOND: u8 = 10;
+/// Addresses tried for a peer, at most: its own (the netmap's, its last
+/// call-me-maybe's) and those its pings came from.
+pub const MAX_CANDIDATES: usize = 32;
+/// How much better a path must be to replace one in use, in the points of
+/// [`better`]: a tenth faster, or of a better kind.
+const SWITCH_MARGIN: i64 = 10;
+
+/// Whether the direct path at `a` is worth leaving the one at `b` for, as
+/// tailscale weighs them (`betterAddr`): points for how much faster one is
+/// than the other (in percent), and for where it leads: 50 for loopback, 30
+/// for link-local, 20 for a private network (a LAN beats the hairpin through
+/// the router's public address even a little slower), 10 for IPv6. Unlike
+/// tailscale, by a margin: two paths alike do not take turns.
+fn better(a: (SocketAddr, Duration), b: (SocketAddr, Duration)) -> bool {
+    let percent_faster = |fast: Duration, slow: Duration| -> i64 {
+        if slow.is_zero() || fast >= slow {
+            return 0;
+        }
+        100 - (fast.as_micros() * 100 / slow.as_micros()) as i64
+    };
+    let place = |addr: SocketAddr| -> i64 {
+        let ip = addr.ip().to_canonical();
+        let kind = match ip {
+            _ if ip.is_loopback() => 50,
+            core::net::IpAddr::V4(v4) if v4.is_link_local() => 30,
+            core::net::IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80 => 30,
+            core::net::IpAddr::V4(v4) if v4.is_private() => 20,
+            core::net::IpAddr::V6(v6) if v6.segments()[0] & 0xfe00 == 0xfc00 => 20,
+            _ => 0,
+        };
+        kind + if ip.is_ipv6() { 10 } else { 0 }
+    };
+    let a_points = percent_faster(a.1, b.1) + place(a.0);
+    let b_points = percent_faster(b.1, a.1) + place(b.0);
+    a_points > b_points + SWITCH_MARGIN
+}
 
 /// Where path selection looks peers up: the netmap.
 pub trait Directory {
     fn peer(&self, key: &NodePublic) -> Option<PeerInfo>;
+    /// A peer with this disco key (the first, should several share it).
     fn peer_by_disco(&self, disco: &DiscoPublic) -> Option<PeerInfo>;
+    /// The peer with this disco key if it is the only one. Two nodes can
+    /// share a disco key (a cloned machine, two nodes of one process): then
+    /// the key alone does not say who sent a message.
+    fn only_peer_by_disco(&self, disco: &DiscoPublic) -> Option<PeerInfo> {
+        self.peer_by_disco(disco)
+    }
 }
 
 /// Where a datagram goes (or came from).
@@ -370,13 +413,34 @@ impl Paths {
         let Some(sender) = disco::sender(packet) else {
             return out;
         };
-        let Some(info) = dir.peer_by_disco(&sender) else {
+        // Only a key some peer has gets a box computed.
+        if dir.peer_by_disco(&sender).is_none() {
             return out;
-        };
-        let node = info.node_key;
+        }
         let Some(msg) = self.disco.open(&sender, packet) else {
             return out;
         };
+        // Whose message it is. The key alone says so only if one peer has
+        // it; else the node DERP got it from, the node a ping names, or, for
+        // a pong, the peer whose ping it answers. Each must hold the key.
+        let claimed = match (&via, &msg) {
+            (Via::Derp { peer, .. }, _) => Some(*peer),
+            (_, Message::Ping { node_key, .. }) => *node_key,
+            (_, Message::Pong { tx, .. }) => self
+                .peers
+                .iter()
+                .find(|(_, p)| p.info.disco_key == sender && p.in_flight.contains_key(tx))
+                .map(|(key, _)| *key),
+            _ => None,
+        };
+        let Some(info) = claimed
+            .and_then(|key| dir.peer(&key))
+            .filter(|info| info.disco_key == sender)
+            .or_else(|| dir.only_peer_by_disco(&sender))
+        else {
+            return out;
+        };
+        let node = info.node_key;
         // Pings and CallMeMaybe start a conversation; pongs answer ours.
         if !matches!(msg, Message::Pong { .. }) {
             self.activate(info, now);
@@ -391,7 +455,9 @@ impl Paths {
                     Via::Udp(src) => {
                         if self.udp {
                             if let Some(p) = self.peers.get_mut(&node) {
-                                p.candidates.entry(src).or_insert(None);
+                                if p.candidates.len() < MAX_CANDIDATES {
+                                    p.candidates.entry(src).or_insert(None);
+                                }
                             }
                         }
                         src
@@ -432,17 +498,17 @@ impl Paths {
                     return out;
                 }
                 let latency = now.duration_since(sent);
-                let better = match p.best {
+                let replace = match p.best {
                     None => true,
                     Some((best, best_latency)) => {
                         best == hop
                             || !p.trusted(now)
                             // A direct path, whatever a relayed one's latency.
                             || best.vni.is_some()
-                            || latency < best_latency.mul_f64(0.9)
+                            || better((addr, latency), (best.addr, best_latency))
                     }
                 };
-                if better {
+                if replace {
                     if p.best.map(|b| b.0) != Some(hop) {
                         tracing::debug!("direct path to {:?} via {addr} ({latency:?})", node);
                     }
@@ -459,11 +525,14 @@ impl Paths {
                     return out;
                 }
                 if let Some(p) = self.peers.get_mut(&node) {
-                    for ep in endpoints {
+                    // What the peer says now is where it is: what an earlier
+                    // call-me-maybe or a ping left goes, but for the path in
+                    // use (the netmap's own are tried again with these).
+                    let keep = p.best.filter(|b| b.0.vni.is_none()).map(|b| b.0.addr);
+                    p.candidates.clear();
+                    p.candidates.extend(keep.map(|addr| (addr, None)));
+                    for ep in endpoints.into_iter().take(MAX_CANDIDATES) {
                         p.candidates.insert(ep, None);
-                    }
-                    for last in p.candidates.values_mut() {
-                        *last = None;
                     }
                 }
                 self.ping_all(&node, now, false, &mut out);
@@ -535,15 +604,33 @@ impl Paths {
             self.emit(sends, &mut out);
             return out;
         }
-        let Some(info) = dir.peer_by_disco(&sender) else {
+        if dir.peer_by_disco(&sender).is_none() {
             return out;
-        };
-        let node = info.node_key;
+        }
         let hop = Hop {
             addr: src,
             vni: Some(vni),
         };
-        match self.disco.open(&sender, packet) {
+        let msg = self.disco.open(&sender, packet);
+        // Whose it is, as for a bare disco message.
+        let claimed = match &msg {
+            Some(Message::Ping { node_key, .. }) => *node_key,
+            Some(Message::Pong { tx, .. }) => self
+                .peers
+                .iter()
+                .find(|(_, p)| p.info.disco_key == sender && p.in_flight.contains_key(tx))
+                .map(|(key, _)| *key),
+            _ => None,
+        };
+        let Some(info) = claimed
+            .and_then(|key| dir.peer(&key))
+            .filter(|info| info.disco_key == sender)
+            .or_else(|| dir.only_peer_by_disco(&sender))
+        else {
+            return out;
+        };
+        let node = info.node_key;
+        match msg {
             Some(Message::Ping { tx, .. }) => {
                 // Answered the way it came, as any ping; and if we are
                 // probing this path ourselves, with a ping of our own.
@@ -835,6 +922,129 @@ mod tests {
         fn peer_by_disco(&self, disco: &DiscoPublic) -> Option<PeerInfo> {
             self.0.values().find(|p| p.disco_key == *disco).cloned()
         }
+        fn only_peer_by_disco(&self, disco: &DiscoPublic) -> Option<PeerInfo> {
+            let mut with = self.0.values().filter(|p| p.disco_key == *disco);
+            let first = with.next()?.clone();
+            with.next().is_none().then_some(first)
+        }
+    }
+
+    /// A LAN address is worth a little latency; a path alike is not worth a
+    /// switch; a much faster one is, wherever it leads.
+    #[test]
+    fn paths_are_weighed_by_latency_and_by_where_they_lead() {
+        let ms = Duration::from_millis;
+        let at = |addr: &str, latency: u64| (addr.parse::<SocketAddr>().unwrap(), ms(latency));
+        let (lan, public) = ("192.168.1.20:41641", "203.0.113.5:41641");
+        // The hairpin through the router answers a touch sooner (4 %): the
+        // LAN still. A fifth sooner, and the two weigh the same: no switch.
+        assert!(better(at(lan, 50), at(public, 48)));
+        assert!(!better(at(public, 48), at(lan, 50)));
+        assert!(!better(at(lan, 50), at(public, 40)));
+        assert!(!better(at(public, 40), at(lan, 50)));
+        // Alike, or a few percent apart: no switch either way.
+        assert!(!better(at(public, 10), at("198.51.100.9:1", 10)));
+        assert!(!better(at(public, 95), at("198.51.100.9:1", 100)));
+        assert!(better(at(public, 80), at("198.51.100.9:1", 100)));
+        // A LAN path far slower than the public one is not kept for its name.
+        assert!(better(at(public, 10), at(lan, 50)));
+        // Loopback over a LAN address, link-local over a private one.
+        assert!(better(at("127.0.0.1:1", 1), at(lan, 1)));
+        assert!(
+            !better(at("169.254.1.2:1", 1), at(lan, 1)),
+            "ten points apart: no switch"
+        );
+        // IPv6 alone is not reason enough.
+        assert!(!better(at("[2001:db8::1]:1", 10), at(public, 10)));
+        assert!(better(at("[fd00::1]:1", 10), at(public, 10)));
+    }
+
+    /// Two peers with one disco key: a ping is the one's it names, and the
+    /// key alone says nothing.
+    #[test]
+    fn a_shared_disco_key_does_not_say_who_pinged() {
+        let mut me = side("10.0.0.1:1000");
+        let twin = side("10.0.0.2:2000");
+        introduce(&mut me, &twin, 1);
+        // A second node with the first one's disco key, somewhere else.
+        let clone = NodePublic(PrivateKey::generate().public());
+        let mut info = me.dir.0.get(&twin.node).unwrap().clone();
+        info.node_key = clone;
+        me.dir.0.insert(clone, info);
+        let now = crate::time::now();
+        let src: SocketAddr = "10.0.0.2:2000".parse().unwrap();
+        let mut theirs = DiscoKeys::new(twin.paths.disco.private.clone());
+        let mut ping = |node_key| {
+            theirs.seal(
+                &me.disco,
+                &Message::Ping {
+                    tx: [9; 12],
+                    node_key,
+                },
+            )
+        };
+
+        // Without a name: dropped, no pong, nobody activated.
+        let unnamed = ping(None);
+        assert!(me
+            .paths
+            .on_disco(&unnamed, Via::Udp(src), now, &me.dir)
+            .is_empty());
+        assert_eq!(me.paths.active(), 0);
+        // Naming a node that does not hold the key: dropped too.
+        let stranger = NodePublic(PrivateKey::generate().public());
+        let misnamed = ping(Some(stranger));
+        assert!(me
+            .paths
+            .on_disco(&misnamed, Via::Udp(src), now, &me.dir)
+            .is_empty());
+        // Named: answered, and the path state is that node's.
+        let named = ping(Some(clone));
+        let out = me.paths.on_disco(&named, Via::Udp(src), now, &me.dir);
+        assert_eq!(out.len(), 1);
+        assert!(me.paths.peers.contains_key(&clone) && !me.paths.peers.contains_key(&twin.node));
+        // Over DERP, the node it came from says whose it is.
+        let via = Via::Derp {
+            region: 1,
+            peer: twin.node,
+        };
+        assert_eq!(me.paths.on_disco(&unnamed, via, now, &me.dir).len(), 1);
+        assert!(me.paths.peers.contains_key(&twin.node));
+    }
+
+    /// A call-me-maybe says where the peer is now: what earlier ones and
+    /// stray pings left is dropped, and no peer can have us try addresses
+    /// without end.
+    #[test]
+    fn candidates_are_the_latest_and_bounded() {
+        let mut a = side("10.0.0.1:1000");
+        let b = side("10.0.0.2:2000");
+        introduce(&mut a, &b, 1);
+        let now = crate::time::now();
+        let via = Via::Derp {
+            region: 1,
+            peer: b.node,
+        };
+        let mut theirs = DiscoKeys::new(b.paths.disco.private.clone());
+        let mut call =
+            |endpoints: Vec<SocketAddr>| theirs.seal(&a.disco, &Message::CallMeMaybe { endpoints });
+        let addrs = |range: core::ops::Range<u16>| -> Vec<SocketAddr> {
+            range
+                .map(|port| SocketAddr::from(([198, 51, 100, 7], port)))
+                .collect()
+        };
+        let first = call(addrs(1..4));
+        a.paths.on_disco(&first, via, now, &a.dir);
+        let known = |a: &Side| -> usize { a.paths.peers[&b.node].candidates.len() };
+        // The three, and the netmap's own (pinged with them).
+        assert_eq!(known(&a), 4);
+        let second = call(addrs(10..12));
+        a.paths.on_disco(&second, via, now, &a.dir);
+        assert_eq!(known(&a), 3, "the first three are gone");
+        let flood = call(addrs(1000..1500));
+        let out = a.paths.on_disco(&flood, via, now, &a.dir);
+        assert!(known(&a) <= MAX_CANDIDATES + 1);
+        assert!(out.len() <= MAX_CANDIDATES + 1, "{} pings", out.len());
     }
 
     fn side(addr: &str) -> Side {
