@@ -1,6 +1,87 @@
 # CHANGELOG
 
 
+## v0.14.0 (2026-11-18)
+
+### Bug Fixes
+
+- **core**: Whose disco message it is, which path is better, and how many addresses a peer may name
+  ([`40fa9e8`](https://github.com/arkitektio/arkitekt-mesh/commit/40fa9e8a6d554d06b55b04605da26a482f252ce3))
+
+- a disco key two nodes share (a cloned machine) no longer makes the first of them the sender: the
+  node DERP got it from, the node a ping names, or the peer whose ping a pong answers, each holding
+  the key; else nobody - direct paths are weighed as tailscale does: by how much faster, and by
+  where they lead (a LAN address over the hairpin through the router), by a margin so that paths
+  alike do not take turns - a call-me-maybe replaces what earlier ones and stray pings left, and a
+  peer's candidates are 32 at most
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+### Features
+
+- A ping to ask for, and peer relays written up (RFC-10)
+  ([`f9c7579`](https://github.com/arkitektio/arkitekt-mesh/commit/f9c7579317e801fcf300a5b8286ad2cfd0971a63))
+
+Node::ping (ping() in Python): a disco ping the way packets to the peer go right now (its address, a
+  peer relay, or its DERP region), with how long it took. Paths::probe underneath.
+
+docs/rfc10-peer-relays.md: how peer relays work, what is done and tested, how a tailnet sets one up,
+  and what is not done: ionskale tells no peer's capability version, so a tailscaled peer does not
+  take part yet. The fuzz target takes Geneve in.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+- Paths through peer relays, where no direct one is found
+  ([`c0b240e`](https://github.com/arkitektio/arkitekt-mesh/commit/c0b240ebe2233da36db8ce30f06a1973949c4e39))
+
+Path selection takes the relay client in: a peer without a trusted direct path is looked for through
+  the peer relays control grants us (every 30 s, every 60 s while on one), a relay path that carried
+  a pong is used like a direct one (WireGuard and heartbeats under its Geneve header), and left for
+  a direct path as soon as one is proven. Datagrams under a Geneve header are read on the UDP
+  sockets. Limits::peer_relay (on; off for Limits::small), PeerPath::PeerRelay.
+
+Tested in bytes against a relay server as tailscale's behaves, in memory: no direct path, a direct
+  path appearing, the relay going and coming back, a rebind, messages from where they may not come.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+- **core**: The peer relay's messages, its Geneve header and its client, without I/O
+  ([`654757c`](https://github.com/arkitektio/arkitekt-mesh/commit/654757c841cf0e92ed6487fac5cafe42a5a084a6))
+
+The first half of peer relays (a path to a peer through another node of the tailnet that forwards
+  UDP for the two, where no direct path is found):
+
+- disco: the six relay messages (bind, challenge, answer, call-me-maybe-via, allocate request and
+  response), byte for byte tailscale's (vectors from its own marshalling,
+  tests/harness/vectors_test.go) - geneve: the header relayed disco and WireGuard travel under, and
+  how it is told from naked WireGuard, disco and STUN - filter: capability grants read
+  (tailscale.com/cap/relay and relay-target), so the node knows which peers it may use as relays;
+  peers' capability version kept - relay: the client's state machine: allocate over DERP (again
+  after 3 s, given up after 10), tell the peer, bind, probe. Bounded in every direction. Unlike
+  tailscale it repeats a bind and an answer that got no reply: a test that loses a third of all
+  messages found one lost datagram costing 30 s
+
+Not wired into path selection yet: nothing uses a relay.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+### Testing
+
+- Peer relays against tailscale's own relay server and peer
+  ([`4db9a4b`](https://github.com/arkitektio/arkitekt-mesh/commit/4db9a4b0486fd3fd0a0f7ff29d3e19761d9be990))
+
+The Go harness grows a peer relay (MESH_HARNESS_RELAY=1): a tsnet node that relays UDP, tailscale's
+  test control granting its use, and the tsnet nodes taking no direct path. Against it: our node and
+  a tsnet peer bind to the relay and carry a megabyte each way; two of our own nodes allocate on it
+  and meet there; with peer relays off, DERP carries.
+
+For it, Limits::never_direct (tailscale's TS_DEBUG_NEVER_DIRECT_UDP): no direct paths, relays and
+  DERP only. And the capability grants are read in their older form too (names in a list), which
+  that control sends: without it our nodes saw no relay and only ever answered a peer's.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+
 ## v0.13.1 (2026-11-18)
 
 ### Bug Fixes
