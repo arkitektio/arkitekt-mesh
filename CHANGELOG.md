@@ -1,6 +1,56 @@
 # CHANGELOG
 
 
+## v0.15.0 (2026-11-18)
+
+### Documentation
+
+- **rfc10**: Ionskale tells capability versions now
+  ([`796ac6a`](https://github.com/arkitektio/arkitekt-mesh/commit/796ac6a92730753fd237e67f33765d998a1743a9))
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+### Features
+
+- The peer relay in sessions, meshd and Python
+  ([`f15ec90`](https://github.com/arkitektio/arkitekt-mesh/commit/f15ec900d622dfb52c7f6b13d456f880a3848f42))
+
+Session::serve_peer_relay, meshd --peer-relay-port (and --peer-relay-endpoint for a port forward;
+  `peer_relay` in its ready line), Node.relay() and Node.relay_status() in Python. RFC-10 and the
+  README say what the relay is and how it was tested.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+- This node as a peer relay (Node::serve_peer_relay)
+  ([`fef6738`](https://github.com/arkitektio/arkitekt-mesh/commit/fef67385867513329ae59d9d0b9ce01596ebf7f3))
+
+A UDP port of its own on which the node forwards for pairs of peers that find no direct path:
+  mesh_core's relay server on real sockets (IPv4 and IPv6), handing endpoints to the peers the
+  tailnet lets ask (tailscale.com/cap/relay towards us), over DERP as tailscale's clients ask for
+  them. Where it can be reached it works out (its address on the default route, what STUN sees of
+  the port) or is told, for a port forward.
+
+Tested against tailscale's own client: two tsnet nodes that take no direct path reach each other
+  through our port. And three of our own nodes: one relays, two meet on it and carry a megabyte each
+  way.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+- **core**: A peer relay of our own, without I/O
+  ([`30a933f`](https://github.com/arkitektio/arkitekt-mesh/commit/30a933fc3e21117925efc14a3e35ef70a5f7d777))
+
+RelayServer: this node forwarding UDP for two peers, as tailscale's
+
+net/udprelay does: endpoints allocated per pair of disco keys, the bind handshake with challenges
+  that are a MAC over the sender's address (nothing kept for a bind, so a forged source costs a
+  reply and no state), packets forwarded by VNI between the two bound addresses without being read,
+  and endpoints that expire unbound after 30 s or silent after five minutes.
+
+The path-selection tests in bytes now run against it instead of a stand-in.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+
 ## v0.14.0 (2026-11-18)
 
 ### Bug Fixes
