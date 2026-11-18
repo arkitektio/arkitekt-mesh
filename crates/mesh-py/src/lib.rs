@@ -64,8 +64,9 @@ impl TurnInfo {
 struct PeerPath {
     /// `"direct"`, `"relay"`, or `"idle"` (nothing sent to the peer lately).
     kind: &'static str,
-    /// The peer's UDP address when direct, the DERP region code (e.g.
-    /// `"waw"`, or the region id) when relayed, else `None`.
+    /// The peer's UDP address when direct; when relayed the DERP region code
+    /// (e.g. `"waw"`, or the region id), or `"peer relay <address>"` for a
+    /// node of the tailnet that forwards UDP for the two; else `None`.
     via: Option<String>,
 }
 
@@ -263,6 +264,12 @@ impl Node {
             DriverPath::Direct(addr) => PeerPath {
                 kind: "direct",
                 via: Some(addr.to_string()),
+            },
+            // "relay" still, for those who know three kinds: `via` tells
+            // the two apart.
+            DriverPath::PeerRelay(addr) => PeerPath {
+                kind: "relay",
+                via: Some(format!("peer relay {addr}")),
             },
             DriverPath::Relay { region, code } => PeerPath {
                 kind: "relay",

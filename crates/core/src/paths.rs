@@ -8,6 +8,10 @@
 //! - A pong over UDP makes its address the best path, trusted for 6.5 s and
 //!   renewed by heartbeat pings every 3 s while the peer is in use.
 //! - Pings are always answered with a pong on the path they came in on.
+//! - Where no direct path comes up and the tailnet has peer relays, a path
+//!   through one is set up ([`crate::relay`]) and used like a direct one:
+//!   trusted while its pings are answered, left for a direct path as soon
+//!   as one is proven. What goes through a relay goes under a Geneve header.
 //!
 //! State is kept only for peers in use; everything else about a peer is
 //! looked up in the [`Directory`] (the netmap) when needed, so a large
@@ -21,7 +25,9 @@ use core::net::SocketAddr;
 use hashbrown::HashMap;
 
 use crate::disco::{self, DiscoKeys, Message, TxId};
+use crate::geneve;
 use crate::keys::{DiscoPublic, NodePublic, PrivateKey};
+use crate::relay::{self, RelayClient};
 
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
 pub const TRUST_UDP_ADDR: Duration = Duration::from_millis(6500);
@@ -31,6 +37,11 @@ pub const DISCO_PING_INTERVAL: Duration = Duration::from_secs(5);
 pub const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 /// Path state of a peer unused this long is dropped.
 pub const IDLE_FORGET: Duration = Duration::from_secs(300);
+/// How often a peer without a direct path is looked for through the peer
+/// relays, at most; and how often while it is on one already (which keeps
+/// the peer told of the endpoint).
+pub const RELAY_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+pub const RELAY_UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 /// Pongs answered per peer per second, at most: a flood of (validly sealed)
 /// pings must not make us send unbounded traffic.
 pub const PONGS_PER_SECOND: u8 = 10;
@@ -67,15 +78,48 @@ pub struct PeerInfo {
     pub home_region: Option<i32>,
     /// Shared with the netmap.
     pub endpoints: Arc<[SocketAddr]>,
+    /// Whether its client speaks through peer relays (by its capability
+    /// version; one control does not tell is taken to).
+    pub relay_capable: bool,
+}
+
+/// Where a peer is reached over UDP: its own address, or a relay's with the
+/// VNI of the endpoint we both bound to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Hop {
+    addr: SocketAddr,
+    vni: Option<u32>,
+}
+
+impl Hop {
+    fn direct(addr: SocketAddr) -> Self {
+        Self { addr, vni: None }
+    }
+
+    /// `datagram` (WireGuard or disco) as it goes over this hop.
+    fn wrap(&self, protocol: geneve::Protocol, datagram: Vec<u8>) -> Vec<u8> {
+        match self.vni {
+            Some(vni) => geneve::Header {
+                protocol,
+                vni,
+                control: false,
+            }
+            .wrap(&datagram),
+            None => datagram,
+        }
+    }
 }
 
 struct Peer {
     info: PeerInfo,
     /// Endpoints to try: the netmap's, CallMeMaybe's and ping sources.
     candidates: HashMap<SocketAddr, Option<Instant>>,
-    best: Option<(SocketAddr, Duration)>,
+    best: Option<(Hop, Duration)>,
+    /// The relay `best` goes through (its disco key), if it does.
+    relay_server: Option<DiscoPublic>,
     trust_until: Option<Instant>,
-    in_flight: HashMap<TxId, (SocketAddr, Instant)>,
+    in_flight: HashMap<TxId, (Hop, Instant)>,
+    last_relay_discovery: Option<Instant>,
     last_full_ping: Option<Instant>,
     last_heartbeat: Option<Instant>,
     last_send: Option<Instant>,
@@ -97,8 +141,10 @@ impl Peer {
             info,
             candidates: HashMap::new(),
             best: None,
+            relay_server: None,
             trust_until: None,
             in_flight: HashMap::new(),
+            last_relay_discovery: None,
             last_full_ping: None,
             last_heartbeat: None,
             last_send: None,
@@ -108,6 +154,24 @@ impl Peer {
 
     fn trusted(&self, now: Instant) -> bool {
         self.best.is_some() && self.trust_until.is_some_and(|t| now < t)
+    }
+
+    fn remote(&self) -> relay::Remote {
+        relay::Remote {
+            node: self.info.node_key,
+            disco: self.info.disco_key,
+            home_region: self.info.home_region.or(self.last_derp_region),
+        }
+    }
+
+    /// The relay path this peer is on, if it is on one.
+    fn relayed(&self, now: Instant) -> Option<relay::Current> {
+        let (hop, _) = self.best?;
+        Some(relay::Current {
+            server: self.relay_server?,
+            vni: hop.vni?,
+            trusted: self.trusted(now),
+        })
     }
 
     fn derp(&self) -> Option<Via> {
@@ -128,17 +192,30 @@ pub struct Paths {
     endpoints: Vec<SocketAddr>,
     /// Whether direct UDP is used at all.
     udp: bool,
+    /// Paths through peer relays: the servers we may use, and what is under
+    /// way with them.
+    relay: RelayClient,
 }
 
 impl Paths {
     pub fn new(disco: PrivateKey, node_key: NodePublic) -> Self {
         Self {
+            relay: RelayClient::new(DiscoPublic(disco.public()), node_key),
             disco: DiscoKeys::new(disco),
             node_key,
             peers: HashMap::new(),
             endpoints: Vec::new(),
             udp: true,
         }
+    }
+
+    /// The peers we may use as relays (none: peer relays are off).
+    pub fn set_relay_servers(&mut self, servers: Vec<relay::Server>) {
+        self.relay.set_servers(servers);
+    }
+
+    pub fn relay_servers(&self) -> &[relay::Server] {
+        self.relay.servers()
     }
 
     pub fn disco_public(&self) -> DiscoPublic {
@@ -174,8 +251,11 @@ impl Paths {
     /// Forget every direct path (the network changed): traffic falls back
     /// to DERP until pings find paths again.
     pub fn reset_direct(&mut self) {
+        self.relay.reset();
         for p in self.peers.values_mut() {
             p.best = None;
+            p.relay_server = None;
+            p.last_relay_discovery = None;
             p.trust_until = None;
             p.candidates.clear();
             p.in_flight.clear();
@@ -187,6 +267,7 @@ impl Paths {
     /// Drop `peer`'s path state (it comes back when next used).
     pub fn forget(&mut self, peer: &NodePublic) {
         self.peers.remove(peer);
+        self.relay.forget(peer);
     }
 
     /// How many peers have path state (for tests and diagnostics).
@@ -197,11 +278,21 @@ impl Paths {
     /// The current direct address of `peer`, if it is trusted.
     pub fn direct(&self, peer: &NodePublic, now: Instant) -> Option<SocketAddr> {
         let p = self.peers.get(peer)?;
-        p.trusted(now).then(|| p.best.map(|b| b.0)).flatten()
+        let (hop, _) = p.best.filter(|_| p.trusted(now))?;
+        hop.vni.is_none().then_some(hop.addr)
+    }
+
+    /// The relay's address `peer` is reached through, if its trusted path
+    /// is one through a peer relay.
+    pub fn relayed(&self, peer: &NodePublic, now: Instant) -> Option<SocketAddr> {
+        let p = self.peers.get(peer)?;
+        let (hop, _) = p.best.filter(|_| p.trusted(now))?;
+        hop.vni.map(|_| hop.addr)
     }
 
     /// Where a datagram to `peer` goes now, as [`route`](Self::route) would
-    /// send it: its trusted direct address, else its DERP relay. `None` while
+    /// send it: its trusted UDP address (its own, or a peer relay's: see
+    /// [`relayed`](Self::relayed)), else its DERP relay. `None` while
     /// the peer is idle: nothing was sent to it within [`SESSION_ACTIVE`], so
     /// no heartbeat keeps a direct path trusted and the next send probes
     /// again. Also `None` with neither a direct address nor a known region.
@@ -213,7 +304,7 @@ impl Paths {
             return None;
         }
         if self.udp && p.trusted(now) {
-            return p.best.map(|b| Via::Udp(b.0));
+            return p.best.map(|b| Via::Udp(b.0.addr));
         }
         p.derp()
     }
@@ -235,16 +326,17 @@ impl Paths {
         let p = self.activate(info, now);
         p.last_send = Some(now);
         if udp && p.trusted(now) {
+            let hop = p.best.expect("trusted").0;
             out.push(Transmit {
-                via: Via::Udp(p.best.expect("trusted").0),
-                data,
+                via: Via::Udp(hop.addr),
+                data: hop.wrap(geneve::Protocol::WireGuard, data),
             });
             return out;
         }
-        if let (true, Some((addr, _))) = (udp, p.best) {
+        if let (true, Some((hop, _))) = (udp, p.best) {
             out.push(Transmit {
-                via: Via::Udp(addr),
-                data: data.clone(),
+                via: Via::Udp(hop.addr),
+                data: hop.wrap(geneve::Protocol::WireGuard, data.clone()),
             });
         }
         if let Some(derp) = p.derp() {
@@ -316,26 +408,34 @@ impl Paths {
                 let Some(p) = self.peers.get_mut(&node) else {
                     return out;
                 };
-                let Some((addr, sent)) = p.in_flight.remove(&tx) else {
+                let Some((hop, sent)) = p.in_flight.remove(&tx) else {
                     return out;
                 };
-                if !matches!(via, Via::Udp(from) if from == addr) {
+                // A pong for a ping sent through a relay comes back through
+                // it, not here.
+                let addr = hop.addr;
+                if hop.vni.is_some() || !matches!(via, Via::Udp(from) if from == addr) {
                     return out;
                 }
                 let latency = now.duration_since(sent);
                 let better = match p.best {
                     None => true,
                     Some((best, best_latency)) => {
-                        best == addr || !p.trusted(now) || latency < best_latency.mul_f64(0.9)
+                        best == hop
+                            || !p.trusted(now)
+                            // A direct path, whatever a relayed one's latency.
+                            || best.vni.is_some()
+                            || latency < best_latency.mul_f64(0.9)
                     }
                 };
                 if better {
-                    if p.best.map(|b| b.0) != Some(addr) {
+                    if p.best.map(|b| b.0) != Some(hop) {
                         tracing::debug!("direct path to {:?} via {addr} ({latency:?})", node);
                     }
-                    p.best = Some((addr, latency));
+                    p.best = Some((hop, latency));
+                    p.relay_server = None;
                 }
-                if p.best.map(|b| b.0) == Some(addr) {
+                if p.best.map(|b| b.0) == Some(hop) {
                     p.trust_until = Some(now + TRUST_UDP_ADDR);
                 }
             }
@@ -354,38 +454,216 @@ impl Paths {
                 }
                 self.ping_all(&node, now, false, &mut out);
             }
-            // The peer relay's messages: not acted on yet.
+            Message::CallMeMaybeVia(endpoint) => {
+                // As call-me-maybe: over DERP, from the node the key is of.
+                if !matches!(via, Via::Derp { peer, .. } if peer == node) || !self.udp {
+                    return out;
+                }
+                let Some(p) = self.peers.get(&node).filter(|p| p.info.relay_capable) else {
+                    return out;
+                };
+                let (remote, current) = (p.remote(), p.relayed(now));
+                let mut sends = Vec::new();
+                self.relay
+                    .on_call_me_maybe_via(&remote, endpoint, current, now, &mut sends);
+                self.emit(sends, &mut out);
+            }
+            Message::RelayAllocated {
+                generation,
+                endpoint,
+            } => {
+                // From the relay server (a peer) we asked, over DERP.
+                if !matches!(via, Via::Derp { peer, .. } if peer == node) || !self.udp {
+                    return out;
+                }
+                let peers = &self.peers;
+                let current = |peer: &NodePublic| peers.get(peer).and_then(|p| p.relayed(now));
+                let mut sends = Vec::new();
+                self.relay
+                    .on_allocated(&node, generation, endpoint, current, now, &mut sends);
+                self.emit(sends, &mut out);
+            }
+            // What a relay server takes: we are none. And a challenge comes
+            // under a Geneve header (`on_relayed_disco`), never bare.
             Message::RelayBind(_)
             | Message::RelayChallenge(_)
             | Message::RelayAnswer(_)
-            | Message::CallMeMaybeVia(_)
-            | Message::AllocateRelay { .. }
-            | Message::RelayAllocated { .. } => {}
+            | Message::AllocateRelay { .. } => {}
         }
         out
+    }
+
+    /// A disco packet that came under a Geneve header, from `src`: a relay's
+    /// own word in the bind handshake (the control bit), or the peer's ping
+    /// or pong, forwarded by the relay.
+    pub fn on_relayed_disco(
+        &mut self,
+        packet: &[u8],
+        src: SocketAddr,
+        header: geneve::Header,
+        now: Instant,
+        dir: &impl Directory,
+    ) -> Vec<Transmit> {
+        let mut out = Vec::new();
+        let Some(sender) = disco::sender(packet).filter(|_| self.udp) else {
+            return out;
+        };
+        let (vni, mut sends) = (header.vni, Vec::new());
+        if header.control {
+            // Only a relay we are binding to is listened to, and only its
+            // challenge.
+            if self.relay.expects(&sender) {
+                if let Some(Message::RelayChallenge(challenge)) = self.disco.open(&sender, packet) {
+                    self.relay
+                        .on_challenge(&sender, src, vni, &challenge, now, &mut sends);
+                }
+            }
+            self.emit(sends, &mut out);
+            return out;
+        }
+        let Some(info) = dir.peer_by_disco(&sender) else {
+            return out;
+        };
+        let node = info.node_key;
+        let hop = Hop {
+            addr: src,
+            vni: Some(vni),
+        };
+        match self.disco.open(&sender, packet) {
+            Some(Message::Ping { tx, .. }) => {
+                // Answered the way it came, as any ping; and if we are
+                // probing this path ourselves, with a ping of our own.
+                let p = self.activate(info, now);
+                if now.duration_since(p.pongs.0) >= Duration::from_secs(1) {
+                    p.pongs = (now, 0);
+                }
+                p.pongs.1 += 1;
+                if p.pongs.1 > PONGS_PER_SECOND {
+                    return out;
+                }
+                let pong = self.disco.seal(&sender, &Message::Pong { tx, src });
+                out.push(Transmit {
+                    via: Via::Udp(src),
+                    data: hop.wrap(geneve::Protocol::Disco, pong),
+                });
+                self.relay.on_ping(&sender, src, vni, now, &mut sends);
+            }
+            Some(Message::Pong { tx, .. }) => {
+                let Some(p) = self.peers.get_mut(&node) else {
+                    return out;
+                };
+                match p.in_flight.get(&tx) {
+                    // A heartbeat on the relay path we are on.
+                    Some((sent_to, _)) if *sent_to == hop => {
+                        p.in_flight.remove(&tx);
+                        if p.best.map(|b| b.0) == Some(hop) {
+                            p.trust_until = Some(now + TRUST_UDP_ADDR);
+                        }
+                    }
+                    Some(_) => {}
+                    // A handshake's probe: the path works.
+                    None => {
+                        if let Some(ready) = self.relay.on_pong(&sender, src, vni, &tx, now) {
+                            self.adopt(ready, now);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.emit(sends, &mut out);
+        out
+    }
+
+    /// A relay path came up: take it unless a path we trust is in the way.
+    fn adopt(&mut self, ready: relay::Ready, now: Instant) {
+        let Some(p) = self.peers.get_mut(&ready.peer) else {
+            return;
+        };
+        // On the same relay we must move: it takes our packets from the
+        // address we bound from last, and only from there.
+        let same_relay = p.relay_server == Some(ready.server);
+        if p.trusted(now) && !same_relay {
+            return;
+        }
+        let hop = Hop {
+            addr: ready.addr,
+            vni: Some(ready.vni),
+        };
+        tracing::debug!(
+            "path to {:?} through the peer relay at {} ({:?})",
+            ready.peer,
+            ready.addr,
+            ready.latency
+        );
+        p.best = Some((hop, ready.latency));
+        p.relay_server = Some(ready.server);
+        p.trust_until = Some(now + TRUST_UDP_ADDR);
+    }
+
+    /// The relay client's messages, sealed and addressed.
+    fn emit(&mut self, sends: Vec<relay::Send>, out: &mut Vec<Transmit>) {
+        for send in sends {
+            out.push(match send {
+                relay::Send::Derp {
+                    region,
+                    node,
+                    disco,
+                    msg,
+                } => Transmit {
+                    via: Via::Derp { region, peer: node },
+                    data: self.disco.seal(&disco, &msg),
+                },
+                relay::Send::Relay {
+                    addr,
+                    vni,
+                    control,
+                    disco,
+                    msg,
+                } => Transmit {
+                    via: Via::Udp(addr),
+                    data: geneve::Header {
+                        protocol: geneve::Protocol::Disco,
+                        vni,
+                        control,
+                    }
+                    .wrap(&self.disco.seal(&disco, &msg)),
+                },
+            });
+        }
     }
 
     /// Heartbeats and ping timeouts.
     pub fn tick(&mut self, now: Instant, dir: &impl Directory) -> Vec<Transmit> {
         let mut out = Vec::new();
         // Forget peers that left the netmap, restarted, or went unused.
-        self.peers.retain(|key, p| match dir.peer(key) {
-            Some(info) if info.disco_key == p.info.disco_key => {
-                p.info = info;
-                now.duration_since(p.last_used) < IDLE_FORGET
+        let relay = &mut self.relay;
+        self.peers.retain(|key, p| {
+            let keep = match dir.peer(key) {
+                Some(info) if info.disco_key == p.info.disco_key => {
+                    p.info = info;
+                    now.duration_since(p.last_used) < IDLE_FORGET
+                }
+                _ => false,
+            };
+            if !keep {
+                relay.forget(key);
             }
-            _ => false,
+            keep
         });
+        let mut sends = Vec::new();
+        self.relay.tick(now, &mut sends);
         let keys: Vec<NodePublic> = self.peers.keys().copied().collect();
         for key in keys {
             let p = self.peers.get_mut(&key).expect("listed");
-            p.in_flight.retain(|_, (addr, sent)| {
+            p.in_flight.retain(|_, (hop, sent)| {
                 let alive = now.duration_since(*sent) < PING_TIMEOUT;
                 if !alive
-                    && p.best.map(|b| b.0) == Some(*addr)
+                    && p.best.map(|b| b.0) == Some(*hop)
                     && p.trust_until.is_none_or(|t| now >= t)
                 {
                     p.best = None;
+                    p.relay_server = None;
                 }
                 alive
             });
@@ -394,6 +672,21 @@ impl Paths {
                     .is_none_or(|t| now.duration_since(t) >= SESSION_ACTIVE)
             {
                 continue;
+            }
+            // No direct path we trust, and relays to ask: look for a path
+            // through one, now and then.
+            let trusted = p.trusted(now);
+            let direct = trusted && p.best.is_some_and(|b| b.0.vni.is_none());
+            let since = p.last_relay_discovery.map(|t| now.duration_since(t));
+            let due = match since {
+                None => true,
+                Some(since) if trusted => since >= RELAY_UPGRADE_INTERVAL,
+                Some(since) => since >= RELAY_DISCOVERY_INTERVAL,
+            };
+            if self.relay.has_servers() && p.info.relay_capable && !direct && due {
+                p.last_relay_discovery = Some(now);
+                let remote = p.remote();
+                self.relay.discover(&remote, now, &mut sends);
             }
             if p.last_heartbeat
                 .is_some_and(|t| now.duration_since(t) < HEARTBEAT_INTERVAL)
@@ -405,42 +698,55 @@ impl Paths {
                 || p.last_full_ping
                     .is_none_or(|t| now.duration_since(t) >= UPGRADE_INTERVAL);
             if full {
+                // The relay path too, if we are on one: it is no candidate
+                // of the peer's own.
+                if let Some((hop, _)) = p.best.filter(|b| b.0.vni.is_some()) {
+                    self.ping(&key, hop, now, &mut out);
+                }
                 self.ping_all(&key, now, true, &mut out);
             } else if let Some((best, _)) = p.best {
                 self.ping(&key, best, now, &mut out);
             }
         }
+        self.emit(sends, &mut out);
         out
     }
 
     /// When [`tick`](Self::tick) next has work, at the latest.
     pub fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        self.peers
+        let heartbeat = self
+            .peers
             .values()
             .any(|p| {
                 p.last_send
                     .is_some_and(|t| now.duration_since(t) < SESSION_ACTIVE)
                     || !p.in_flight.is_empty()
             })
-            .then_some(now + HEARTBEAT_INTERVAL)
+            .then_some(now + HEARTBEAT_INTERVAL);
+        [heartbeat, self.relay.next_deadline()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
-    fn ping(&mut self, key: &NodePublic, addr: SocketAddr, now: Instant, out: &mut Vec<Transmit>) {
+    fn ping(&mut self, key: &NodePublic, hop: Hop, now: Instant, out: &mut Vec<Transmit>) {
         let Some(p) = self.peers.get_mut(key) else {
             return;
         };
         let mut tx = [0u8; 12];
         crate::random::fill(&mut tx);
-        p.in_flight.insert(tx, (addr, now));
-        p.candidates.insert(addr, Some(now));
+        p.in_flight.insert(tx, (hop, now));
+        if hop.vni.is_none() {
+            p.candidates.insert(hop.addr, Some(now));
+        }
         let ping = Message::Ping {
             tx,
             node_key: Some(self.node_key),
         };
         let to = p.info.disco_key;
         out.push(Transmit {
-            via: Via::Udp(addr),
-            data: self.disco.seal(&to, &ping),
+            via: Via::Udp(hop.addr),
+            data: hop.wrap(geneve::Protocol::Disco, self.disco.seal(&to, &ping)),
         });
     }
 
@@ -475,7 +781,7 @@ impl Paths {
         let derp = p.derp();
         let disco_key = p.info.disco_key;
         for addr in due {
-            self.ping(key, addr, now, out);
+            self.ping(key, Hop::direct(addr), now, out);
         }
         if let (true, Some(derp), false) = (call_me_maybe, derp, self.endpoints.is_empty()) {
             let cmm = Message::CallMeMaybe {
@@ -488,6 +794,9 @@ impl Paths {
         }
     }
 }
+
+#[cfg(test)]
+mod relay_tests;
 
 #[cfg(test)]
 mod tests {
@@ -536,6 +845,7 @@ mod tests {
                 disco_key: b.disco,
                 home_region: Some(region),
                 endpoints: vec![b.addr].into(),
+                relay_capable: true,
             },
         );
     }

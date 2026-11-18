@@ -167,6 +167,7 @@ impl Config {
                 congestion: Congestion::Reno,
                 handshake_queue: 8,
                 max_active_peers: 8,
+                peer_relay: false,
                 udp_flows: 64,
                 netcheck_interval: Some(Duration::from_secs(300)),
             },

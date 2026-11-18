@@ -119,6 +119,8 @@ impl Peer {
             disco_key: self.disco_key,
             home_region: self.home_region,
             endpoints: self.endpoints.clone(),
+            // Control that does not say (ionscale) is given the benefit.
+            relay_capable: self.cap == 0 || self.cap >= crate::relay::RELAY_CAPABLE,
         }
     }
 }

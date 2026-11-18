@@ -28,8 +28,9 @@ class PeerPath:
     """``idle``: nothing was sent to the peer lately (the next packet probes
     again)."""
     via: Optional[str]
-    """The peer's UDP address when direct, the DERP region code (e.g. ``waw``)
-    when relayed, else ``None``."""
+    """The peer's UDP address when direct; when relayed the DERP region code
+    (e.g. ``waw``), or ``peer relay <address>`` for a node of the tailnet that
+    forwards UDP for the two; else ``None``."""
 
 class ControlStatus:
     """How the node stands with the coordination server (see ``Node.control``)."""

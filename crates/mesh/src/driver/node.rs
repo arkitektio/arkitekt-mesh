@@ -71,6 +71,9 @@ pub enum PeerPath {
     /// Through a DERP relay: its region id and code (e.g. `"waw"`; empty
     /// when the DERP map gives none).
     Relay { region: i32, code: String },
+    /// Over UDP through a peer relay (a node of the tailnet that forwards
+    /// for the two of us), at this address of it.
+    PeerRelay(SocketAddr),
 }
 
 /// Buffer and queue sizes: memory against throughput.
@@ -131,6 +134,10 @@ pub struct Limits {
     /// Ask the gateway for a port mapping (feature `portmap`;
     /// docs/rfc3-nat-port-mapping.md).
     pub portmap: bool,
+    /// Reach peers through the tailnet's peer relays where no direct path
+    /// is found (docs/rfc10-peer-relays.md): UDP through a node the admin
+    /// set up for it, in place of DERP.
+    pub peer_relay: bool,
 }
 
 impl Default for Limits {
@@ -153,6 +160,7 @@ impl Default for Limits {
             ipv4: true,
             ipv6: true,
             portmap: true,
+            peer_relay: true,
         }
     }
 }
@@ -177,6 +185,7 @@ impl Limits {
             ipv4: true,
             ipv6: false,
             portmap: false,
+            peer_relay: false,
         }
     }
 }
@@ -368,6 +377,7 @@ impl Node {
                 max_active_peers: limits.max_active_peers,
                 udp_flows: limits.udp_flows,
                 netcheck_interval: limits.netcheck_interval,
+                peer_relay: limits.peer_relay,
             },
             clock::now(),
         );
@@ -568,7 +578,11 @@ impl Node {
             .peer_by_ip(ip)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("no peer has {ip}")))?
             .key;
-        Ok(match state.paths().via(&key, clock::now()) {
+        let now = clock::now();
+        if let Some(relay) = state.paths().relayed(&key, now) {
+            return Ok(PeerPath::PeerRelay(relay));
+        }
+        Ok(match state.paths().via(&key, now) {
             None => PeerPath::Idle,
             Some(Via::Udp(addr)) => PeerPath::Direct(addr),
             Some(Via::Derp { region, .. }) => PeerPath::Relay {

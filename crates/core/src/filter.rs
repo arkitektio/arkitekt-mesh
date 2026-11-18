@@ -381,6 +381,11 @@ impl Firewall {
         self.filter = filter;
     }
 
+    /// The filter in force (its capability grants are asked of it).
+    pub fn filter(&self) -> &Filter {
+        &self.filter
+    }
+
     /// Packets dropped so far.
     pub fn dropped(&self) -> u64 {
         self.dropped

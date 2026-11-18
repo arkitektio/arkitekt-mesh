@@ -68,6 +68,9 @@ pub struct Settings {
     pub udp_flows: usize,
     /// How often to measure every region and re-pick the home (`None`: once).
     pub netcheck_interval: Option<Duration>,
+    /// Reach peers through the tailnet's peer relays where no direct path
+    /// is found (it takes `direct`, and a grant from control).
+    pub peer_relay: bool,
 }
 
 /// What the driver should do (besides sending [`Transmit`]s).
@@ -195,6 +198,7 @@ impl NodeCore {
         };
         node.apply_lock();
         node.sync_peers();
+        node.find_relays();
         // The home region is connected once the first netcheck answers (it
         // may pick another), or at `HOME_WAIT`; see `link_home_when_due`.
         node
@@ -225,6 +229,19 @@ impl NodeCore {
                 }
             }
             Vec::new()
+        } else if let Some((header, payload)) = crate::geneve::unwrap(data) {
+            // Through a peer relay: the relay's word in the bind handshake,
+            // or the peer's disco and WireGuard, forwarded.
+            if !self.settings.direct || !self.settings.peer_relay {
+                return Vec::new();
+            }
+            match header.protocol {
+                crate::geneve::Protocol::Disco => {
+                    self.paths
+                        .on_relayed_disco(payload, src, header, now, &self.netmap)
+                }
+                crate::geneve::Protocol::WireGuard => self.on_wireguard(payload, now),
+            }
         } else if disco::looks_like_disco(data) {
             if !self.settings.direct {
                 return Vec::new();
@@ -258,13 +275,18 @@ impl NodeCore {
     /// A map response from control (tailnet lock already synced).
     pub fn apply_map(&mut self, mut resp: MapResponse) {
         let (whole, named) = (resp.packet_filter.take(), resp.packet_filters.take());
-        if crate::filter::apply_update(&mut self.filter_sets, whole, named) {
+        let filtered = crate::filter::apply_update(&mut self.filter_sets, whole, named);
+        if filtered {
             let filter = crate::filter::compile(&self.filter_sets);
             self.firewall.set_filter(filter);
         }
-        if self.netmap.apply(resp) {
+        let mapped = self.netmap.apply(resp);
+        if mapped {
             self.apply_lock();
             self.refresh_derp();
+        }
+        if filtered || mapped {
+            self.find_relays();
         }
     }
 
@@ -272,6 +294,7 @@ impl NodeCore {
     pub fn set_lock(&mut self, lock: Lock) {
         self.lock = lock;
         self.apply_lock();
+        self.find_relays();
     }
 
     /// The connection to `region` ended: it is made again when next needed.
@@ -573,6 +596,41 @@ impl NodeCore {
         self.sync_peers();
     }
 
+    /// The peers we may use as relays: those control grants the relay-target
+    /// capability towards us (`tailscale.com/cap/relay-target`, from the
+    /// peer's address to ours of the same family), whose client is new
+    /// enough. Peers tailnet lock hides are not among them.
+    fn find_relays(&mut self) {
+        if !self.settings.direct || !self.settings.peer_relay {
+            return;
+        }
+        let (filter, ours) = (self.firewall.filter(), self.netmap.self_addresses());
+        let granted = |peer: &crate::control::netmap::Peer| {
+            peer.addresses.iter().any(|from| {
+                ours.iter().any(|to| {
+                    from.is_ipv4() == to.is_ipv4()
+                        && filter.grants(*from, *to, crate::filter::CAP_RELAY_TARGET)
+                })
+            })
+        };
+        let servers: Vec<crate::relay::Server> = self
+            .netmap
+            .peers()
+            .iter()
+            .filter(|p| p.cap == 0 || p.cap >= crate::relay::RELAY_CAPABLE)
+            .filter(|p| !p.unsigned_peer_api_only && granted(p))
+            .map(|p| crate::relay::Server {
+                node: p.key,
+                disco: p.disco_key,
+                home_region: p.home_region,
+            })
+            .collect();
+        if servers != self.paths.relay_servers() {
+            tracing::debug!("{} peer relay(s) to use", servers.len());
+            self.paths.set_relay_servers(servers);
+        }
+    }
+
     /// Bring the stack and the tunnel in line with the netmap. WireGuard and
     /// path state are made when a peer is first used, so only departed
     /// peers are removed here (path state prunes itself on tick).
@@ -835,6 +893,7 @@ mod tests {
             max_active_peers: 8,
             udp_flows: 16,
             netcheck_interval: None,
+            peer_relay: true,
         };
         NodeCore::new(
             node_key,
@@ -938,6 +997,57 @@ mod tests {
         ));
         assert!(!accept_inbound(&netmap, &a, &packet([8, 8, 8, 8], me)));
         assert!(!accept_inbound(&netmap, &a, &[0x45, 0]));
+    }
+
+    /// A peer becomes a relay to use when control grants it the relay-target
+    /// capability towards us, and stops being one when the grant goes.
+    #[test]
+    fn relays_are_the_peers_control_grants() {
+        let now = Instant::ZERO;
+        let mut node = two_regions(now);
+        let map = |filter: &str| -> MapResponse {
+            serde_json::from_str(&format!(
+                r#"{{"PeersChanged": [
+                    {{"ID": 2, "Name": "relay", "Addresses": ["100.64.0.2/32"], "HomeDERP": 4, "Cap": 142,
+                      "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000002",
+                      "DiscoKey": "discokey:0000000000000000000000000000000000000000000000000000000000000022"}},
+                    {{"ID": 3, "Name": "old", "Addresses": ["100.64.0.3/32"], "Cap": 100,
+                      "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000003"}},
+                    {{"ID": 4, "Name": "other", "Addresses": ["100.64.0.4/32"],
+                      "Key": "nodekey:0000000000000000000000000000000000000000000000000000000000000004"}}],
+                  "PacketFilter": {filter}}}"#
+            ))
+            .unwrap()
+        };
+        let grant = |srcs: &str| {
+            format!(
+                r#"[{{"SrcIPs": [{srcs}], "CapGrant": [{{"Dsts": ["100.64.0.9/32"],
+                    "CapMap": {{"tailscale.com/cap/relay-target": null}}}}]}}]"#
+            )
+        };
+        node.apply_map(map("[]"));
+        assert!(node.paths().relay_servers().is_empty());
+
+        // Granted to two peers: the one whose client speaks it is a relay.
+        node.apply_map(map(&grant(r#""100.64.0.2", "100.64.0.3""#)));
+        let servers = node.paths().relay_servers();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].home_region, Some(4));
+        assert_eq!(
+            servers[0].node,
+            node.netmap().peer_by_name("relay").unwrap().key
+        );
+
+        // A client control says nothing of (ionscale) is taken to speak it.
+        node.apply_map(map(&grant(r#""100.64.0.4""#)));
+        assert_eq!(node.paths().relay_servers().len(), 1);
+        assert_eq!(
+            node.paths().relay_servers()[0].node,
+            node.netmap().peer_by_name("other").unwrap().key
+        );
+
+        node.apply_map(map("[]"));
+        assert!(node.paths().relay_servers().is_empty());
     }
 
     /// A peer control lists as expired is not a peer to talk to.
