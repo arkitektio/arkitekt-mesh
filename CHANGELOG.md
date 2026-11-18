@@ -1,6 +1,18 @@
 # CHANGELOG
 
 
+## v0.15.1 (2026-11-18)
+
+### Bug Fixes
+
+- **py**: Reprs write an absent value as None, and a present one as a string
+  ([`0fdfc0f`](https://github.com/arkitektio/arkitekt-mesh/commit/0fdfc0fa501789981057045183d3e3c0c8bdda56))
+
+PeerPath, ControlStatus and Pinged printed Rust's Some("…") for an optional field.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+
 ## v0.15.0 (2026-11-18)
 
 ### Documentation
