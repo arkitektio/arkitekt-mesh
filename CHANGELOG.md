@@ -1,6 +1,25 @@
 # CHANGELOG
 
 
+## v0.13.1 (2026-11-18)
+
+### Bug Fixes
+
+- Tls past its advisories (rustls 0.23.46, rustls-webpki 0.103.17, webpki-roots 1.0.12)
+  ([`4adcb21`](https://github.com/arkitektio/arkitekt-mesh/commit/4adcb21edddd4ecd28e2015a9d047dfa126ffee8))
+
+What the wheels and meshd are built from, by Cargo.lock: rustls (a ServerHello that downgrades later
+  connections, 1 GiB of certificate decompression before authentication, session secrets in Debug),
+  rustls-webpki and webpki-roots (distrusted emSign intermediates), and url/idna under the TURN
+  relay. tokio 1.54 and quinn (the tests') with them. The smoltcp fork's inherited dev pin of idna
+  held url back and is gone.
+
+The audit runs cargo-audit itself (the action could not update its check run) and ignores, by name
+  and reason, what only rustls-rustcrypto brings into the tests.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+
+
 ## v0.13.0 (2026-11-18)
 
 ### Continuous Integration
